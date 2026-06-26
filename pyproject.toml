@@ -1,0 +1,28 @@
+[project]
+name = "search-assistant"
+version = "0.1.0"
+description = "Feishu-connected search assistant powered by Microsoft Agent Framework."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "agent-framework==1.9.0",
+  "fastapi==0.138.1",
+  "pydantic==2.13.4",
+  "uvicorn==0.38.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.0.2",
+  "httpx==0.28.1",
+]
+
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
