@@ -50,5 +50,5 @@ class AnswerPackage(BaseModel):
     confidence: Confidence
     verified_claims: list[VerifiedClaim] = Field(default_factory=list)
     unverified_claims: list[str] = Field(default_factory=list)
-    calibration: CalibrationResult | dict[str, Any] | None = None
+    calibration: dict[str, Any] | None = None
     memory_updates: list[MemoryUpdate | dict[str, Any]] = Field(default_factory=list)
