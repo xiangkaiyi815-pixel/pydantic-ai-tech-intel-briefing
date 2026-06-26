@@ -221,6 +221,55 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_answers(self) -> list[AnswerPackage]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT package_json FROM answers ORDER BY created_at ASC"
+            ).fetchall()
+        return [AnswerPackage.model_validate_json(row["package_json"]) for row in rows]
+
+    def add_profile_snapshot(self, summary: dict[str, Any]) -> str:
+        snapshot_id = _new_id("profile")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO profile_snapshots (id, summary_json, created_at) VALUES (?, ?, ?)",
+                (snapshot_id, json.dumps(summary, ensure_ascii=False), _now_iso()),
+            )
+        return snapshot_id
+
+    def list_profile_snapshots(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM profile_snapshots ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_learning_report(self, markdown_body: str, path: str | None = None) -> str:
+        report_id = _new_id("report")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO learning_reports (id, markdown_body, path, created_at) VALUES (?, ?, ?, ?)",
+                (report_id, markdown_body, path, _now_iso()),
+            )
+        return report_id
+
+    def add_skill_draft(self, name: str, path: str, source_ids: list[str]) -> str:
+        draft_id = _new_id("skill")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_drafts (id, name, path, source_ids_json, review_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (draft_id, name, path, json.dumps(source_ids), "draft", _now_iso()),
+            )
+        return draft_id
+
+    def list_skill_drafts(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM skill_drafts ORDER BY created_at ASC").fetchall()
+        return [dict(row) for row in rows]
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
