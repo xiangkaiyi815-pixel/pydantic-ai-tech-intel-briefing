@@ -1,0 +1,19 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "evt_fixture",
+    "event_type": "im.message.receive_v1"
+  },
+  "event": {
+    "message": {
+      "message_id": "om_fixture",
+      "chat_id": "oc_fixture",
+      "content": "{\"text\":\"hello from fixture\"}"
+    },
+    "sender": {
+      "sender_id": {
+        "open_id": "ou_fixture"
+      }
+    }
+  }
+}
