@@ -35,8 +35,16 @@
 
 - Replace `FakeAgentRuntime` with `MicrosoftAgentRuntime` plus a configured model provider.
 - Extend `verification.policy` with real search and source-backed verdicts.
-- Replace `FeishuHttpClient.reply_text` with live tenant-token and reply API calls.
+- `FeishuHttpClient.reply_text` already performs tenant-token retrieval and text replies. Extend it for encrypted callbacks, retry policy, token expiry refresh, and richer message types.
 - Add review commands for promoting `skills/drafts/<name>/SKILL.md` into active skills.
+
+## Feishu Binding Checklist
+
+1. Deploy or tunnel the FastAPI app so Feishu can reach `POST /feishu/events` over HTTPS.
+2. Set `SEARCH_ASSISTANT_FEISHU_ENABLED=true`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET`.
+3. In Feishu Open Platform, enable the bot, configure the event request URL, subscribe to `im.message.receive_v1`, and grant the permissions needed to receive and reply to messages.
+4. Run `python -m uvicorn search_assistant.server:create_app --factory --host 0.0.0.0 --port 8000`.
+5. Send a bot message and confirm the reply includes `classification` and `confidence`.
 
 ## Development Rules
 

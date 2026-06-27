@@ -42,7 +42,25 @@ Configure a Feishu bot application with an event callback URL pointing at:
 POST /feishu/events
 ```
 
-Phase 1 supports URL challenge responses and `im.message.receive_v1` fixture-style events. Live Feishu HTTP delivery is intentionally behind `FeishuHttpClient` and requires production credential wiring before deployment.
+Phase 1 supports URL challenge responses, `im.message.receive_v1` events, and live text replies through Feishu's tenant access token and message reply APIs.
+
+For a local tunnel or deployed server:
+
+```powershell
+$env:PYTHONPATH = "src"
+$env:SEARCH_ASSISTANT_FEISHU_ENABLED = "true"
+$env:FEISHU_APP_ID = "cli_xxx"
+$env:FEISHU_APP_SECRET = "xxx"
+python -m uvicorn search_assistant.server:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+Then configure the public HTTPS URL in Feishu:
+
+```text
+https://<your-domain>/feishu/events
+```
+
+The Feishu app must enable bot capabilities, subscribe to `im.message.receive_v1`, and grant the message permissions required by Feishu for receiving and replying as a bot.
 
 ## Verification Model
 
@@ -65,4 +83,5 @@ Design and implementation plan:
 
 - Generated skills are drafts only and are not auto-enabled.
 - Scheduled reports are represented by a CLI command.
-- Live Feishu token retrieval, encrypted callbacks, and production model providers remain later-phase work.
+- Encrypted Feishu callbacks and production model/search providers remain later-phase work.
+- The default local answer runtime is deterministic and fake. Bind a real model/search runtime before relying on answer quality in daily use.
