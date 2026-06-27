@@ -63,11 +63,35 @@ class SearchAssistantWorkflow:
 
     def _classify(self, text: str) -> Classification:
         lowered = text.lower()
-        if any(word in lowered for word in ("medical", "legal", "financial", "investment", "safety")):
+        if any(
+            word in lowered
+            for word in ("medical", "legal", "financial", "investment", "safety", "医疗", "法律", "金融", "投资", "安全")
+        ):
             return "high_stakes"
-        if any(word in lowered for word in ("compare", "migration", "risks", "architecture", "debug", "why")):
+        if any(
+            word in lowered
+            for word in (
+                "compare",
+                "migration",
+                "risks",
+                "architecture",
+                "debug",
+                "why",
+                "比较",
+                "风险",
+                "架构",
+                "调试",
+                "为什么",
+                "学习方向",
+                "学习路线",
+                "下一步",
+            )
+        ):
             return "hard"
-        if any(word in lowered for word in ("latest", "current", "newest", "today", "2026", "api", "version")):
+        if any(
+            word in lowered
+            for word in ("latest", "current", "newest", "today", "2026", "api", "version", "最新", "当前", "今天", "版本", "核验", "验证")
+        ):
             return "research"
         return "simple"
 
@@ -81,8 +105,14 @@ class SearchAssistantWorkflow:
     def _memory_updates(self, message: IncomingMessage, question_id: str) -> list[dict[str, str]]:
         lowered = message.text.lower()
         updates: list[dict[str, str]] = []
-        if "feishu" in lowered:
+        if any(word in lowered for word in ("feishu", "飞书", "bot", "机器人")):
             updates.append({"kind": "topic", "content": "Feishu integration", "source_id": question_id})
         if "agent framework" in lowered:
             updates.append({"kind": "topic", "content": "Microsoft Agent Framework", "source_id": question_id})
+        if any(word in lowered for word in ("学习", "learning", "路线", "方向", "下一步", "next step")):
+            updates.append({"kind": "intent", "content": "Learning direction planning", "source_id": question_id})
+        if any(word in lowered for word in ("verify", "verification", "核验", "验证", "证据", "source")):
+            updates.append({"kind": "practice", "content": "Verification practice", "source_id": question_id})
+        if any(word in lowered for word in ("api", "version", "版本")):
+            updates.append({"kind": "topic", "content": "API reliability", "source_id": question_id})
         return updates

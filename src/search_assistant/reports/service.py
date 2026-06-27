@@ -19,8 +19,26 @@ class ReportService:
             "",
             f"Question volume: {len(answers)}",
             "",
-            "## Important Answers",
+            "## Learning Direction",
         ]
+        topics = self._learning_topics()
+        if topics:
+            lines.extend(f"- {topic}" for topic in topics)
+        else:
+            lines.append("- No learning direction detected yet.")
+        lines.extend(
+            [
+                "",
+                "## Recommended Next Learning Actions",
+            ]
+        )
+        lines.extend(f"- {action}" for action in self._recommended_actions(topics))
+        lines.extend(
+            [
+                "",
+                "## Important Answers",
+            ]
+        )
         for answer in answers:
             lines.append(f"- ({answer.classification}, confidence {answer.confidence}) {answer.answer_text}")
         lines.extend(
@@ -38,3 +56,28 @@ class ReportService:
         report_path.write_text(markdown, encoding="utf-8")
         self.store.add_learning_report(markdown, str(report_path))
         return markdown
+
+    def _learning_topics(self) -> list[str]:
+        seen: set[str] = set()
+        topics: list[str] = []
+        for item in self.store.list_memory_items():
+            content = item["content"]
+            if content not in seen:
+                seen.add(content)
+                topics.append(content)
+        return topics
+
+    def _recommended_actions(self, topics: list[str]) -> list[str]:
+        actions: list[str] = []
+        topic_set = set(topics)
+        if "Feishu integration" in topic_set:
+            actions.append("Build a Feishu bot callback and reply checklist")
+        if "Microsoft Agent Framework" in topic_set:
+            actions.append("Map the Agent Framework workflow, runtime, and tool boundaries")
+        if "Verification practice" in topic_set or "API reliability" in topic_set:
+            actions.append("Create a key-data verification checklist before answers")
+        if "Learning direction planning" in topic_set:
+            actions.append("Turn repeated questions into a weekly learning plan")
+        if not actions:
+            actions.append("Ask three focused questions in one topic so the assistant can identify a learning direction")
+        return actions

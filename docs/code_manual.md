@@ -31,6 +31,8 @@
 7. Run calibration for hard, research, high-stakes, or unverified answers.
 8. Persist the answer and memory updates.
 
+Chinese and English prompts are both considered by the built-in classifier for Feishu integration, Microsoft Agent Framework, API reliability, verification practice, and learning-direction planning. These heuristics are scaffolding for local testing and should be replaced or augmented by a real model/search runtime for production answer quality.
+
 ## Extension Points
 
 - Replace `FakeAgentRuntime` with `MicrosoftAgentRuntime` plus a configured model provider.

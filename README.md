@@ -66,6 +66,8 @@ The Feishu app must enable bot capabilities, subscribe to `im.message.receive_v1
 
 The assistant classifies questions as `simple`, `research`, `hard`, or `high_stakes`. Research, hard, high-stakes, current, versioned, numeric, policy, API, and other fragile claims require verification. If a claim cannot be verified in Phase 1 local mode, it is recorded as unverified and confidence is downgraded.
 
+The learning report aggregates stored memory into a learning direction and recommended next actions. Current built-in intent detection recognizes English and Chinese prompts around Feishu, Microsoft Agent Framework, API reliability, verification practice, and learning direction planning.
+
 ## Development
 
 Run tests:
