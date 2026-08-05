@@ -44,6 +44,18 @@ class ReportService:
         lines.extend(
             [
                 "",
+                "## Experience Notes",
+            ]
+        )
+        experiences = self.store.list_experience_items()
+        if experiences:
+            for item in experiences:
+                lines.append(f"- {item['title']}: {item['body']}")
+        else:
+            lines.append("- No experience notes recorded yet.")
+        lines.extend(
+            [
+                "",
                 "## Unresolved Or Weakly Verified Areas",
             ]
         )
@@ -78,6 +90,12 @@ class ReportService:
             actions.append("Create a key-data verification checklist before answers")
         if "Learning direction planning" in topic_set:
             actions.append("Turn repeated questions into a weekly learning plan")
+        if "AI infrastructure and model deployment" in topic_set:
+            actions.append("Build a model deployment feasibility checklist")
+        if "AI memory architecture" in topic_set:
+            actions.append("Map CXL, memory pooling, and accelerator memory tiers")
+        if "Physical AI and world models" in topic_set:
+            actions.append("Track world-model and embodied-AI releases against primary sources")
         if not actions:
             actions.append("Ask three focused questions in one topic so the assistant can identify a learning direction")
         return actions

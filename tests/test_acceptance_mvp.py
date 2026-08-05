@@ -2,11 +2,17 @@ from fastapi.testclient import TestClient
 
 from search_assistant.feishu.client import FakeFeishuClient
 from search_assistant.server import create_app
+from search_assistant.workflow.runtime import FakeAgentRuntime
 
 
 def test_phase_1_acceptance_flow(tmp_path):
     feishu = FakeFeishuClient()
-    app = create_app(data_dir=tmp_path, feishu_client=feishu)
+    app = create_app(
+        data_dir=tmp_path,
+        feishu_client=feishu,
+        runtime=FakeAgentRuntime(),
+        search_client=EmptySearchClient(),
+    )
     client = TestClient(app)
     payload = {
         "schema": "2.0",
@@ -25,4 +31,17 @@ def test_phase_1_acceptance_flow(tmp_path):
 
     assert response.status_code == 200
     assert feishu.replies
-    assert "confidence" in feishu.replies[0]["text"]
+    assert "confidence" in _post_text(feishu.replies[0]["post"])
+
+
+class EmptySearchClient:
+    def search(self, query, limit=5):
+        return []
+
+
+def _post_text(post):
+    return "\n".join(
+        str(element.get("text", ""))
+        for line in post["zh_cn"]["content"]
+        for element in line
+    )

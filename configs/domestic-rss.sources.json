@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "weibo-keyword",
+      "platform": "weibo",
+      "kind": "query",
+      "route_template": "/weibo/keyword/{query}",
+      "domains": ["weibo.com", "weibo.cn"],
+      "enabled": true,
+      "requires_login": false,
+      "requires_browser": false,
+      "requires_external_subscription": false
+    },
+    {
+      "id": "zhihu-hot",
+      "platform": "zhihu",
+      "kind": "hot",
+      "route_template": "/zhihu/hot",
+      "domains": ["zhihu.com", "zhuanlan.zhihu.com"],
+      "enabled": true,
+      "requires_login": false,
+      "requires_browser": false,
+      "requires_external_subscription": false
+    },
+    {
+      "id": "36kr-newsflashes",
+      "platform": "36kr",
+      "kind": "hot",
+      "route_template": "/36kr/newsflashes",
+      "domains": ["36kr.com"],
+      "enabled": true,
+      "requires_login": false,
+      "requires_browser": false,
+      "requires_external_subscription": false
+    },
+    {
+      "id": "juejin-aicoding",
+      "platform": "juejin",
+      "kind": "hot",
+      "route_template": "/juejin/aicoding",
+      "domains": ["juejin.cn"],
+      "enabled": true,
+      "requires_login": false,
+      "requires_browser": false,
+      "requires_external_subscription": false
+    },
+    {
+      "id": "douyin-user",
+      "platform": "douyin",
+      "kind": "subscription",
+      "route_template": "/douyin/user/{uid}",
+      "domains": ["douyin.com"],
+      "parameters": {"uid": ""},
+      "enabled": false,
+      "requires_login": false,
+      "requires_browser": true,
+      "requires_external_subscription": false
+    },
+    {
+      "id": "kuaishou-profile",
+      "platform": "kuaishou",
+      "kind": "subscription",
+      "route_template": "/kuaishou/profile/{principal_id}",
+      "domains": ["kuaishou.com"],
+      "parameters": {"principal_id": ""},
+      "enabled": false,
+      "requires_login": false,
+      "requires_browser": true,
+      "requires_external_subscription": false
+    }
+  ]
+}

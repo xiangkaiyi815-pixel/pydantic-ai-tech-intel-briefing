@@ -1,89 +1,175 @@
-# Search Assistant
+# Pydantic AI Technology Intelligence Briefing
 
-Feishu-connected search assistant powered by Microsoft Agent Framework. The Phase 1 MVP receives local CLI questions or Feishu-style event payloads, produces structured answer packages, records interactions in SQLite, runs conservative verification/calibration gates, generates learning reports, and creates reviewable skill drafts.
+A local-first Pydantic AI assistant that turns a topic into a Chinese daily
+technology-intelligence briefing. It plans technical queries, retrieves
+publicly accessible material, preserves original URLs, ranks signals, and
+synthesizes the implementation details that matter: models, representations,
+interfaces, validation layers, system boundaries, and open engineering gaps.
+
+It is built for engineers who need a repeatable way to follow an area without
+turning their daily report into a list of headlines.
+
+## What It Does
+
+- Plans bilingual technical queries with GLM-4.7 through Pydantic AI.
+- Searches public web engines plus read-only MCP sources for GitHub, arXiv,
+  Hacker News, and Stack Exchange.
+- Supports public-index or no-login discovery for selected Chinese platforms.
+- Stores topics, feedback, retained sources, reports, and learning evidence in
+  SQLite.
+- Produces a Chinese `content collection report` with search directions,
+  keywords, a concise technical brief, free-form detailed analysis, next
+  research directions, implementation suggestions, and original URLs.
+- Accepts case articles as feedback so future query planning can follow the
+  technology object and implementation path implied by the article.
+- Provides Feishu webhook, long-connection, and polling adapters for local
+  deployments.
+
+## Design Principles
+
+1. **Evidence before prose.** Every retained source keeps its original URL.
+2. **No login-state automation.** Private posts, internal search, comments,
+   and recommendation feeds are intentionally out of scope.
+3. **Synthesis, not a search log.** Short summaries name concrete mechanisms;
+   detailed summaries choose their own evidence-led structure rather than
+   filling a fixed theme form.
+4. **Fail closed on weak evidence.** Search-page dumps, login pages, generic
+   references, and known CAD medical false positives are filtered before
+   ranking. A synthesis timeout retries with a smaller high-ranked evidence
+   set instead of silently inventing material.
+5. **Local control.** Secrets stay in ignored local configuration or deployment
+   secret stores. The checked-in configuration contains no credentials.
 
 ## Architecture
 
-- `feishu`: parses Feishu callback events and sends replies through a client adapter.
-- `workflow`: orchestrates answer generation, claim extraction, verification policy, calibration, and persistence.
-- `memory`: stores interactions, answers, evidence, memory items, profile snapshots, reports, and skill drafts in SQLite.
-- `profile`: turns answer history into compact user-profile snapshots.
-- `reports`: exports learning reports as markdown.
-- `skills`: creates draft `SKILL.md` files for human review.
+```mermaid
+flowchart LR
+    Topic[Topic or case feedback] --> Planner[GLM query planner]
+    Planner --> Retrieval[Public search and read-only MCP]
+    Retrieval --> Filter[URL, relevance, and noise filters]
+    Filter --> Rank[Deduplicate and rank]
+    Rank --> SQLite[(SQLite evidence store)]
+    Rank --> Synthesis[GLM technical synthesis]
+    Synthesis --> Report[Chinese Markdown briefing]
+    Report --> SQLite
+    Report --> Feishu[Optional Feishu delivery]
+```
 
-Microsoft Agent Framework is integrated behind `MicrosoftAgentRuntime` in `search_assistant.workflow.runtime`. Tests and local commands use `FakeAgentRuntime` so the MVP is deterministic without live credentials.
+Read the full module map in [docs/architecture.md](docs/architecture.md).
 
-## Setup
+## Quick Start
+
+Requirements: Python 3.11 to 3.13. The project is developed and tested with
+Python 3.12 on Windows.
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+Copy-Item .env.example .env.local
 ```
 
-Copy `.env.example` to `.env.local` for local notes. Do not commit real Feishu or model secrets.
+Set a model provider and its credentials only in `.env.local`, your shell, or
+your deployment secret manager. Never commit a populated `.env.local` file.
+See [docs/configuration.md](docs/configuration.md) for variable definitions and
+the MCP/RSSHub setup.
 
-## Local Commands
+Run a one-off daily briefing:
 
 ```powershell
-python -m search_assistant.cli ask "What should be verified before answering current API questions?"
-python -m search_assistant.cli report
-python -m search_assistant.cli skill-draft "Reliable API Answers"
-python -m search_assistant.cli feishu-fixture tests/fixtures/feishu_message_event.json
+python -m search_assistant.cli brief-run "AI industrial development"
 ```
 
-Use `--data-dir <path>` on any command to isolate local data.
+The Markdown output is written to `<data-dir>/briefs/`. The default data
+directory is `.local-data/` and is ignored by Git.
 
-## Feishu Integration
+## Daily Briefing Contract
 
-Configure a Feishu bot application with an event callback URL pointing at:
+Each report is written in Chinese and always contains:
 
-```text
-POST /feishu/events
-```
+1. Search directions
+2. Keywords
+3. Search-content summary
+4. Concise technical summary
+5. Detailed evidence-led analysis
+6. AI analysis judgment
+7. Next research directions
+8. Implementation suggestions
+9. Original source URLs
 
-Phase 1 supports URL challenge responses, `im.message.receive_v1` events, and live text replies through Feishu's tenant access token and message reply APIs.
+The concise summary must identify an implementation path where the evidence
+supports it. The detailed section uses two to five self-chosen analysis blocks;
+it does not force every source into a technical-map checklist. The operating
+contract is in [skills/content-collection-report/SKILL.md](skills/content-collection-report/SKILL.md).
 
-For a local tunnel or deployed server:
+## Search Coverage
+
+The default `hybrid` provider combines read-only MCP tools with Bing, Baidu,
+and Google public-result pages. Platform capability is deliberately explicit:
+
+| Source family | Access mode | Notes |
+| --- | --- | --- |
+| GitHub, arXiv, Hacker News, Stack Exchange | Read-only MCP | URL-bearing public results |
+| General web | Public engine results | Bing, Baidu, Google; markup and anti-bot behavior can vary |
+| Bilibili | Public video-search API | No login state |
+| Weibo, Zhihu, 36Kr, Juejin | Optional local RSSHub MCP | Public feeds only |
+| WeChat, Toutiao, Xiaohongshu | Baidu public-index discovery | Original target URLs only; no detail-page fetching |
+| Douyin and Kuaishou | Disabled RSSHub subscription slots | Require public account identifiers and route validation |
+| LinkedIn, X, Reddit, YouTube | Public-result discovery | No private, internal, or login-gated material |
+
+Configured coverage is not proof that a platform produced useful results for a
+particular topic. The report retains only sources that pass its relevance and
+URL checks. Details: [docs/platform-coverage.md](docs/platform-coverage.md).
+
+## Operations
+
+Useful commands:
 
 ```powershell
-$env:PYTHONPATH = "src"
-$env:SEARCH_ASSISTANT_FEISHU_ENABLED = "true"
-$env:FEISHU_APP_ID = "cli_xxx"
-$env:FEISHU_APP_SECRET = "xxx"
-python -m uvicorn search_assistant.server:create_app --factory --host 0.0.0.0 --port 8000
+python -m search_assistant.cli ask "Explain a technical concept"
+python -m search_assistant.cli topic-add "industrial AI"
+python -m search_assistant.cli brief-feedback "industrial AI" "focus on controlled MES agents" --url "https://example.com/case"
+python -m search_assistant.cli brief-run "industrial AI"
+python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 86400
+python -m search_assistant.cli doctor
+python -m search_assistant.cli eval-suite
 ```
 
-Then configure the public HTTPS URL in Feishu:
+Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
+Feishu guidance are in [docs/operations.md](docs/operations.md).
 
-```text
-https://<your-domain>/feishu/events
-```
-
-The Feishu app must enable bot capabilities, subscribe to `im.message.receive_v1`, and grant the message permissions required by Feishu for receiving and replying as a bot.
-
-## Verification Model
-
-The assistant classifies questions as `simple`, `research`, `hard`, or `high_stakes`. Research, hard, high-stakes, current, versioned, numeric, policy, API, and other fragile claims require verification. If a claim cannot be verified in Phase 1 local mode, it is recorded as unverified and confidence is downgraded.
-
-The learning report aggregates stored memory into a learning direction and recommended next actions. Current built-in intent detection recognizes English and Chinese prompts around Feishu, Microsoft Agent Framework, API reliability, verification practice, and learning direction planning.
-
-## Development
-
-Run tests:
+## Development And Verification
 
 ```powershell
-python -m pytest -q
+$env:PYTHONUTF8 = "1"
+py -3.12 -m pytest -q
 ```
 
-Design and implementation plan:
+The suite covers configuration, search parsing, MCP and RSSHub adapters,
+briefing contracts, GLM JSON validation, Feishu adapters, storage, verification,
+and regression cases for noisy search results. See
+[docs/development.md](docs/development.md) for test boundaries.
 
-- `docs/superpowers/specs/2026-06-26-search-assistant-design.md`
-- `docs/superpowers/plans/2026-06-26-search-assistant-mvp.md`
+## Documentation
 
-## Phase 1 Limits
+- [Architecture](docs/architecture.md)
+- [Configuration](docs/configuration.md)
+- [Platform coverage and boundaries](docs/platform-coverage.md)
+- [Operations and scheduling](docs/operations.md)
+- [Development guide](docs/development.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
 
-- Generated skills are drafts only and are not auto-enabled.
-- Scheduled reports are represented by a CLI command.
-- Encrypted Feishu callbacks and production model/search providers remain later-phase work.
-- The default local answer runtime is deterministic and fake. Bind a real model/search runtime before relying on answer quality in daily use.
+## Status And Limits
+
+This is a working local deployment project, not a claim of exhaustive web or
+social-media coverage. Search pages can change, block automation, or omit
+results. Public-index discovery does not bypass access controls. Model output
+is constrained to the retrieved evidence, but source material may still omit
+implementation details; the report should name those gaps rather than fill them
+with speculation.
+
+## License
+
+[MIT](LICENSE)

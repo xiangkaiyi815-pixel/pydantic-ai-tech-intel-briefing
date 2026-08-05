@@ -1,56 +1,62 @@
 # Code Manual
 
-## Module Map
+This document is the current module guide. It is intentionally shorter than a
+line-by-line API reference; public behavior and deployment instructions belong
+in the other documents under `docs/`.
 
-- `search_assistant.contracts`: Pydantic data contracts shared across the system.
-- `search_assistant.config`: environment-backed settings.
-- `search_assistant.memory.store`: SQLite persistence and append-first memory behavior.
-- `search_assistant.verification.policy`: deterministic claim verification and calibration trigger rules.
-- `search_assistant.workflow.runtime`: fake runtime plus Microsoft Agent Framework adapter boundary.
-- `search_assistant.workflow.service`: main answer workflow.
-- `search_assistant.feishu.events`: Feishu event parsing and challenge handling.
-- `search_assistant.feishu.client`: fake and production Feishu client boundaries.
-- `search_assistant.server`: FastAPI app factory.
-- `search_assistant.profile.service`: user profile snapshots.
-- `search_assistant.reports.service`: markdown learning reports.
-- `search_assistant.skills.service`: reviewable skill draft generation.
-- `search_assistant.cli`: local operation commands.
+## Packages
 
-## Data Contracts
+| Package | Responsibility |
+| --- | --- |
+| `contracts` | Pydantic models for messages, source evidence, daily briefings, and synthesis output. |
+| `config` | Environment-backed settings. Secrets are read at runtime and never written to reports. |
+| `search` | Browser, MCP, RSSHub, public Bilibili, Brave, SearXNG, and fallback search adapters. |
+| `mcp` | Read-only local MCP servers for public sources and domestic RSS feeds. |
+| `briefing` | Topic planning, source filtering, ranking, synthesis, Markdown rendering, and feedback handling. |
+| `workflow` | Ordinary question-answering, verification, calibration, final review, and active-skill context. |
+| `memory` | SQLite schema and scoped persistence. |
+| `verification` | Claim extraction, deterministic source matching, and evidence backfill. |
+| `evaluation` | Repeatable workflow evaluation and persisted quality records. |
+| `feishu` | Callback parsing, long connection, polling, reply formatting, and safe diagnostics. |
+| `reports`, `profile`, `skills` | Learning reports, compact user profiles, and human-reviewed local skill drafts. |
 
-`IncomingMessage` normalizes CLI and Feishu messages. `AnswerPackage` is the core response envelope and always includes classification, confidence, verification lists, calibration data, and memory updates.
+## Briefing Flow
 
-## Workflow Steps
+1. `DailyBriefingService.build_search_plan()` combines user feedback, GLM
+   planning output, deterministic technical coverage queries, and platform
+   routes.
+2. `_collect_sources()` runs retrieval concurrently under a budget, rejects
+   search-page dumps, generic references, login pages, invalid platform URLs,
+   and obvious false positives, then stores compact source evidence.
+3. Sources are deduplicated and ranked. The full retained set remains in SQLite
+   and the report; only the highest-ranked evidence is sent to the synthesis
+   model.
+4. `GLMPydanticAIRuntime.synthesize_briefing()` returns validated JSON with a
+   concise technical summary, free-form detailed analysis, evidence anchors,
+   next research directions, and implementation suggestions. A timeout retries
+   with a smaller evidence set.
+5. `render_markdown()` writes the Chinese report and preserves all retained
+   original URLs.
 
-1. Check for a stored answer by dedupe key.
-2. Persist the incoming interaction.
-3. Classify the question.
-4. Retrieve memory context.
-5. Generate a draft through `AgentRuntime`.
-6. Extract fragile claims and mark unverified claims when no verifier is configured.
-7. Run calibration for hard, research, high-stakes, or unverified answers.
-8. Persist the answer and memory updates.
+## Data Boundaries
 
-Chinese and English prompts are both considered by the built-in classifier for Feishu integration, Microsoft Agent Framework, API reliability, verification practice, and learning-direction planning. These heuristics are scaffolding for local testing and should be replaced or augmented by a real model/search runtime for production answer quality.
+- `.local-data/` contains SQLite databases, generated reports, and runtime
+  evidence. It is not source-controlled.
+- `.env.local` is ignored and should be the only local file containing model or
+  Feishu credentials.
+- Checked-in MCP configurations describe commands and bindings only; they must
+  remain read-only and URL-bearing.
+- Generated skills are drafts until a human explicitly promotes them.
 
 ## Extension Points
 
-- Replace `FakeAgentRuntime` with `MicrosoftAgentRuntime` plus a configured model provider.
-- Extend `verification.policy` with real search and source-backed verdicts.
-- `FeishuHttpClient.reply_text` already performs tenant-token retrieval and text replies. Extend it for encrypted callbacks, retry policy, token expiry refresh, and richer message types.
-- Add review commands for promoting `skills/drafts/<name>/SKILL.md` into active skills.
+- Add a public source through `search/provider.py` or a read-only MCP binding.
+- Add platform constraints in `configs/domestic-rss.sources.json` and verify
+  original-domain enforcement with tests.
+- Add a model runtime by implementing `AgentRuntime` and wiring it in
+  `runtime_from_settings()`.
+- Add quality cases in the existing test modules before changing filtering,
+  report shape, or verification policy.
 
-## Feishu Binding Checklist
-
-1. Deploy or tunnel the FastAPI app so Feishu can reach `POST /feishu/events` over HTTPS.
-2. Set `SEARCH_ASSISTANT_FEISHU_ENABLED=true`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET`.
-3. In Feishu Open Platform, enable the bot, configure the event request URL, subscribe to `im.message.receive_v1`, and grant the permissions needed to receive and reply to messages.
-4. Run `python -m uvicorn search_assistant.server:create_app --factory --host 0.0.0.0 --port 8000`.
-5. Send a bot message and confirm the reply includes `classification` and `confidence`.
-
-## Development Rules
-
-- Write tests first for behavior changes.
-- Keep network and model calls behind interfaces.
-- Do not commit secrets or local SQLite files.
-- Generated skill drafts require human review before activation.
+For deployment behavior, see [operations.md](operations.md). For source access
+limits, see [platform-coverage.md](platform-coverage.md).

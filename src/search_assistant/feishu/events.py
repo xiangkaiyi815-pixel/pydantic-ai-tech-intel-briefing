@@ -14,6 +14,15 @@ def handle_challenge(payload: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def validate_verification_token(payload: dict[str, Any], expected_token: str | None) -> None:
+    if not expected_token:
+        return
+    header = _dict(payload.get("header"))
+    actual = payload.get("token") or header.get("token")
+    if actual != expected_token:
+        raise ValueError("Feishu verification token mismatch")
+
+
 def parse_feishu_event(payload: dict[str, Any]) -> IncomingMessage:
     header = _dict(payload.get("header"))
     event_type = header.get("event_type")

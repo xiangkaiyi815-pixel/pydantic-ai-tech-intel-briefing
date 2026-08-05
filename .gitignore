@@ -11,4 +11,6 @@ __pycache__/
 .env.local
 .local-data/
 /reports/
+outputs/
+.pytest-tmp*/
 skills/drafts/

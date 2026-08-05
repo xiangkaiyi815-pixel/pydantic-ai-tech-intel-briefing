@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "public_sources": {
+      "command": "py",
+      "args": ["-3.12", "scripts/public_sources_mcp.py"],
+      "cwd": ".."
+    },
+    "domestic_rss": {
+      "command": "py",
+      "args": ["-3.12", "scripts/domestic_rss_mcp.py"],
+      "cwd": ".."
+    }
+  },
+  "searchBindings": {
+    "public_sources": {
+      "tool": "search_public_sources",
+      "arguments": {
+        "query": "{query}",
+        "limit": "{limit}"
+      }
+    },
+    "domestic_rss": {
+      "tool": "search_domestic_rss",
+      "siteDomains": [
+        "weibo.com",
+        "weibo.cn",
+        "zhihu.com",
+        "douyin.com",
+        "kuaishou.com",
+        "36kr.com",
+        "juejin.cn"
+      ],
+      "arguments": {
+        "query": "{query}",
+        "limit": "{limit}"
+      }
+    }
+  }
+}
