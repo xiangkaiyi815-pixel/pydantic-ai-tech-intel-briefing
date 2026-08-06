@@ -11,6 +11,7 @@ from search_assistant.contracts import (
     AnswerPackage,
     CollectedSource,
     DailyBriefing,
+    DomainKnowledgeCandidate,
     DomainKnowledgeEntity,
     DomainKnowledgeGraph,
     DomainKnowledgeRelation,
@@ -180,6 +181,51 @@ class MemoryStore:
                     UNIQUE(topic_id, run_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS trajectory_logs (
+                    id TEXT PRIMARY KEY,
+                    question_id TEXT NOT NULL UNIQUE,
+                    user_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS trajectory_evaluations (
+                    id TEXT PRIMARY KEY,
+                    trajectory_id TEXT NOT NULL,
+                    question_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    process_json TEXT NOT NULL,
+                    quality_json TEXT NOT NULL,
+                    diagnosis_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_candidates (
+                    id TEXT PRIMARY KEY,
+                    topic TEXT NOT NULL,
+                    claim TEXT NOT NULL,
+                    applies_when TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    contradictions_json TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('candidate', 'validated', 'deprecated')),
+                    source_ids_json TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_candidate_events (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS domain_knowledge_graphs (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -218,6 +264,65 @@ class MemoryStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (graph_id, id)
                 );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_candidate_graph_links (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    entity_id TEXT,
+                    relation_id TEXT,
+                    link_type TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TRIGGER IF NOT EXISTS trajectory_logs_no_update
+                BEFORE UPDATE ON trajectory_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'trajectory logs are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trajectory_logs_no_delete
+                BEFORE DELETE ON trajectory_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'trajectory logs are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trajectory_evaluations_no_update
+                BEFORE UPDATE ON trajectory_evaluations
+                BEGIN
+                    SELECT RAISE(ABORT, 'trajectory evaluations are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trajectory_evaluations_no_delete
+                BEFORE DELETE ON trajectory_evaluations
+                BEGIN
+                    SELECT RAISE(ABORT, 'trajectory evaluations are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS domain_knowledge_candidate_events_no_update
+                BEFORE UPDATE ON domain_knowledge_candidate_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'domain knowledge candidate events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS domain_knowledge_candidate_events_no_delete
+                BEFORE DELETE ON domain_knowledge_candidate_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'domain knowledge candidate events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS domain_knowledge_candidate_graph_links_no_update
+                BEFORE UPDATE ON domain_knowledge_candidate_graph_links
+                BEGIN
+                    SELECT RAISE(ABORT, 'domain knowledge candidate graph links are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS domain_knowledge_candidate_graph_links_no_delete
+                BEFORE DELETE ON domain_knowledge_candidate_graph_links
+                BEGIN
+                    SELECT RAISE(ABORT, 'domain knowledge candidate graph links are immutable');
+                END;
                 """
             )
             self._ensure_column(connection, "memory_items", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
@@ -297,6 +402,7 @@ class MemoryStore:
                 (package.question_id, package.question_id),
             )
             self._insert_missing_verified_claims(connection, package.question_id, package.verified_claims)
+            self._insert_trajectory_log(connection, package)
 
     def has_interaction(self, dedupe_key: str) -> bool:
         with self._connect() as connection:
@@ -395,6 +501,235 @@ class MemoryStore:
             rows = connection.execute(
                 "SELECT * FROM evidence ORDER BY created_at ASC, id ASC"
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_trajectory_logs(
+        self,
+        user_id: str | None = None,
+        chat_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM trajectory_logs"
+        parameters: tuple[str, ...] = ()
+        if user_id is not None and chat_id is not None:
+            query += " WHERE user_id = ? AND chat_id = ?"
+            parameters = (user_id, chat_id)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._trajectory_row(row) for row in rows]
+
+    def latest_trajectory_for_question(self, question_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM trajectory_logs WHERE question_id = ? ORDER BY created_at DESC LIMIT 1",
+                (question_id,),
+            ).fetchone()
+        return self._trajectory_row(row) if row is not None else None
+
+    def add_trajectory_evaluation(
+        self,
+        trajectory_id: str,
+        question_id: str,
+        result_verification: dict[str, Any],
+        process_verification: dict[str, Any],
+        quality_verification: dict[str, Any],
+        diagnosis: dict[str, Any],
+    ) -> str:
+        evaluation_id = _new_id("traj_eval")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO trajectory_evaluations (
+                    id, trajectory_id, question_id, result_json, process_json,
+                    quality_json, diagnosis_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evaluation_id,
+                    trajectory_id,
+                    question_id,
+                    json.dumps(result_verification, ensure_ascii=False),
+                    json.dumps(process_verification, ensure_ascii=False),
+                    json.dumps(quality_verification, ensure_ascii=False),
+                    json.dumps(diagnosis, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return evaluation_id
+
+    def list_trajectory_evaluations(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trajectory_evaluations ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "result_verification": json.loads(row["result_json"]),
+                "process_verification": json.loads(row["process_json"]),
+                "quality_verification": json.loads(row["quality_json"]),
+                "diagnosis": json.loads(row["diagnosis_json"]),
+            }
+            for row in rows
+        ]
+
+    def add_domain_knowledge_candidate(self, candidate: DomainKnowledgeCandidate) -> str:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO domain_knowledge_candidates (
+                    id, topic, claim, applies_when, evidence_json, contradictions_json,
+                    confidence, status, source_ids_json, fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.id,
+                    candidate.topic,
+                    candidate.claim,
+                    candidate.applies_when,
+                    json.dumps([item.model_dump(mode="json") for item in candidate.evidence], ensure_ascii=False),
+                    json.dumps(candidate.contradictions, ensure_ascii=False),
+                    candidate.confidence,
+                    candidate.status,
+                    json.dumps(candidate.source_ids, ensure_ascii=False),
+                    candidate.fingerprint,
+                    candidate.created_at,
+                    candidate.updated_at,
+                ),
+            )
+            if cursor.rowcount:
+                self._insert_candidate_event(
+                    connection,
+                    candidate.id,
+                    from_status=None,
+                    to_status="candidate",
+                    reason="created from traceable search evidence",
+                )
+                return candidate.id
+            row = connection.execute(
+                "SELECT id FROM domain_knowledge_candidates WHERE fingerprint = ?",
+                (candidate.fingerprint,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("candidate insert was ignored without a matching fingerprint")
+        return str(row["id"])
+
+    def list_domain_knowledge_candidates(self, status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM domain_knowledge_candidates"
+        parameters: tuple[str, ...] = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            parameters = (status,)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._domain_candidate_row(row) for row in rows]
+
+    def get_domain_knowledge_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM domain_knowledge_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+        return self._domain_candidate_row(row) if row is not None else None
+
+    def update_domain_knowledge_candidate_status(
+        self,
+        candidate_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        allowed_transitions = {
+            "candidate": {"validated", "deprecated"},
+            "validated": {"deprecated"},
+            "deprecated": set(),
+        }
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM domain_knowledge_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
+            current_status = str(row["status"])
+            if status == current_status:
+                return
+            if status not in allowed_transitions.get(current_status, set()):
+                raise ValueError(f"invalid candidate status transition: {current_status} -> {status}")
+            now = _now_iso()
+            connection.execute(
+                "UPDATE domain_knowledge_candidates SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, candidate_id),
+            )
+            self._insert_candidate_event(connection, candidate_id, current_status, status, reason)
+
+    def list_domain_knowledge_candidate_events(self, candidate_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM domain_knowledge_candidate_events"
+        parameters: tuple[str, ...] = ()
+        if candidate_id is not None:
+            query += " WHERE candidate_id = ?"
+            parameters = (candidate_id,)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def link_domain_candidate_to_graph(
+        self,
+        candidate_id: str,
+        graph_id: str,
+        entity_id: str | None = None,
+        relation_id: str | None = None,
+        link_type: str = "supports",
+        note: str = "",
+    ) -> str:
+        link_id = _new_id("knowledge_link")
+        with self._connect() as connection:
+            candidate = connection.execute(
+                "SELECT 1 FROM domain_knowledge_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
+            graph = connection.execute(
+                "SELECT 1 FROM domain_knowledge_graphs WHERE id = ?",
+                (graph_id,),
+            ).fetchone()
+            if graph is None:
+                raise KeyError(f"domain knowledge graph not found: {graph_id}")
+            if entity_id is not None:
+                entity = connection.execute(
+                    "SELECT 1 FROM domain_knowledge_entities WHERE graph_id = ? AND id = ?",
+                    (graph_id, entity_id),
+                ).fetchone()
+                if entity is None:
+                    raise KeyError(f"domain knowledge entity not found: {graph_id}/{entity_id}")
+            if relation_id is not None:
+                relation = connection.execute(
+                    "SELECT 1 FROM domain_knowledge_relations WHERE graph_id = ? AND id = ?",
+                    (graph_id, relation_id),
+                ).fetchone()
+                if relation is None:
+                    raise KeyError(f"domain knowledge relation not found: {graph_id}/{relation_id}")
+            connection.execute(
+                """
+                INSERT INTO domain_knowledge_candidate_graph_links (
+                    id, candidate_id, graph_id, entity_id, relation_id, link_type, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (link_id, candidate_id, graph_id, entity_id, relation_id, link_type, note, _now_iso()),
+            )
+        return link_id
+
+    def list_domain_candidate_graph_links(self, candidate_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM domain_knowledge_candidate_graph_links"
+        parameters: tuple[str, ...] = ()
+        if candidate_id is not None:
+            query += " WHERE candidate_id = ?"
+            parameters = (candidate_id,)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def update_answer_verification(
@@ -588,6 +923,11 @@ class MemoryStore:
             "domain_knowledge_graphs",
             "domain_knowledge_entities",
             "domain_knowledge_relations",
+            "trajectory_logs",
+            "trajectory_evaluations",
+            "domain_knowledge_candidates",
+            "domain_knowledge_candidate_events",
+            "domain_knowledge_candidate_graph_links",
         )
         with self._connect() as connection:
             return {
@@ -1037,6 +1377,75 @@ class MemoryStore:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _insert_trajectory_log(self, connection: sqlite3.Connection, package: AnswerPackage) -> None:
+        interaction = connection.execute(
+            "SELECT user_id, chat_id, text, source FROM interactions WHERE id = ?",
+            (package.question_id,),
+        ).fetchone()
+        context = package.trajectory_context
+        payload = {
+            "question_id": package.question_id,
+            "question": str(interaction["text"]) if interaction is not None else "",
+            "classification": package.classification,
+            "search_record": package.search_record.model_dump(mode="json") if package.search_record else None,
+            "draft_answer": context.get("draft_answer"),
+            "calibration": package.calibration,
+            "review": package.review,
+            "final_answer": package.answer_text,
+            "verified_claims": [claim.model_dump(mode="json") for claim in package.verified_claims],
+            "unverified_claims": package.unverified_claims,
+            "active_skills": context.get("active_skills", []),
+            "answer_strategy": context.get("answer_strategy", {}),
+            "runtime_metadata": context.get("runtime_metadata", {}),
+            "execution_flags": context.get("execution_flags", {}),
+        }
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO trajectory_logs (
+                id, question_id, user_id, chat_id, source, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _new_id("traj"),
+                package.question_id,
+                str(interaction["user_id"]) if interaction is not None else "system",
+                str(interaction["chat_id"]) if interaction is not None else "system",
+                str(interaction["source"]) if interaction is not None else "direct-store",
+                json.dumps(payload, ensure_ascii=False),
+                _now_iso(),
+            ),
+        )
+
+    @staticmethod
+    def _trajectory_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {**dict(row), "payload": json.loads(row["payload_json"])}
+
+    @staticmethod
+    def _domain_candidate_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            **dict(row),
+            "evidence": json.loads(row["evidence_json"]),
+            "contradictions": json.loads(row["contradictions_json"]),
+            "source_ids": json.loads(row["source_ids_json"]),
+        }
+
+    @staticmethod
+    def _insert_candidate_event(
+        connection: sqlite3.Connection,
+        candidate_id: str,
+        from_status: str | None,
+        to_status: str,
+        reason: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO domain_knowledge_candidate_events (
+                id, candidate_id, from_status, to_status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (_new_id("knowledge_event"), candidate_id, from_status, to_status, reason, _now_iso()),
+        )
 
     def _insert_missing_verified_claims(
         self,

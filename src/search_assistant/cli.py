@@ -12,6 +12,7 @@ from search_assistant.contracts import IncomingMessage
 from search_assistant.briefing.service import DailyBriefingService
 from search_assistant.diagnostics.readiness import run_readiness_diagnostics
 from search_assistant.evaluation.service import EvaluationService
+from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.feishu.client import FakeFeishuClient, FeishuHttpClient
 from search_assistant.feishu.events import parse_feishu_event
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
@@ -756,6 +757,12 @@ def _skill_draft_by_path(store: MemoryStore, active_path: str) -> dict[str, Any]
 def _run_evolution(store: MemoryStore, data_dir: Path) -> dict[str, object]:
     markdown = ReportService(store, output_dir=data_dir / "reports").generate_markdown()
     report_path = data_dir / "reports" / "learning-report.md"
+    link_result = DomainKnowledgeCandidateService(store).link_candidates_to_knowledge_graphs()
+    candidates = store.list_domain_knowledge_candidates()
+    candidate_status_counts = {
+        status: sum(1 for item in candidates if item["status"] == status)
+        for status in ("candidate", "validated", "deprecated")
+    }
     skill_service = SkillDraftService(store, drafts_dir=data_dir / "skills" / "drafts")
     refreshed_skill_paths = skill_service.refresh_reviewable_drafts()
     skill_paths = skill_service.auto_create_from_experience(refresh_existing=False)
@@ -764,6 +771,13 @@ def _run_evolution(store: MemoryStore, data_dir: Path) -> dict[str, object]:
         "report_written": bool(markdown),
         "skill_paths": skill_paths,
         "refreshed_skill_paths": refreshed_skill_paths,
+        "immutable_trajectories": len(store.list_trajectory_logs()),
+        "structured_evaluations": len(store.list_trajectory_evaluations()),
+        "domain_knowledge_candidates": candidate_status_counts,
+        "domain_knowledge_candidate_graph_links": {
+            "created": link_result["created_links"],
+            "total": len(store.list_domain_candidate_graph_links()),
+        },
     }
 
 
