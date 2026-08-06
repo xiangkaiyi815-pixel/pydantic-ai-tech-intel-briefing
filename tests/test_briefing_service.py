@@ -194,6 +194,11 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert "https://www.example.com/agent-mes" in briefing.markdown
     assert "https://www.bilibili.com/video/BV1test" in briefing.markdown
     assert store.latest_daily_briefing(briefing.topic_id).id == briefing.id
+    candidates = store.list_domain_knowledge_candidates()
+    assert candidates
+    assert all(candidate["status"] == "candidate" for candidate in candidates)
+    assert all(briefing.id in candidate["source_ids"] for candidate in candidates)
+    assert all(candidate["evidence"] for candidate in candidates)
 
 
 def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(tmp_path):

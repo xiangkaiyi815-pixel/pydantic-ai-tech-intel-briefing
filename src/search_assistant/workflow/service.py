@@ -103,6 +103,7 @@ class SearchAssistantWorkflow:
         }
 
         calibration: dict[str, object] | None = None
+        draft: str | None = None
         low_relevance_issue = self._low_source_relevance_issue(question_text, classification, search_audit)
         allow_foundational_fallback = self._allow_foundational_fallback(
             question_text,
@@ -213,6 +214,25 @@ class SearchAssistantWorkflow:
             review=review,
             memory_updates=self._memory_updates(message, question_id),
             search_record=self._search_record_from_audit(search_audit),
+            trajectory_context={
+                "draft_answer": draft,
+                "active_skills": [
+                    {"name": skill.get("name", ""), "path": skill.get("path", "")}
+                    for skill in active_skills
+                ],
+                "answer_strategy": answer_strategy,
+                "runtime_metadata": {
+                    "runtime_class": type(self.runtime).__name__,
+                    "model": getattr(self.runtime, "model", None),
+                    "provider": getattr(self.runtime, "provider", None),
+                    "search_client_class": type(self.search_client).__name__ if self.search_client is not None else None,
+                },
+                "execution_flags": {
+                    "review_failed": review_failed,
+                    "fallback_used": fallback_used,
+                    "low_relevance_issue": low_relevance_issue,
+                },
+            },
         )
         self.store.record_answer(package)
         self.store.add_experience_item(

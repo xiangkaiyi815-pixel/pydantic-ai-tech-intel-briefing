@@ -72,6 +72,7 @@ class AnswerPackage(BaseModel):
     review: dict[str, Any] | None = None
     memory_updates: list[MemoryUpdate | dict[str, Any]] = Field(default_factory=list)
     search_record: SearchRecord | None = None
+    trajectory_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class TopicSubscription(BaseModel):
@@ -156,3 +157,28 @@ class DailyBriefing(BaseModel):
     synthesis: BriefingSynthesis
     markdown: str
     created_at: str
+
+
+CandidateStatus = Literal["candidate", "validated", "deprecated"]
+
+
+class DomainKnowledgeEvidence(BaseModel):
+    title: str
+    url: str
+    provider: str
+    retrieved_at: str
+
+
+class DomainKnowledgeCandidate(BaseModel):
+    id: str
+    topic: str
+    claim: str
+    applies_when: str
+    evidence: list[DomainKnowledgeEvidence] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    confidence: Confidence
+    status: CandidateStatus = "candidate"
+    source_ids: list[str] = Field(default_factory=list)
+    fingerprint: str
+    created_at: str
+    updated_at: str

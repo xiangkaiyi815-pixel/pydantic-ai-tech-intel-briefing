@@ -1,4 +1,8 @@
-from search_assistant.contracts import AnswerPackage, IncomingMessage, VerifiedClaim
+import sqlite3
+
+import pytest
+
+from search_assistant.contracts import AnswerPackage, IncomingMessage, SearchRecord, VerifiedClaim
 from search_assistant.memory.store import MemoryStore
 
 
@@ -29,6 +33,53 @@ def test_records_interaction_answer_and_evidence(tmp_path):
 
     assert store.has_interaction("e-1")
     assert store.latest_answer_for_dedupe_key("e-1").question_id == question_id
+
+
+def test_answer_recording_appends_an_immutable_trajectory(tmp_path):
+    database_path = tmp_path / "assistant.sqlite3"
+    store = MemoryStore(database_path)
+    store.initialize()
+    question_id = store.record_interaction(
+        IncomingMessage(
+            message_id="m-trajectory",
+            event_id="e-trajectory",
+            user_id="u-trajectory",
+            chat_id="c-trajectory",
+            text="What changed in the current API?",
+            source="cli",
+        )
+    )
+    package = AnswerPackage(
+        question_id=question_id,
+        answer_text="The answer is traceable to the recorded search.",
+        classification="research",
+        confidence="medium",
+        search_record=SearchRecord(executed=True, queries=["current API official docs"]),
+        trajectory_context={
+            "draft_answer": "Initial draft",
+            "active_skills": [{"name": "verification"}],
+            "runtime_metadata": {"runtime_class": "FakeAgentRuntime"},
+        },
+    )
+
+    store.record_answer(package)
+
+    trajectories = store.list_trajectory_logs("u-trajectory", "c-trajectory")
+    assert len(trajectories) == 1
+    assert trajectories[0]["question_id"] == question_id
+    assert trajectories[0]["payload"]["question"] == "What changed in the current API?"
+    assert trajectories[0]["payload"]["draft_answer"] == "Initial draft"
+    assert trajectories[0]["payload"]["search_record"]["executed"] is True
+    assert trajectories[0]["payload"]["active_skills"] == [{"name": "verification"}]
+
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="trajectory logs are immutable"):
+            connection.execute(
+                "UPDATE trajectory_logs SET source = 'changed' WHERE question_id = ?",
+                (question_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="trajectory logs are immutable"):
+            connection.execute("DELETE FROM trajectory_logs WHERE question_id = ?", (question_id,))
 
 
 def test_updates_answer_verification_and_deduplicates_evidence(tmp_path):
