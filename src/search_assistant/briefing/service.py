@@ -103,6 +103,58 @@ THEMES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
 )
 
 
+GENERIC_EVIDENCE_THEMES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
+    (
+        "政策、规模与产业链信号",
+        (
+            "政策", "规划", "行动计划", "产业链", "规模", "报告", "白皮书", "全景分析",
+            "万亿", "亿元", "市场", "产业", "发布", "大会", "waic", "naai",
+        ),
+        "把政策文件、产业规模、产业链梳理和大会/报告类材料视为环境信号，用来判断资金、监管、供给链和需求侧正在如何给技术落地设定边界。",
+        "它能说明行业为什么加速投入、哪些环节被反复强调，但不能直接证明某个系统已经形成可复制的工程闭环。",
+        "宏观信号阶段；需要继续核验原始政策文本、统计口径、企业案例和技术指标之间是否相互支撑。",
+    ),
+    (
+        "技术底座、数据与开源生态",
+        (
+            "dataset", "benchmark", "github", "hugging face", "modelscope", "open source", "paper",
+            "repository", "数据集", "评测", "基准", "开源", "论文", "模型", "框架", "算力",
+            "api", "数据", "架构",
+        ),
+        "把数据集、评测基准、模型/框架、开源仓库和工程接口视为技术底座，用来判断产业发展是否具备可复现、可评估和可集成的基础。",
+        "这类来源决定日报能不能从口号进入实现层：是否有可获得的数据、可比较的指标、可复用的软件组件和清晰的系统接口。",
+        "技术线索阶段；需要补查原始论文、模型卡、仓库 README、benchmark 定义和真实部署约束。",
+    ),
+    (
+        "应用落地与业务转型案例",
+        (
+            "应用", "落地", "实践", "案例", "场景", "解决方案", "客户", "部署", "转型",
+            "升级", "生产", "制造", "医疗", "教育", "金融", "政务", "工业", "工作流",
+        ),
+        "把行业案例和业务流程描述还原为输入数据、模型或规则处理、系统接口、人工复核和结果写回的工作流假设。",
+        "它能帮助识别哪些环节已经从演示进入业务流程，也能暴露公开材料尚未说明的审批、回滚、异常接管和量化收益。",
+        "案例线索阶段；没有现场指标、接口说明和失败处理机制前，不应把宣传材料直接视为规模化能力。",
+    ),
+    (
+        "教育传播、公众讨论与弱证据线索",
+        (
+            "教程", "课程", "纪录片", "科普", "入门", "讲完", "学习", "培训", "视频",
+            "论坛", "人山人海", "观点", "讨论", "评论", "bilibili", "youtube",
+        ),
+        "把课程、纪录片、公开视频和公众讨论作为关注度与知识扩散信号，而不是直接作为技术实现证据。",
+        "这类来源能说明话题热度、人才供给和概念传播，但通常缺少系统架构、数据接口、评测指标和部署边界。",
+        "弱证据阶段；适合引出下一轮检索方向，不适合单独支撑技术结论。",
+    ),
+    (
+        "综合产业动态与待核验证据",
+        (),
+        "把无法归入明确技术或政策类别的公开材料先作为综合线索保留，再等待原始技术文档、案例指标或代码材料校验。",
+        "它避免遗漏潜在线索，但在证据等级上低于论文、产品文档、开源仓库和带指标的落地案例。",
+        "待核验线索阶段；下一步应回到原始来源、技术材料和可量化结果。",
+    ),
+)
+
+
 CAD_THEMES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
     (
         "生成式 CAD 与参数化建模",
@@ -272,6 +324,16 @@ def _load_report_skill() -> str:
         return "Follow the fixed Chinese content collection report contract and synthesize technology themes, not search logs."
 
 
+def _has_substantive_detailed_summary(value: str) -> bool:
+    text = value.strip()
+    if len(text) < 280:
+        return False
+    heading_count = len(re.findall(r"^###\s+\S", text, flags=re.MULTILINE))
+    if heading_count >= 2:
+        return True
+    return heading_count == 1 and len(text) >= 500
+
+
 def _is_substantive_synthesis(synthesis: BriefingSynthesis) -> bool:
     if not synthesis.themes or len(synthesis.analysis_judgment.strip()) < 60:
         return False
@@ -281,7 +343,7 @@ def _is_substantive_synthesis(synthesis: BriefingSynthesis) -> bool:
     if synthesis.detailed_summary.strip():
         return (
             len(synthesis.short_summary.strip()) >= 75
-            and len(synthesis.detailed_summary.strip()) >= 240
+            and _has_substantive_detailed_summary(synthesis.detailed_summary)
             and all(
                 len(theme.analysis.strip()) >= 30 and bool(theme.source_urls)
                 for theme in synthesis.themes
@@ -376,6 +438,7 @@ class DailyBriefingService:
             subscription.topic,
             ranked_sources[: self.model_max_sources],
             search_plan,
+            fallback_sources=ranked_sources,
         )
         resolved_date = run_date or self._briefing_date()
         briefing = DailyBriefing(
@@ -579,6 +642,7 @@ class DailyBriefingService:
         topic: str,
         sources: list[CollectedSource],
         search_plan: list[tuple[str, str]],
+        fallback_sources: list[CollectedSource] | None = None,
     ) -> BriefingSynthesis:
         if self.runtime is not None:
             try:
@@ -595,7 +659,7 @@ class DailyBriefingService:
                 generated = None
             if generated is not None and _is_substantive_synthesis(generated):
                 return self._preserve_generated_detail(generated, topic, sources)
-        return self._fallback_synthesis(topic, sources)
+        return self._fallback_synthesis(topic, fallback_sources or sources)
 
     def _preserve_generated_detail(
         self,
@@ -615,6 +679,7 @@ class DailyBriefingService:
     def _fallback_synthesis(self, topic: str, sources: list[CollectedSource]) -> BriefingSynthesis:
         theme_catalog = CAD_THEMES + THEMES if _is_cad_topic(topic) else THEMES
         themed_sources: dict[str, list[CollectedSource]] = {}
+        is_cad = _is_cad_topic(topic)
         for source in sources:
             haystack = f"{source.title} {source.snippet}".lower()
             matched = False
@@ -624,7 +689,10 @@ class DailyBriefingService:
                     matched = True
                     break
             if not matched:
-                themed_sources.setdefault("产业落地与产品动态", []).append(source)
+                if is_cad:
+                    themed_sources.setdefault("工程图与 CAD 工具链线索", []).append(source)
+                else:
+                    themed_sources.setdefault(self._generic_evidence_theme_name(source), []).append(source)
 
         themes: list[BriefingTheme] = []
         for name, markers, technology, importance, maturity in theme_catalog:
@@ -643,26 +711,43 @@ class DailyBriefingService:
                     source_urls=[source.url for source in evidence[:4]],
                 )
             )
-        residual = themed_sources.get("产业落地与产品动态", [])
-        residual_name = "工程图与 CAD 工具链线索" if _is_cad_topic(topic) else "产业落地与产品动态"
-        if residual:
-            themes.append(
-                BriefingTheme(
-                    name=residual_name,
-                    analysis=self._fallback_theme_analysis(
-                        residual,
-                        "从产品发布、部署经验和行业讨论中识别可重复的技术路线与约束。",
-                        "它提供了需求侧和供给侧的信号，但需要继续回到技术实现和量化指标核验。",
-                        "信息线索阶段，需补充原始技术材料和现场指标。",
-                    ),
-                    what_is_happening=self._evidence_summary(residual),
-                    core_technology="从产品发布、部署经验和行业讨论中识别可重复的技术路线与约束。",
-                    why_it_matters="它提供了需求侧和供给侧的信号，但需要继续回到技术实现和量化指标核验。",
-                    maturity="信息线索阶段，需补充原始技术材料和现场指标。",
-                    data_and_workflow=self._evidence_workflow(residual),
-                    source_urls=[source.url for source in residual[:4]],
+        if is_cad:
+            residual = themed_sources.get("工程图与 CAD 工具链线索", [])
+            if residual:
+                themes.append(
+                    BriefingTheme(
+                        name="工程图与 CAD 工具链线索",
+                        analysis=self._fallback_theme_analysis(
+                            residual,
+                            "从产品发布、部署经验和行业讨论中识别可重复的技术路线与约束。",
+                            "它提供了需求侧和供给侧的信号，但需要继续回到技术实现和量化指标核验。",
+                            "信息线索阶段，需补充原始技术材料和现场指标。",
+                        ),
+                        what_is_happening=self._evidence_summary(residual),
+                        core_technology="从产品发布、部署经验和行业讨论中识别可重复的技术路线与约束。",
+                        why_it_matters="它提供了需求侧和供给侧的信号，但需要继续回到技术实现和量化指标核验。",
+                        maturity="信息线索阶段，需补充原始技术材料和现场指标。",
+                        data_and_workflow=self._evidence_workflow(residual),
+                        source_urls=[source.url for source in residual[:4]],
+                    )
                 )
-            )
+        else:
+            for name, _, technology, importance, maturity in GENERIC_EVIDENCE_THEMES:
+                evidence = themed_sources.get(name, [])
+                if not evidence:
+                    continue
+                themes.append(
+                    BriefingTheme(
+                        name=name,
+                        analysis=self._fallback_theme_analysis(evidence, technology, importance, maturity),
+                        what_is_happening=self._evidence_summary(evidence),
+                        core_technology=technology,
+                        why_it_matters=importance,
+                        maturity=maturity,
+                        data_and_workflow=self._evidence_workflow(evidence),
+                        source_urls=[source.url for source in evidence[:4]],
+                    )
+                )
         if not themes:
             themes.append(
                 BriefingTheme(
@@ -718,16 +803,16 @@ class DailyBriefingService:
             )
         return BriefingSynthesis(
             search_content_summary=(
-                f"本轮围绕“{topic}”保留了 {source_count} 条公开线索，技术讨论主要聚集在{theme_names}。"
-                "这些材料不是孤立新闻：它们共同描述了 AI 从单点识别或助手功能，走向接入工程数据、业务系统和现场闭环的过程。"
+                f"本轮围绕“{topic}”保留了 {source_count} 条公开线索，可分为{theme_names}。"
+                "这些材料需要分层阅读：政策、规模和活动类内容提供产业环境信号；数据、开源、评测和案例材料才更接近实现证据。"
             ),
             short_summary=(
-                f"这一批内容的共同主题是：{topic} 正从概念展示转向具体工作流。"
-                "最值得关注的是系统如何连接领域数据、约束、工具调用和人工复核，而不是单一模型名称。"
+                f"本轮关于“{topic}”的有效阅读方式，是先把来源拆成宏观产业信号、技术底座、应用场景和弱证据四层。"
+                "只有能说明数据输入、模型或工具链、系统接口、评估指标与人工接管机制的材料，才足以支撑技术落地判断。"
             ),
             detailed_summary=self._fallback_detailed_summary(themes, key_signal_interpretation=(
-                "公开材料反复出现的不是单一模型名称，而是领域数据进入模型、模型调用受控工具、"
-                "结果写回业务或工程系统并保留人工接管的闭环；没有这些环节的内容只能视为早期线索。"
+                "公开材料的证据强度并不相同：报告、政策和视频能说明关注度与投入方向，"
+                "但是否真正形成产业能力，还要回到原始技术资料、数据集/评测、接口说明、客户案例和可复现指标。"
             )),
             themes=themes,
             key_signal_interpretation=(
@@ -750,6 +835,19 @@ class DailyBriefingService:
             ],
         )
 
+    def _generic_evidence_theme_name(self, source: CollectedSource) -> str:
+        text = f"{source.title} {source.snippet} {source.platform} {source.provider}".lower()
+        best_name = "综合产业动态与待核验证据"
+        best_score = 0
+        for name, markers, *_ in GENERIC_EVIDENCE_THEMES:
+            if not markers:
+                continue
+            score = sum(1 for marker in markers if self._matches_technical_marker(text, marker.lower()))
+            if score > best_score:
+                best_name = name
+                best_score = score
+        return best_name
+
     def _fallback_theme_analysis(
         self,
         evidence: list[CollectedSource],
@@ -760,9 +858,10 @@ class DailyBriefingService:
         evidence_summary = self._evidence_summary(evidence)
         workflow = self._evidence_workflow(evidence)
         return (
-            f"已有材料显示：{evidence_summary}。可从中还原的实现路径是{workflow}；"
-            f"其中真正承担工程能力的部分是{technology}。这会影响{importance}。"
-            f"当前应按“{maturity}”理解，不把公开线索直接当作已验证的规模化能力。"
+            f"{evidence_summary}\n\n"
+            f"能够支撑的工作假设是：{technology}{workflow}\n\n"
+            f"工程含义是：{importance}证据边界是：{maturity} "
+            "因此不应把公开线索直接写成已验证的规模化能力。"
         )
 
     @staticmethod
@@ -1026,16 +1125,58 @@ class DailyBriefingService:
 
     @staticmethod
     def _evidence_workflow(sources: list[CollectedSource]) -> str:
-        excerpts = [" ".join(source.snippet.split()) for source in sources if source.snippet]
+        excerpts = [
+            DailyBriefingService._short_evidence_excerpt(source.snippet)
+            for source in sources
+            if source.snippet
+        ]
+        excerpts = [excerpt for excerpt in excerpts if excerpt]
         if not excerpts:
-            return "来源未披露完整数据闭环；下一步应补查输入数据、系统接口、执行动作和人工接管点。"
+            return " 来源未披露完整数据闭环；下一步应补查输入数据、系统接口、执行动作和人工接管点。"
         return (
-            "从公开描述可见的流程线索是："
-            + "；".join(excerpts[:2])[:900]
-            + "。仍应核对数据来源、决策/规则层、写回系统与异常接管是否完整闭环。"
+            " 公开片段提供的可用线索包括："
+            + "；".join(excerpts[:3])
+            + "。但这些片段仍不足以完整证明输入、处理、接口写回和异常接管机制。"
         )
 
     @staticmethod
     def _evidence_summary(sources: list[CollectedSource]) -> str:
-        titles = "；".join(source.title for source in sources[:3])
-        return f"相关线索集中讨论：{titles}。"
+        titles: list[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            title = DailyBriefingService._trim_source_title(source.title)
+            key = title.lower()
+            if not title or key in seen:
+                continue
+            titles.append(title)
+            seen.add(key)
+            if len(titles) >= 4:
+                break
+        if not titles:
+            return "本组暂无可读标题"
+        suffix = "等" if len(sources) > len(titles) else ""
+        return "主要证据包括：" + "；".join(f"《{title}》" for title in titles) + suffix + "。"
+
+    @staticmethod
+    def _short_evidence_excerpt(value: str, max_chars: int = 150) -> str:
+        text = " ".join(value.split()).strip()
+        if not text:
+            return ""
+        text = re.sub(r"作者：.*$", "", text).strip()
+        text = re.sub(r"[-—]{2,}.*$", "", text).strip()
+        candidates = [part.strip() for part in re.split(r"[。！？；\n]+", text) if part.strip()]
+        if candidates:
+            text = max(candidates[:3], key=len)
+        if len(text) < 8 or not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", text):
+            return ""
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip("，,；;：:、 ") + "…"
+        return text
+
+    @staticmethod
+    def _trim_source_title(value: str, max_chars: int = 46) -> str:
+        title = " ".join(value.split()).strip()
+        title = re.sub(r"[_\-—|].*$", "", title).strip() or title
+        if len(title) > max_chars:
+            return title[: max_chars - 1].rstrip("，,；;：:、 ") + "…"
+        return title

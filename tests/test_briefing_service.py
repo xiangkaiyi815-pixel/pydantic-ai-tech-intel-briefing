@@ -5,8 +5,8 @@ from search_assistant.briefing.service import DailyBriefingService, REPORT_SKILL
 from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, IncomingMessage
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
-from search_assistant.workflow.runtime import FakeAgentRuntime
-from search_assistant.workflow.runtime import GLMPydanticAIRuntime, runtime_from_settings
+from search_assistant.workflow.runtime import DeepSeekChatRuntime, FakeAgentRuntime
+from search_assistant.workflow.runtime import GLMPydanticAIRuntime, MicrosoftAgentRuntime, runtime_from_settings
 from search_assistant.workflow.service import SearchAssistantWorkflow
 from search_assistant.config import Settings
 
@@ -90,6 +90,47 @@ class NoisySearchClient:
                 snippet="The agent reads machine events, invokes MES work orders, and keeps an approval trail.",
                 provider="mcp:public:test",
                 checked_at="2026-07-25T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
+class GenericIndustrySearchClient:
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="NAAI发布2024年全球人工智能产业发展报告",
+                url="https://mp.weixin.qq.com/s/industry-report",
+                snippet="人工智能产业发展报告梳理产业规模、产业链、政策环境和企业投入方向，但没有披露具体系统接口。",
+                provider="browser-baidu",
+                checked_at="2026-08-08T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="人工智能产业发展中的AI数据集和benchmark建设",
+                url="https://example.com/ai-dataset-benchmark",
+                snippet="文章讨论dataset、benchmark、开源模型和评测指标如何支撑人工智能产业发展。",
+                provider="browser-bing",
+                checked_at="2026-08-08T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="人工智能产业发展推动制造业和政务场景落地",
+                url="https://example.com/ai-application-case",
+                snippet="案例描述人工智能应用进入业务流程，但仍需要核验数据输入、系统接口、人工审批和量化收益。",
+                provider="browser-google",
+                checked_at="2026-08-08T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="央视纪录片讨论人工智能产业发展与智能时代",
+                url="https://www.bilibili.com/video/av996452521",
+                snippet="公开视频和纪录片解释人工智能发展趋势，适合作为公众传播信号而不是系统实现证据。",
+                provider="bilibili-public-api",
+                checked_at="2026-08-08T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="人工智能产业发展大会展示AI产品和生态合作",
+                url="https://example.com/ai-conference",
+                snippet="大会展示产品动态、生态合作和行业讨论，需要继续查找原始技术文档和客户部署指标。",
+                provider="browser-baidu",
+                checked_at="2026-08-08T00:00:00+00:00",
             ),
         ][:limit]
 
@@ -303,6 +344,61 @@ def test_daily_briefing_archives_more_sources_than_it_sends_to_the_model(tmp_pat
 
     assert len(briefing.sources) == 3
     assert runtime.synthesis_source_count == 2
+
+
+def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = SourceLimitRuntime()
+    service = DailyBriefingService(
+        store,
+        GenericIndustrySearchClient(),
+        runtime=runtime,
+        max_queries=3,
+        results_per_query=5,
+        max_sources=8,
+        model_max_sources=2,
+    )
+
+    briefing = service.run("人工智能产业发展", "u-1", "c-1", run_date=date(2026, 8, 8))
+
+    assert runtime.synthesis_source_count == 2
+    assert len(briefing.sources) == 5
+    assert "保留了 5 条公开线索" in briefing.synthesis.search_content_summary
+    assert "### 政策、规模与产业链信号" in briefing.synthesis.detailed_summary
+    assert "### 技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
+    assert "### 应用落地与业务转型案例" in briefing.synthesis.detailed_summary
+    assert "### 教育传播、公众讨论与弱证据线索" in briefing.synthesis.detailed_summary
+    assert "相关线索集中讨论" not in briefing.synthesis.detailed_summary
+    assert _is_substantive_synthesis(briefing.synthesis) is True
+
+
+def test_short_single_block_generated_detail_is_not_substantive():
+    synthesis = BriefingSynthesis(
+        search_content_summary="本轮来源共同讨论人工智能产业发展，但材料需要继续分层核验。",
+        short_summary=(
+            "本轮材料需要先区分宏观产业信号、技术底座和业务落地案例，再核验数据输入、模型或工具链、"
+            "系统接口、评估指标和人工接管机制，不能只按标题判断技术成熟度。"
+        ),
+        detailed_summary=(
+            "### 产业动态\n"
+            "本轮来源包含报告、教程和公开视频，说明人工智能产业发展受到关注，但这段总结过短，"
+            "没有把证据拆成政策、技术底座、应用场景和弱证据层次。"
+        ),
+        themes=[
+            BriefingTheme(
+                name="产业动态",
+                analysis="公开材料说明话题热度上升，但没有给出足够系统接口、评测指标和部署边界。",
+                source_urls=["https://example.com/source"],
+            )
+        ],
+        key_signal_interpretation="这些来源需要先按证据强度分层，再判断是否能支持技术实现和落地能力。",
+        analysis_judgment="报告和视频可以说明关注度，但不能直接证明工程闭环已经成熟，需要继续核验原始技术材料和可量化指标。",
+        next_search_directions=["补查原始技术文档", "核验公开评测指标"],
+        landing_suggestions=["先建立证据分层", "只把有接口和指标的来源用于落地判断"],
+    )
+
+    assert _is_substantive_synthesis(synthesis) is False
 
 
 def test_daily_briefing_keeps_model_selected_detail_structure_without_injecting_static_themes(tmp_path):
@@ -547,6 +643,94 @@ def test_glm_briefing_synthesis_validates_text_json_against_collected_urls():
     assert len(json.loads(retry_calls[1][4])["sources"]) == 1
 
 
+def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
+    source = CollectedSource(
+        id="src-1",
+        topic_id="topic-1",
+        user_id="u-1",
+        title="Industrial AI agent",
+        url="https://example.com/industrial-agent",
+        snippet="Agent reads machine events and writes approved work orders to MES.",
+        platform="technical",
+        provider="mcp:public:test",
+        query="industrial AI agent MES",
+        importance_score=9.0,
+        retrieved_at="2026-07-25T00:00:00+00:00",
+    )
+    output = {
+        "search_content_summary": "本轮来源显示工业 AI 正把设备事件、审批流程和 MES 写回连接成受控工作流。",
+        "short_summary": (
+            "这类工业智能体以设备事件和生产上下文为输入，先由检索、规则和语言模型生成候选工单，"
+            "再通过受权限控制的 MES 接口写回；人工审批、审计日志和失败回滚决定它能否进入生产流程。"
+        ),
+        "detailed_summary": (
+            "### 事件到工单的受控编排\n"
+            "来源支持的路径不是让模型直接控制设备，而是把机器事件、生产上下文和历史规则送入解释层。"
+            "解释层生成候选工单后，仍由 MES 适配器、权限模型和审批流程完成确定性写回，这让模型停留在语义归纳和建议生成层，"
+            "把生产执行责任保留在既有系统和人工审核链路中。\n\n"
+            "### 仍需补齐的验证指标\n"
+            "现有材料没有给出异常分类误差、接口失败补偿、越权阻断率或人工驳回后的回滚指标。"
+            "因此评估这类方案时，应把同一事件在数据缺失、权限变化和人工拒绝条件下的端到端结果纳入测试，"
+            "而不是只检查模型能否生成看似合理的工单说明。"
+            "这些指标会决定系统是可审计的生产辅助，还是只能停留在演示层的文本自动化。"
+        ),
+        "themes": [
+            {
+                "name": "受控工单编排",
+                "analysis": "模型负责解释设备事件并生成候选工单，MES 和审批流程负责确定性写回、权限边界与审计记录。",
+                "source_urls": [source.url],
+            }
+        ],
+        "key_signal_interpretation": "关键结构是事件、解释层、候选工单、审批和系统写回形成的闭环。",
+        "analysis_judgment": (
+            "本轮材料支持把工业 AI 视为受控编排层，而不是自主控制层；下一步应核验接口、权限和回滚指标。"
+            "只有这些边界被验证后，候选工单才适合进入真实生产流程。"
+        ),
+        "next_search_directions": ["核验 MES 适配器事务设计", "寻找失败补偿和人工接管指标"],
+        "landing_suggestions": ["从候选工单试点开始", "记录每次调用、审批和回滚路径"],
+    }
+    calls: list[dict[str, object]] = []
+
+    def runner(model, api_key, base_url, instructions, prompt, temperature, max_tokens, timeout_seconds):
+        calls.append(
+            {
+                "model": model,
+                "base_url": base_url,
+                "instructions": instructions,
+                "prompt": prompt,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if max_tokens == 700:
+            return json.dumps(["industrial AI MES workflow architecture"])
+        return json.dumps(output, ensure_ascii=False)
+
+    runtime = DeepSeekChatRuntime(
+        api_key="test-key",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        timeout_seconds=180.0,
+        briefing_planning_timeout_seconds=40.0,
+        agent_runner=runner,
+    )
+
+    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": []})
+    synthesis = runtime.synthesize_briefing("industrial AI", [source], {"report_contract": {}, "report_skill": "contract"})
+
+    assert queries == ["industrial AI MES workflow architecture"]
+    assert synthesis.themes[0].source_urls == [source.url]
+    assert _is_substantive_synthesis(synthesis) is True
+    assert [call["max_tokens"] for call in calls[:2]] == [700, 2400]
+    assert calls[0]["timeout_seconds"] == 40.0
+    assert calls[1]["timeout_seconds"] == 180.0
+    assert calls[1]["model"] == "deepseek-v4-flash"
+    assert calls[1]["base_url"] == "https://api.deepseek.com"
+    assert "Return ONLY one valid JSON object" in str(calls[1]["instructions"])
+    assert json.loads(str(calls[1]["prompt"]))["sources"][0]["url"] == source.url
+
+
 def test_glm_provider_selects_the_pydantic_ai_runtime():
     runtime = runtime_from_settings(
         Settings.from_env(
@@ -561,6 +745,25 @@ def test_glm_provider_selects_the_pydantic_ai_runtime():
     assert isinstance(runtime, GLMPydanticAIRuntime)
     assert runtime.model == "glm-4.7"
     assert runtime.timeout_seconds == 120.0
+
+
+def test_deepseek_provider_selects_runtime_with_briefing_planning_timeout():
+    runtime = runtime_from_settings(
+        Settings.from_env(
+            {
+                "SEARCH_ASSISTANT_MODEL_PROVIDER": "deepseek",
+                "DEEPSEEK_API_KEY": "test-key",
+                "DEEPSEEK_MODEL": "deepseek-v4-flash",
+                "DEEPSEEK_TIMEOUT_SECONDS": "180",
+                "BRIEFING_PLANNING_TIMEOUT_SECONDS": "40",
+            }
+        )
+    )
+
+    assert isinstance(runtime, MicrosoftAgentRuntime)
+    assert runtime.model == "deepseek-v4-flash"
+    assert runtime.timeout_seconds == 180.0
+    assert runtime.briefing_planning_timeout_seconds == 40.0
 
 
 def test_glm_scope_review_detects_unsupported_industry_wide_claims():
