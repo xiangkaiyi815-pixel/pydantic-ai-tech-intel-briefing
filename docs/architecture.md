@@ -53,7 +53,14 @@ flowchart TD
 
 `MemoryStore` uses SQLite. Key tables include topic subscriptions, topic
 feedback, collected sources, daily briefings, interactions, answers, claim
-evidence, profiles, reports, runtime sessions, and skill drafts.
+evidence, profiles, reports, runtime sessions, skill drafts, and reviewed
+domain knowledge graphs.
+
+Domain knowledge graphs are stored as graph headers, entity nodes, and typed
+relation edges. They intentionally keep natural-language summaries next to
+entity-relation triples: the triples support GraphRAG-style navigation and
+entity disambiguation, while the summaries preserve the semantic nuance that
+would be lost by reducing every domain claim to a bare triple.
 
 The database is scoped by user and chat where applicable. The default location
 is `.local-data/assistant.sqlite3`; use `--data-dir` for isolated test or

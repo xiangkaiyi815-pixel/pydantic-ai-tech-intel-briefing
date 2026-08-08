@@ -156,3 +156,65 @@ class DailyBriefing(BaseModel):
     synthesis: BriefingSynthesis
     markdown: str
     created_at: str
+
+
+DomainKnowledgeEntityType = Literal[
+    "concept",
+    "system",
+    "data",
+    "workflow",
+    "metric",
+    "risk",
+    "control",
+    "source",
+]
+
+
+class DomainKnowledgeEntity(BaseModel):
+    """A reviewed node in a domain-specific GraphRAG-style knowledge map."""
+
+    id: str = Field(description="Stable graph-local entity identifier.")
+    name: str
+    entity_type: DomainKnowledgeEntityType = "concept"
+    aliases: list[str] = Field(default_factory=list)
+    summary: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DomainKnowledgeRelation(BaseModel):
+    """A typed edge between two reviewed domain entities."""
+
+    id: str = Field(description="Stable graph-local relation identifier.")
+    source_entity_id: str
+    relation_type: str
+    target_entity_id: str
+    description: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    weight: float = Field(default=1.0, ge=0.0)
+
+
+class DomainKnowledgeGraph(BaseModel):
+    """A small, auditable domain graph that keeps triples and prose together."""
+
+    id: str
+    name: str
+    description: str
+    overview: str
+    source: str = "reviewed-seed"
+    version: str = "1"
+    entities: list[DomainKnowledgeEntity] = Field(min_length=1)
+    relations: list[DomainKnowledgeRelation] = Field(default_factory=list)
+
+
+class DomainKnowledgeSearchHit(BaseModel):
+    graph_id: str
+    graph_name: str
+    entity_id: str
+    entity_name: str
+    entity_type: DomainKnowledgeEntityType
+    score: float
+    summary: str
+    matched_aliases: list[str] = Field(default_factory=list)
+    outgoing_relations: list[str] = Field(default_factory=list)
+    incoming_relations: list[str] = Field(default_factory=list)

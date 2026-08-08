@@ -11,6 +11,9 @@ from search_assistant.contracts import (
     AnswerPackage,
     CollectedSource,
     DailyBriefing,
+    DomainKnowledgeEntity,
+    DomainKnowledgeGraph,
+    DomainKnowledgeRelation,
     IncomingMessage,
     TopicSubscription,
     VerifiedClaim,
@@ -175,6 +178,45 @@ class MemoryStore:
                     package_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(topic_id, run_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_graphs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    overview TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_entities (
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    aliases_json TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (graph_id, id)
+                );
+
+                CREATE TABLE IF NOT EXISTS domain_knowledge_relations (
+                    id TEXT NOT NULL,
+                    graph_id TEXT NOT NULL,
+                    source_entity_id TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    target_entity_id TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (graph_id, id)
                 );
                 """
             )
@@ -543,6 +585,9 @@ class MemoryStore:
             "topic_feedback",
             "collected_sources",
             "daily_briefings",
+            "domain_knowledge_graphs",
+            "domain_knowledge_entities",
+            "domain_knowledge_relations",
         )
         with self._connect() as connection:
             return {
@@ -789,6 +834,192 @@ class MemoryStore:
                 (topic_id,),
             ).fetchone()
         return DailyBriefing.model_validate_json(row["package_json"]) if row is not None else None
+
+    def upsert_domain_knowledge_graph(self, graph: DomainKnowledgeGraph) -> dict[str, object]:
+        now = _now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO domain_knowledge_graphs (
+                    id, name, description, overview, source, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    overview = excluded.overview,
+                    source = excluded.source,
+                    version = excluded.version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    graph.id,
+                    graph.name,
+                    graph.description,
+                    graph.overview,
+                    graph.source,
+                    graph.version,
+                    now,
+                    now,
+                ),
+            )
+            keep_entity_ids = {entity.id for entity in graph.entities}
+            keep_relation_ids = {relation.id for relation in graph.relations}
+            if keep_entity_ids:
+                connection.execute(
+                    "DELETE FROM domain_knowledge_entities WHERE graph_id = ? AND id NOT IN ({})".format(
+                        ",".join("?" for _ in keep_entity_ids)
+                    ),
+                    (graph.id, *sorted(keep_entity_ids)),
+                )
+            else:
+                connection.execute("DELETE FROM domain_knowledge_entities WHERE graph_id = ?", (graph.id,))
+            if keep_relation_ids:
+                connection.execute(
+                    "DELETE FROM domain_knowledge_relations WHERE graph_id = ? AND id NOT IN ({})".format(
+                        ",".join("?" for _ in keep_relation_ids)
+                    ),
+                    (graph.id, *sorted(keep_relation_ids)),
+                )
+            else:
+                connection.execute("DELETE FROM domain_knowledge_relations WHERE graph_id = ?", (graph.id,))
+            for entity in graph.entities:
+                connection.execute(
+                    """
+                    INSERT INTO domain_knowledge_entities (
+                        id, graph_id, name, entity_type, aliases_json, summary,
+                        evidence_refs_json, metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(graph_id, id) DO UPDATE SET
+                        name = excluded.name,
+                        entity_type = excluded.entity_type,
+                        aliases_json = excluded.aliases_json,
+                        summary = excluded.summary,
+                        evidence_refs_json = excluded.evidence_refs_json,
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        entity.id,
+                        graph.id,
+                        entity.name,
+                        entity.entity_type,
+                        json.dumps(entity.aliases, ensure_ascii=False),
+                        entity.summary,
+                        json.dumps(entity.evidence_refs, ensure_ascii=False),
+                        json.dumps(entity.metadata, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+            for relation in graph.relations:
+                connection.execute(
+                    """
+                    INSERT INTO domain_knowledge_relations (
+                        id, graph_id, source_entity_id, relation_type, target_entity_id,
+                        description, evidence_refs_json, weight, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(graph_id, id) DO UPDATE SET
+                        source_entity_id = excluded.source_entity_id,
+                        relation_type = excluded.relation_type,
+                        target_entity_id = excluded.target_entity_id,
+                        description = excluded.description,
+                        evidence_refs_json = excluded.evidence_refs_json,
+                        weight = excluded.weight,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        relation.id,
+                        graph.id,
+                        relation.source_entity_id,
+                        relation.relation_type,
+                        relation.target_entity_id,
+                        relation.description,
+                        json.dumps(relation.evidence_refs, ensure_ascii=False),
+                        relation.weight,
+                        now,
+                        now,
+                    ),
+                )
+        return {
+            "id": graph.id,
+            "name": graph.name,
+            "entities": len(graph.entities),
+            "relations": len(graph.relations),
+        }
+
+    def list_domain_knowledge_graphs(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    g.*,
+                    COUNT(DISTINCT e.id) AS entity_count,
+                    COUNT(DISTINCT r.id) AS relation_count
+                FROM domain_knowledge_graphs g
+                LEFT JOIN domain_knowledge_entities e ON e.graph_id = g.id
+                LEFT JOIN domain_knowledge_relations r ON r.graph_id = g.id
+                GROUP BY g.id
+                ORDER BY g.id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_domain_knowledge_graph(self, graph_id: str) -> DomainKnowledgeGraph | None:
+        with self._connect() as connection:
+            graph_row = connection.execute(
+                "SELECT * FROM domain_knowledge_graphs WHERE id = ?",
+                (graph_id,),
+            ).fetchone()
+            if graph_row is None:
+                return None
+            entity_rows = connection.execute(
+                """
+                SELECT * FROM domain_knowledge_entities
+                WHERE graph_id = ?
+                ORDER BY id ASC
+                """,
+                (graph_id,),
+            ).fetchall()
+            relation_rows = connection.execute(
+                """
+                SELECT * FROM domain_knowledge_relations
+                WHERE graph_id = ?
+                ORDER BY id ASC
+                """,
+                (graph_id,),
+            ).fetchall()
+        return DomainKnowledgeGraph(
+            id=str(graph_row["id"]),
+            name=str(graph_row["name"]),
+            description=str(graph_row["description"]),
+            overview=str(graph_row["overview"]),
+            source=str(graph_row["source"]),
+            version=str(graph_row["version"]),
+            entities=[
+                DomainKnowledgeEntity(
+                    id=str(row["id"]),
+                    name=str(row["name"]),
+                    entity_type=str(row["entity_type"]),
+                    aliases=json.loads(str(row["aliases_json"])),
+                    summary=str(row["summary"]),
+                    evidence_refs=json.loads(str(row["evidence_refs_json"])),
+                    metadata=json.loads(str(row["metadata_json"])),
+                )
+                for row in entity_rows
+            ],
+            relations=[
+                DomainKnowledgeRelation(
+                    id=str(row["id"]),
+                    source_entity_id=str(row["source_entity_id"]),
+                    relation_type=str(row["relation_type"]),
+                    target_entity_id=str(row["target_entity_id"]),
+                    description=str(row["description"]),
+                    evidence_refs=json.loads(str(row["evidence_refs_json"])),
+                    weight=float(row["weight"]),
+                )
+                for row in relation_rows
+            ],
+        )
 
     @staticmethod
     def _topic_from_row(row: sqlite3.Row) -> TopicSubscription:

@@ -14,6 +14,7 @@ from search_assistant.diagnostics.readiness import run_readiness_diagnostics
 from search_assistant.evaluation.service import EvaluationService
 from search_assistant.feishu.client import FakeFeishuClient, FeishuHttpClient
 from search_assistant.feishu.events import parse_feishu_event
+from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
 from search_assistant.reports.service import ReportService
@@ -85,6 +86,24 @@ def main(argv: list[str] | None = None) -> int:
 
     evidence_backfill_parser = subparsers.add_parser("evidence-backfill")
     _add_data_dir(evidence_backfill_parser)
+
+    kg_seed_parser = subparsers.add_parser("knowledge-graph-seed")
+    kg_seed_parser.add_argument("--domain", action="append", default=None)
+    _add_data_dir(kg_seed_parser)
+
+    kg_list_parser = subparsers.add_parser("knowledge-graph-list")
+    _add_data_dir(kg_list_parser)
+
+    kg_query_parser = subparsers.add_parser("knowledge-graph-query")
+    kg_query_parser.add_argument("query")
+    kg_query_parser.add_argument("--domain", default=None)
+    kg_query_parser.add_argument("--limit", type=_positive_int, default=10)
+    _add_data_dir(kg_query_parser)
+
+    kg_export_parser = subparsers.add_parser("knowledge-graph-export")
+    kg_export_parser.add_argument("domain")
+    kg_export_parser.add_argument("--output", default=None)
+    _add_data_dir(kg_export_parser)
 
     skill_parser = subparsers.add_parser("skill-draft")
     skill_parser.add_argument("title")
@@ -266,6 +285,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "evidence-backfill":
         result = VerificationBackfillService(store).run()
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "knowledge-graph-seed":
+        result = DomainKnowledgeGraphService(store).seed_default_graphs(args.domain)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "knowledge-graph-list":
+        result = DomainKnowledgeGraphService(store).list_graphs()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "knowledge-graph-query":
+        hits = DomainKnowledgeGraphService(store).query(args.query, domain_id=args.domain, limit=args.limit)
+        print(json.dumps([hit.model_dump(mode="json") for hit in hits], ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "knowledge-graph-export":
+        markdown = DomainKnowledgeGraphService(store).export_markdown(args.domain)
+        output_path = Path(args.output) if args.output else data_dir / "knowledge-graphs" / f"{args.domain}.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(markdown, encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "domain": args.domain,
+                    "path": str(output_path),
+                    "characters": len(markdown),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "skill-draft":
         path = SkillDraftService(store, drafts_dir=data_dir / "skills" / "drafts").create_from_experience(

@@ -17,6 +17,9 @@ turning their daily report into a list of headlines.
 - Supports public-index or no-login discovery for selected Chinese platforms.
 - Stores topics, feedback, retained sources, reports, and learning evidence in
   SQLite.
+- Seeds reviewed domain knowledge graphs for Agent engineering, industrial AI,
+  and medical-imaging AI so retrieved evidence can be mapped onto explicit
+  entity-relation structures instead of flat text notes.
 - Produces a Chinese `content collection report` with search directions,
   keywords, a concise technical brief, free-form detailed analysis, next
   research directions, implementation suggestions, and original URLs.
@@ -132,6 +135,9 @@ python -m search_assistant.cli topic-add "industrial AI"
 python -m search_assistant.cli brief-feedback "industrial AI" "focus on controlled MES agents" --url "https://example.com/case"
 python -m search_assistant.cli brief-run "industrial AI"
 python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 86400
+python -m search_assistant.cli knowledge-graph-seed
+python -m search_assistant.cli knowledge-graph-query "MES 工单 写回" --domain industrial-ai
+python -m search_assistant.cli knowledge-graph-export agent-engineering
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
 ```
@@ -156,6 +162,7 @@ and regression cases for noisy search results. See
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Platform coverage and boundaries](docs/platform-coverage.md)
+- [Domain knowledge graphs](docs/domain-knowledge-graphs.md)
 - [Operations and scheduling](docs/operations.md)
 - [Development guide](docs/development.md)
 - [Security policy](SECURITY.md)
