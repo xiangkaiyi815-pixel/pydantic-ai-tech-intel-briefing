@@ -106,17 +106,21 @@ contract is in [skills/content-collection-report/SKILL.md](skills/content-collec
 ## Search Coverage
 
 The default `hybrid` provider combines read-only MCP tools with Bing, Baidu,
-and Google public-result pages. Platform capability is deliberately explicit:
+and Google public-result pages. DuckDuckGo can be added to the browser engine
+pool when the local network can reach its HTML endpoint. Platform capability is
+deliberately explicit:
 
 | Source family | Access mode | Notes |
 | --- | --- | --- |
 | GitHub, arXiv, Hacker News, Stack Exchange | Read-only MCP | URL-bearing public results |
-| General web | Public engine results | Bing, Baidu, Google; markup and anti-bot behavior can vary |
-| Bilibili | Public video-search API | No login state |
+| General web | Public engine results | Bing, Baidu, Google; optional DuckDuckGo; markup and anti-bot behavior can vary |
+| Bilibili | Public video-search API | No login state; retries with browser headers when public API returns transient anti-bot errors |
 | Weibo, Zhihu, 36Kr, Juejin | Optional local RSSHub MCP | Public feeds only |
-| WeChat, Toutiao, Xiaohongshu | Baidu public-index discovery | Original target URLs only; no detail-page fetching |
+| WeChat, Xiaohongshu | Baidu-first public-index discovery with endpoint and public-engine fallback | Original target URLs only; no detail-page fetching |
+| Toutiao | Public search page plus Baidu/public-engine fallback | Original `toutiao.com` URLs only; no detail-page fetching |
 | Douyin and Kuaishou | Disabled RSSHub subscription slots | Require public account identifiers and route validation |
-| LinkedIn, X, Reddit, YouTube | Public-result discovery | No private, internal, or login-gated material |
+| LinkedIn, X, Reddit | Public-result discovery | No private, internal, or login-gated material |
+| YouTube | Public search page plus public-result discovery | Original watch URLs only; no private or login-gated material |
 
 Configured coverage is not proof that a platform produced useful results for a
 particular topic. The report retains only sources that pass its relevance and

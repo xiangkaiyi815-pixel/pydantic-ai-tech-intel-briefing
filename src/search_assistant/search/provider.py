@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -614,9 +615,37 @@ class BrowserSearchClient:
         )
 
     def _search_engines(self, query: str, limit: int) -> list[list[SearchResult]]:
-        engines = self.engines
-        if self._requires_baidu_only(_site_domains(query)):
-            engines = [engine for engine in engines if isinstance(engine, BaiduBrowserSearchClient)]
+        scoped_domains = _site_domains(query)
+        if self._requires_baidu_only(scoped_domains):
+            baidu_engines = [engine for engine in self.engines if isinstance(engine, BaiduBrowserSearchClient)]
+            baidu_results = self._search_with_engines(baidu_engines, query, limit)
+            if self._has_scoped_engine_results(baidu_results, scoped_domains):
+                return baidu_results
+            fallback_engines = [engine for engine in self.engines if not isinstance(engine, BaiduBrowserSearchClient)]
+            return baidu_results + self._scoped_query_fallback_results(fallback_engines, query, scoped_domains, limit)
+
+        engine_results = self._search_with_engines(self.engines, query, limit)
+        if scoped_domains and not self._has_scoped_engine_results(engine_results, scoped_domains):
+            engine_results.extend(self._scoped_query_fallback_results(self.engines, query, scoped_domains, limit))
+        return engine_results
+
+    @staticmethod
+    def _has_scoped_engine_results(
+        engine_results: list[list[SearchResult]],
+        scoped_domains: tuple[str, ...],
+    ) -> bool:
+        return any(
+            _matches_scoped_domains(result.url, scoped_domains)
+            for results in engine_results
+            for result in results
+        )
+
+    def _search_with_engines(
+        self,
+        engines: list[SearchClient],
+        query: str,
+        limit: int,
+    ) -> list[list[SearchResult]]:
         if not engines:
             return []
 
@@ -636,6 +665,21 @@ class BrowserSearchClient:
                 engine_results.append([])
         executor.shutdown(wait=False, cancel_futures=True)
         return engine_results
+
+    def _scoped_query_fallback_results(
+        self,
+        engines: list[SearchClient],
+        query: str,
+        scoped_domains: tuple[str, ...],
+        limit: int,
+    ) -> list[list[SearchResult]]:
+        fallback_results: list[list[SearchResult]] = []
+        for fallback_query in _scoped_query_fallbacks(query, scoped_domains):
+            engine_results = self._search_with_engines(engines, fallback_query, limit)
+            fallback_results.extend(engine_results)
+            if self._has_scoped_engine_results(engine_results, scoped_domains):
+                break
+        return fallback_results
 
     def _enrich_results(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         if not self.enrich_content or self._requires_baidu_only(_site_domains(query)):
@@ -735,30 +779,65 @@ class BingBrowserSearchClient:
 class BaiduBrowserSearchClient:
     def __init__(
         self,
-        base_url: str = "https://m.baidu.com/s",
+        base_url: str = "https://www.baidu.com/baidu",
         transport: SearchTransport | None = None,
+        fallback_base_urls: Iterable[str] | None = None,
+        request_interval_seconds: float = 0.0,
+        challenge_cooldown_seconds: float = 0.0,
     ):
         self.base_url = base_url
         self.transport = transport or _urllib_get
+        self.fallback_base_urls = tuple(
+            fallback_base_urls
+            if fallback_base_urls is not None
+            else ("https://www.baidu.com/baidu", "https://m.baidu.com/s", "https://www.baidu.com/s")
+        )
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self.challenge_cooldown_seconds = max(0.0, challenge_cooldown_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+        self._blocked_until = 0.0
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
-        host = _normalize_domain(urllib.parse.urlparse(self.base_url).hostname or "")
-        parameters = {"word": query} if host == "m.baidu.com" else {"wd": query, "ie": "utf-8"}
-        url = self.base_url + "?" + urllib.parse.urlencode(parameters)
-        html_body = self.transport(
-            url,
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-            },
-        )
-        if _is_baidu_challenge_page(html_body):
-            raise SearchProviderError("Baidu public search returned a verification page")
-        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+        last_error: SearchProviderError | None = None
+        for base_url in _unique_urls((self.base_url, *self.fallback_base_urls)):
+            url = _baidu_search_url(base_url, query)
+            try:
+                html_body = self._rate_limited_get(url, _baidu_page_headers(base_url))
+            except SearchProviderError as exc:
+                last_error = exc
+                continue
+            if _is_baidu_challenge_page(html_body):
+                last_error = SearchProviderError("Baidu public search returned a verification page")
+                continue
+            results = self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())
+            if results:
+                return results[:limit]
+        if last_error is not None:
+            if "verification page" in str(last_error):
+                self._mark_challenge_cooldown()
+            raise last_error
+        return []
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        with self._request_lock:
+            if self._blocked_until > time.monotonic():
+                raise SearchProviderError("Baidu public search is cooling down after a verification page")
+            if self.request_interval_seconds <= 0:
+                return self.transport(url, headers)
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    def _mark_challenge_cooldown(self) -> None:
+        if self.challenge_cooldown_seconds <= 0:
+            return
+        with self._request_lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + self.challenge_cooldown_seconds)
 
     @staticmethod
     def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
@@ -989,9 +1068,13 @@ class BilibiliPublicSearchClient:
         self,
         base_url: str = "https://api.bilibili.com/x/web-interface/search/type",
         transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         keyword = _query_without_site_directives(query)
@@ -1000,15 +1083,28 @@ class BilibiliPublicSearchClient:
         url = self.base_url + "?" + urllib.parse.urlencode(
             {"search_type": "video", "keyword": keyword, "page": "1"}
         )
-        payload = self.transport(
-            url,
-            {
-                "User-Agent": "Mozilla/5.0 search-assistant/0.1",
-                "Accept": "application/json",
-                "Referer": "https://search.bilibili.com/",
-            },
-        )
-        return self.parse_results(payload, checked_at=datetime.now(UTC).isoformat())[:limit]
+        last_error: SearchProviderError | None = None
+        for headers in _bilibili_api_headers():
+            try:
+                payload = self._rate_limited_get(url, headers)
+                return self.parse_results(payload, checked_at=datetime.now(UTC).isoformat())[:limit]
+            except SearchProviderError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return []
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
 
     @staticmethod
     def parse_results(payload: str, checked_at: str) -> list[SearchResult]:
@@ -1050,6 +1146,150 @@ class BilibiliPublicSearchClient:
                     )
                 )
         return results
+
+
+class ToutiaoPublicSearchClient:
+    """No-login Toutiao public search page parser for routes explicitly scoped to toutiao.com."""
+
+    def __init__(
+        self,
+        base_url: str = "https://so.toutiao.com/search",
+        transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
+    ):
+        self.base_url = base_url
+        self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        keyword = _query_without_site_directives(query)
+        if not keyword:
+            return []
+        url = self.base_url + "?" + urllib.parse.urlencode({"keyword": keyword})
+        html_body = self._rate_limited_get(
+            url,
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+            },
+        )
+        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    @staticmethod
+    def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        url_pattern = re.compile(
+            r'(?:open_url|article_url)(?:&quot;|["\'])\s*:\s*(?:&quot;|["\'])(?P<url>.*?)(?:&quot;|["\'])',
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        matches = list(url_pattern.finditer(html_body))
+        for index, match in enumerate(matches):
+            url = _decode_embedded_json_value(match.group("url"))
+            url = html.unescape(url).replace("\\/", "/").strip()
+            url = _canonical_toutiao_url(url)
+            if not url:
+                continue
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else min(len(html_body), match.end() + 6000)
+            window = html_body[max(0, match.start() - 2500) : next_start]
+            title = _extract_embedded_json_field(window, ("title", "display_title")) or url
+            snippet = _extract_embedded_json_field(window, ("abstract", "summary", "hot_board_summary"))
+            results.append(
+                SearchResult(
+                    title=_clean_text(_strip_tags(title)),
+                    url=url,
+                    snippet=_clean_text(_strip_tags(snippet)),
+                    provider="toutiao-public-search",
+                    checked_at=checked_at,
+                )
+            )
+        return _dedupe_search_results(results)
+
+
+class YouTubePublicSearchClient:
+    """No-login YouTube search page parser for routes explicitly scoped to youtube.com."""
+
+    def __init__(
+        self,
+        base_url: str = "https://www.youtube.com/results",
+        transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
+    ):
+        self.base_url = base_url
+        self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        keyword = _query_without_site_directives(query)
+        if not keyword:
+            return []
+        url = self.base_url + "?" + urllib.parse.urlencode({"search_query": keyword})
+        html_body = self._rate_limited_get(
+            url,
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9,zh;q=0.6",
+            },
+        )
+        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    @staticmethod
+    def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        pattern = re.compile(
+            r'"videoId":"(?P<video_id>[^"]+)".{0,5000}?"title":\{"runs":\[\{"text":"(?P<title>.*?)"\}',
+            flags=re.DOTALL,
+        )
+        for match in pattern.finditer(html_body):
+            video_id = match.group("video_id")
+            title = _decode_embedded_json_value(match.group("title"))
+            if not video_id or not title:
+                continue
+            results.append(
+                SearchResult(
+                    title=_clean_text(title),
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    snippet="Public YouTube search result.",
+                    provider="youtube-public-search",
+                    checked_at=checked_at,
+                )
+            )
+        return _dedupe_search_results(results)
 
 
 class DuckDuckGoSearchClient:
@@ -1128,7 +1368,16 @@ def _browser_search_client_from_settings(settings: Settings) -> BrowserSearchCli
             "bilibili.com": BilibiliPublicSearchClient(
                 base_url=settings.bilibili_search_base_url,
                 transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
-            )
+                request_interval_seconds=0.5,
+            ),
+            "toutiao.com": ToutiaoPublicSearchClient(
+                transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
+                request_interval_seconds=0.5,
+            ),
+            "youtube.com": YouTubePublicSearchClient(
+                transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
+                request_interval_seconds=0.5,
+            ),
         },
         baidu_only_domains={
             "mp.weixin.qq.com",
@@ -1171,7 +1420,14 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
                 )
             )
         elif engine == "baidu":
-            engines.append(BaiduBrowserSearchClient(base_url=settings.baidu_search_base_url, transport=transport))
+            engines.append(
+                BaiduBrowserSearchClient(
+                    base_url=settings.baidu_search_base_url,
+                    transport=transport,
+                    request_interval_seconds=0.8,
+                    challenge_cooldown_seconds=60.0,
+                )
+            )
         elif engine == "google":
             engines.append(
                 GoogleBrowserSearchClient(
@@ -1180,6 +1436,8 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
                     transport=transport,
                 )
             )
+        elif engine == "duckduckgo":
+            engines.append(DuckDuckGoSearchClient(transport=transport))
         else:
             raise RuntimeError(f"Unsupported browser search engine: {engine}")
     return engines
@@ -1267,6 +1525,131 @@ def _browser_page_headers() -> dict[str, str]:
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9,zh;q=0.6",
     }
+
+
+def _scoped_query_fallbacks(query: str, scoped_domains: tuple[str, ...]) -> list[str]:
+    clean_query = _query_without_site_directives(query)
+    if not clean_query or not scoped_domains:
+        return []
+
+    fallbacks: list[str] = []
+    for domain in scoped_domains:
+        _append_unique(fallbacks, f"{clean_query} {domain}")
+    return [candidate for candidate in fallbacks if candidate != query]
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    normalized = " ".join(value.split())
+    if normalized and normalized.lower() not in {item.lower() for item in values}:
+        values.append(normalized)
+
+
+def _unique_urls(urls: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        normalized = url.strip().rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def _baidu_search_url(base_url: str, query: str) -> str:
+    host = _normalize_domain(urllib.parse.urlparse(base_url).hostname or "")
+    parameters = {"word": query} if host == "m.baidu.com" else {"wd": query, "ie": "utf-8"}
+    return base_url.rstrip("/") + "?" + urllib.parse.urlencode(parameters)
+
+
+def _baidu_page_headers(base_url: str) -> dict[str, str]:
+    host = _normalize_domain(urllib.parse.urlparse(base_url).hostname or "")
+    if host == "m.baidu.com":
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        }
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+    }
+
+
+def _bilibili_api_headers() -> list[dict[str, str]]:
+    desktop_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        "Origin": "https://search.bilibili.com",
+        "Referer": "https://search.bilibili.com/",
+    }
+    return [
+        {
+            "User-Agent": "Mozilla/5.0 search-assistant/0.1",
+            "Accept": "application/json",
+            "Referer": "https://search.bilibili.com/",
+        },
+        desktop_headers,
+    ]
+
+
+def _extract_embedded_json_field(window: str, field_names: tuple[str, ...]) -> str:
+    for field_name in field_names:
+        patterns = (
+            rf'{re.escape(field_name)}(?:&quot;|["\'])\s*:\s*(?:&quot;|["\'])(.*?)(?:&quot;|["\'])',
+            rf'{re.escape(field_name)}\\?"\s*:\s*\\?"(.*?)(?:\\?"|")',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, window, flags=re.DOTALL | re.IGNORECASE)
+            if match:
+                value = _decode_embedded_json_value(match.group(1))
+                if value:
+                    return value
+    return ""
+
+
+def _decode_embedded_json_value(value: str) -> str:
+    unescaped = html.unescape(value).replace("\\/", "/")
+    try:
+        return str(json.loads(f'"{unescaped}"'))
+    except json.JSONDecodeError:
+        return _decode_javascript_escapes(unescaped)
+
+
+def _dedupe_search_results(results: list[SearchResult]) -> list[SearchResult]:
+    unique: list[SearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        key = _dedupe_key(result.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(result)
+    return unique
+
+
+def _canonical_toutiao_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = _normalize_domain(parsed.hostname or "")
+    if not _matches_scoped_domains(url, ("toutiao.com",)):
+        return ""
+    if host == "article.zlink.toutiao.com":
+        return ""
+    match = re.match(r"^/(?:group|article)/(\d+)/?", parsed.path)
+    if not match:
+        return ""
+    return f"https://toutiao.com/group/{match.group(1)}"
 
 
 def _extract_relevant_page_excerpt(html_body: str, query: str, max_chars: int = 1200) -> str:

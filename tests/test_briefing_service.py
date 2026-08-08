@@ -350,6 +350,33 @@ def test_cad_topic_filter_rejects_generic_ai_content_and_keeps_engineering_evide
     )
 
 
+def test_report_source_filter_keeps_exact_chinese_topic_phrase_without_overmatching_fragments():
+    topic = "人工智能产业发展"
+    query = "site:bilibili.com 人工智能产业发展"
+
+    assert DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://www.bilibili.com/video/av116578230279494",
+        "【政策研究】中国 人工智能产业发展 调查",
+        "围绕人工智能产业发展讨论政策、产业链与应用落地。",
+    )
+    assert DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://www.bilibili.com/video/av114070036480806",
+        "人工智能创新加速我国产业转型升级",
+        "公开视频讨论人工智能技术快速发展、产业链和应用落地。",
+    )
+    assert not DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://example.com/ren-gong",
+        "人工 的意思",
+        "人工是一个汉语词汇解释页面。",
+    )
+
+
 def test_cad_topic_filter_rejects_search_dumps_login_pages_and_medical_cad():
     topic = "AI 3D CAD engineering drawing"
     query = "text-to-CAD parametric modeling B-Rep evaluation"

@@ -96,10 +96,10 @@ class Settings(BaseModel):
     domestic_rss_timeout_seconds: float = 8.0
     bilibili_search_base_url: str = "https://api.bilibili.com/x/web-interface/search/type"
     duckduckgo_timeout_seconds: float = 12.0
-    browser_search_base_url: str = "https://www.bing.com/search"
+    browser_search_base_url: str = "https://cn.bing.com/search"
     browser_search_market: str = "zh-CN"
     browser_search_engines: list[str] = Field(default_factory=lambda: ["bing", "baidu", "google"])
-    baidu_search_base_url: str = "https://m.baidu.com/s"
+    baidu_search_base_url: str = "https://www.baidu.com/baidu"
     google_search_base_url: str = "https://www.google.com/search"
     browser_search_timeout_seconds: float = 8.0
     browser_content_timeout_seconds: float = 3.0
@@ -172,13 +172,13 @@ class Settings(BaseModel):
                 "https://api.bilibili.com/x/web-interface/search/type",
             ),
             "duckduckgo_timeout_seconds": _to_float(source.get("DUCKDUCKGO_TIMEOUT_SECONDS"), 12.0),
-            "browser_search_base_url": source.get("BROWSER_SEARCH_BASE_URL", "https://www.bing.com/search"),
+            "browser_search_base_url": source.get("BROWSER_SEARCH_BASE_URL", "https://cn.bing.com/search"),
             "browser_search_market": source.get("BROWSER_SEARCH_MARKET", "zh-CN"),
             "browser_search_engines": _to_list(
                 source.get("BROWSER_SEARCH_ENGINES"),
                 ["bing", "baidu", "google"],
             ),
-            "baidu_search_base_url": source.get("BAIDU_SEARCH_BASE_URL", "https://m.baidu.com/s"),
+            "baidu_search_base_url": source.get("BAIDU_SEARCH_BASE_URL", "https://www.baidu.com/baidu"),
             "google_search_base_url": source.get("GOOGLE_SEARCH_BASE_URL", "https://www.google.com/search"),
             "browser_search_timeout_seconds": _to_float(source.get("BROWSER_SEARCH_TIMEOUT_SECONDS"), 8.0),
             "browser_content_timeout_seconds": _to_float(source.get("BROWSER_CONTENT_TIMEOUT_SECONDS"), 3.0),
