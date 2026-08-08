@@ -909,6 +909,27 @@ class DailyBriefingService:
         return float(sum(1 for term in terms if term in haystack))
 
     @staticmethod
+    def _has_exact_cjk_topic_phrase(topic: str, title: str, snippet: str) -> bool:
+        phrases = re.findall(r"[\u4e00-\u9fff]{4,}", topic)
+        if not phrases:
+            return False
+        haystack = f"{title} {snippet}"
+        return any(phrase in haystack for phrase in phrases)
+
+    @staticmethod
+    def _cjk_topic_match_score(topic: str, title: str, snippet: str) -> int:
+        haystack = f"{title} {snippet}"
+        best_score = 0
+        for phrase in re.findall(r"[\u4e00-\u9fff]{3,}", topic):
+            if phrase in haystack:
+                best_score = max(best_score, 4)
+                continue
+            chunks = {phrase[index : index + 2] for index in range(0, len(phrase) - 1)}
+            matched_chunks = {chunk for chunk in chunks if chunk in haystack}
+            best_score = max(best_score, len(matched_chunks))
+        return best_score
+
+    @staticmethod
     def _query_relevance_score(query: str, title: str, snippet: str) -> float:
         terms = [
             term.lower()
@@ -978,6 +999,10 @@ class DailyBriefingService:
             return False
         topic_score = cls._relevance_score(topic, title, snippet)
         query_score = cls._query_relevance_score(query, title, snippet)
+        if cls._has_exact_cjk_topic_phrase(topic, title, snippet):
+            return True
+        if cls._cjk_topic_match_score(topic, title, snippet) >= 2:
+            return True
         if _is_cad_topic(f"{topic} {query}"):
             return topic_score >= 2 or query_score >= 2 or (
                 cls._technical_signal_count(title, snippet) > 0 and max(topic_score, query_score) >= 1

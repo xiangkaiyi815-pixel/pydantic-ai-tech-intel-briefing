@@ -21,6 +21,8 @@ from search_assistant.search.provider import (
     SearxngSearchClient,
     SearchProviderError,
     SearchResult,
+    ToutiaoPublicSearchClient,
+    YouTubePublicSearchClient,
     search_client_from_settings,
 )
 
@@ -329,6 +331,89 @@ def test_bilibili_public_search_client_extracts_public_video_results_without_log
     assert calls[0]["headers"]["Referer"] == "https://search.bilibili.com/"
 
 
+def test_bilibili_public_search_client_retries_with_browser_headers_after_anti_bot_error():
+    calls = []
+
+    def transport(url, headers):
+        calls.append({"url": url, "headers": headers})
+        if len(calls) == 1:
+            raise SearchProviderError("Search request failed: HTTP Error 412: Precondition Failed")
+        return json.dumps(
+            {
+                "code": 0,
+                "data": {
+                    "result": [
+                        {
+                            "title": "AI industry video",
+                            "bvid": "BV1retry123",
+                            "description": "Public Bilibili result.",
+                        }
+                    ]
+                },
+            }
+        )
+
+    client = BilibiliPublicSearchClient(transport=transport)
+
+    results = client.search("site:bilibili.com AI industry", limit=1)
+
+    assert results[0].url == "https://www.bilibili.com/video/BV1retry123"
+    assert len(calls) == 2
+    assert "Windows NT" in calls[1]["headers"]["User-Agent"]
+
+
+def test_toutiao_public_search_client_extracts_original_group_urls_without_detail_fetch():
+    calls = []
+
+    def transport(url, headers):
+        calls.append({"url": url, "headers": headers})
+        return """
+        <script>
+        window.__DATA__={"display":[
+          {"open_url":"https://toutiao.com/group/7662517064405451274/?source=search_tab",
+           "title":"我国人工智能产业发展观察",
+           "abstract":"公开搜索摘要提到产业链和应用落地。"},
+          {"open_url":"https://article.zlink.toutiao.com/J4dQM?alert=0",
+           "title":"跳转链接不应保留"},
+          {"open_url":"https://example.com/off-domain",
+           "title":"ignored"}
+        ]};
+        </script>
+        """
+
+    client = ToutiaoPublicSearchClient(transport=transport)
+
+    results = client.search("site:toutiao.com 人工智能产业发展", limit=3)
+
+    assert [result.url for result in results] == ["https://toutiao.com/group/7662517064405451274"]
+    assert results[0].title == "我国人工智能产业发展观察"
+    assert results[0].snippet == "公开搜索摘要提到产业链和应用落地。"
+    assert results[0].provider == "toutiao-public-search"
+    assert "keyword=%E4%BA%BA%E5%B7%A5" in calls[0]["url"]
+    assert "site%3Atoutiao.com" not in calls[0]["url"]
+
+
+def test_youtube_public_search_client_extracts_watch_urls_without_api_key():
+    calls = []
+
+    def transport(url, headers):
+        calls.append({"url": url, "headers": headers})
+        return (
+            '{"videoRenderer":{"videoId":"abc123xyz00","thumbnail":{},'
+            '"title":{"runs":[{"text":"AI industrial development keynote"}]}}}'
+        )
+
+    client = YouTubePublicSearchClient(transport=transport)
+
+    results = client.search("site:youtube.com AI industrial development", limit=3)
+
+    assert [result.url for result in results] == ["https://www.youtube.com/watch?v=abc123xyz00"]
+    assert results[0].title == "AI industrial development keynote"
+    assert results[0].provider == "youtube-public-search"
+    assert "search_query=AI+industrial+development" in calls[0]["url"]
+    assert "site%3Ayoutube.com" not in calls[0]["url"]
+
+
 def test_browser_search_client_rejects_off_domain_results_for_site_queries():
     client = BrowserSearchClient(
         [
@@ -385,6 +470,42 @@ def test_browser_search_client_uses_direct_scoped_client_before_html_engines():
 
     assert [result.url for result in results] == ["https://www.bilibili.com/video/BV1valid"]
     assert results[0].provider == "bilibili-public-api"
+
+
+def test_browser_search_client_uses_public_scoped_clients_for_toutiao_and_youtube():
+    client = BrowserSearchClient(
+        [StaticSearchClient([])],
+        scoped_search_clients={
+            "toutiao.com": StaticSearchClient(
+                [
+                    SearchResult(
+                        title="Toutiao public result",
+                        url="https://toutiao.com/group/1",
+                        snippet="",
+                        provider="toutiao-public-search",
+                        checked_at="2026-07-24T00:00:00Z",
+                    )
+                ]
+            ),
+            "youtube.com": StaticSearchClient(
+                [
+                    SearchResult(
+                        title="YouTube public result",
+                        url="https://www.youtube.com/watch?v=1",
+                        snippet="",
+                        provider="youtube-public-search",
+                        checked_at="2026-07-24T00:00:00Z",
+                    )
+                ]
+            ),
+        },
+    )
+
+    toutiao_results = client.search("site:toutiao.com industrial AI", limit=5)
+    youtube_results = client.search("site:youtube.com industrial AI", limit=5)
+
+    assert [result.provider for result in toutiao_results] == ["toutiao-public-search"]
+    assert [result.provider for result in youtube_results] == ["youtube-public-search"]
 
 
 def test_bing_browser_search_parser_extracts_results_from_html():
@@ -459,7 +580,7 @@ def test_baidu_browser_search_parser_extracts_mobile_original_url_and_discards_b
     assert results[0].snippet == "Result-page summary for the article."
 
 
-def test_baidu_browser_search_uses_mobile_public_results_page_by_default():
+def test_baidu_browser_search_uses_available_public_results_endpoint_by_default():
     calls = []
 
     def transport(url, headers):
@@ -469,8 +590,35 @@ def test_baidu_browser_search_uses_mobile_public_results_page_by_default():
     client = BaiduBrowserSearchClient(transport=transport)
     client.search("industrial AI", limit=1)
 
-    assert calls[0]["url"].startswith("https://m.baidu.com/s?word=industrial+AI")
-    assert "Android" in calls[0]["headers"]["User-Agent"]
+    assert calls[0]["url"].startswith("https://www.baidu.com/baidu?wd=industrial+AI")
+    assert "Windows NT" in calls[0]["headers"]["User-Agent"]
+
+
+def test_baidu_browser_search_falls_back_when_primary_endpoint_is_challenged():
+    calls = []
+
+    def transport(url, headers):
+        calls.append(url)
+        if url.startswith("https://m.baidu.com/s?"):
+            return "<html><title>百度安全验证</title></html>"
+        return """
+        <div class="result c-container" mu="https://mp.weixin.qq.com/s/fallback-original">
+          <h3 class="t"><a href="https://www.baidu.com/link?url=opaque">Fallback public account article</a></h3>
+          <div class="c-abstract">Baidu desktop result-page excerpt.</div>
+        </div>
+        """
+
+    client = BaiduBrowserSearchClient(
+        base_url="https://m.baidu.com/s",
+        transport=transport,
+        fallback_base_urls=("https://www.baidu.com/baidu",),
+    )
+
+    results = client.search("site:mp.weixin.qq.com industrial AI", limit=1)
+
+    assert [result.url for result in results] == ["https://mp.weixin.qq.com/s/fallback-original"]
+    assert calls[0].startswith("https://m.baidu.com/s?word=site%3Amp.weixin.qq.com")
+    assert calls[1].startswith("https://www.baidu.com/baidu?wd=site%3Amp.weixin.qq.com")
 
 
 def test_browser_search_client_uses_baidu_only_and_skips_platform_enrichment():
@@ -508,6 +656,84 @@ def test_browser_search_client_uses_baidu_only_and_skips_platform_enrichment():
     assert page_calls == []
 
 
+def test_browser_search_client_falls_back_to_other_engines_when_baidu_public_index_is_blocked():
+    page_calls = []
+
+    def baidu_transport(url, headers):
+        return "<html><title>百度安全验证</title></html>"
+
+    def content_transport(url, headers):
+        page_calls.append(url)
+        raise AssertionError("Platform public-index discovery must not fetch the detail page")
+
+    fallback = StaticSearchClient(
+        [
+            SearchResult(
+                title="Off-domain result",
+                url="https://example.com/not-wechat",
+                snippet="Should be filtered out.",
+                provider="browser-bing",
+                checked_at="2026-07-26T00:00:00Z",
+            ),
+            SearchResult(
+                title="Public account fallback article",
+                url="https://mp.weixin.qq.com/s/fallback-original",
+                snippet="Result-page excerpt from another public search engine.",
+                provider="browser-google",
+                checked_at="2026-07-26T00:00:00Z",
+            ),
+        ]
+    )
+    client = BrowserSearchClient(
+        [BaiduBrowserSearchClient(transport=baidu_transport), fallback],
+        enrich_content=True,
+        content_transport=content_transport,
+        baidu_only_domains={"mp.weixin.qq.com", "toutiao.com", "xiaohongshu.com", "xhslink.com"},
+    )
+
+    results = client.search("site:mp.weixin.qq.com DGX Spark", limit=3)
+
+    assert [result.url for result in results] == ["https://mp.weixin.qq.com/s/fallback-original"]
+    assert results[0].provider == "browser-google"
+    assert page_calls == []
+
+
+def test_browser_search_client_retries_site_queries_with_domain_without_faking_coverage():
+    class QuerySensitiveSearchClient:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, query, limit=5):
+            self.calls.append(query)
+            if query == "industrial AI reddit.com":
+                return [
+                    SearchResult(
+                        title="Industrial AI discussion",
+                        url="https://www.reddit.com/r/MachineLearning/comments/example",
+                        snippet="A public Reddit discussion about industrial AI.",
+                        provider="browser-bing",
+                        checked_at="2026-07-26T00:00:00Z",
+                    )
+                ]
+            return [
+                SearchResult(
+                    title="Off-domain result",
+                    url="https://example.com/not-reddit",
+                    snippet="The engine ignored the site filter.",
+                    provider="browser-bing",
+                    checked_at="2026-07-26T00:00:00Z",
+                )
+            ]
+
+    engine = QuerySensitiveSearchClient()
+    client = BrowserSearchClient([engine])
+
+    results = client.search("site:reddit.com industrial AI", limit=3)
+
+    assert [result.url for result in results] == ["https://www.reddit.com/r/MachineLearning/comments/example"]
+    assert engine.calls[:2] == ["site:reddit.com industrial AI", "industrial AI reddit.com"]
+
+
 def test_baidu_browser_search_rejects_verification_pages():
     client = BaiduBrowserSearchClient(
         transport=lambda url, headers: "<html><title>百度安全验证</title></html>"
@@ -515,6 +741,27 @@ def test_baidu_browser_search_rejects_verification_pages():
 
     with pytest.raises(SearchProviderError, match="verification page"):
         client.search("site:mp.weixin.qq.com industrial AI")
+
+
+def test_baidu_browser_search_cools_down_after_verification_page():
+    calls = []
+
+    def transport(url, headers):
+        calls.append(url)
+        return "<html><title>百度安全验证</title></html>"
+
+    client = BaiduBrowserSearchClient(
+        transport=transport,
+        fallback_base_urls=(),
+        challenge_cooldown_seconds=30.0,
+    )
+
+    with pytest.raises(SearchProviderError, match="verification page"):
+        client.search("site:mp.weixin.qq.com industrial AI")
+    with pytest.raises(SearchProviderError, match="cooling down"):
+        client.search("site:mp.weixin.qq.com industrial AI")
+
+    assert len(calls) == 1
 
 
 def test_google_browser_search_parser_extracts_results_from_html():
@@ -1147,7 +1394,7 @@ def test_search_client_from_settings_uses_hybrid_search_by_default_without_api_k
         "xhslink.com",
     }
     baidu = next(engine for engine in client.clients[1].engines if isinstance(engine, BaiduBrowserSearchClient))
-    assert baidu.base_url == "https://m.baidu.com/s"
+    assert baidu.base_url == "https://www.baidu.com/baidu"
 
 
 def test_search_client_from_settings_allows_browser_engine_selection(tmp_path):
@@ -1165,6 +1412,24 @@ def test_search_client_from_settings_allows_browser_engine_selection(tmp_path):
     assert [type(engine).__name__ for engine in client.engines] == [
         "BaiduBrowserSearchClient",
         "GoogleBrowserSearchClient",
+    ]
+
+
+def test_search_client_from_settings_allows_duckduckgo_in_browser_engine_pool(tmp_path):
+    settings = Settings.from_env(
+        {
+            "SEARCH_ASSISTANT_DATA_DIR": str(tmp_path),
+            "SEARCH_ASSISTANT_SEARCH_PROVIDER": "browser",
+            "BROWSER_SEARCH_ENGINES": "bing,duckduckgo",
+        }
+    )
+
+    client = search_client_from_settings(settings)
+
+    assert isinstance(client, BrowserSearchClient)
+    assert [type(engine).__name__ for engine in client.engines] == [
+        "BingBrowserSearchClient",
+        "DuckDuckGoSearchClient",
     ]
 
 
