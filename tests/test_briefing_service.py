@@ -94,6 +94,32 @@ class NoisySearchClient:
         ][:limit]
 
 
+class MarketingSearchClient:
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="Industrial AI MES agent training camp limited offer",
+                url="https://mp.weixin.qq.com/s/marketing-camp",
+                snippet=(
+                    "Industrial AI MES agent case with scan QR, add WeChat, coupon, "
+                    "course enrollment, and business cooperation."
+                ),
+                provider="browser-baidu",
+                checked_at="2026-07-25T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="Industrial AI MES agent architecture and edge deployment",
+                url="https://example.com/industrial-agent-architecture",
+                snippet=(
+                    "The system describes machine events, MES work order interfaces, "
+                    "edge inference deployment, approval trails, and benchmark evaluation."
+                ),
+                provider="mcp:public:test",
+                checked_at="2026-07-25T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
 class PlanningRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
@@ -230,6 +256,38 @@ def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path)
     )
 
     assert [source.url for source in sources] == ["https://example.com/industrial-agent"]
+
+
+def test_daily_briefing_filters_marketing_account_content_before_ranking(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, MarketingSearchClient())
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    sources = service._collect_sources(
+        subscription,
+        [("public-social", "industrial AI MES agent architecture deployment")],
+        [],
+    )
+
+    assert [source.url for source in sources] == ["https://example.com/industrial-agent-architecture"]
+
+
+def test_marketing_filter_keeps_technical_public_account_posts():
+    assert not DailyBriefingService._is_report_source_candidate(
+        "industrial AI",
+        "industrial AI MES agent architecture deployment",
+        "https://mp.weixin.qq.com/s/marketing-camp",
+        "Industrial AI MES agent training camp limited offer",
+        "Scan QR, add WeChat, coupon, course enrollment, and business cooperation.",
+    )
+    assert DailyBriefingService._is_report_source_candidate(
+        "industrial AI",
+        "industrial AI MES agent architecture deployment",
+        "https://mp.weixin.qq.com/s/technical-architecture",
+        "Industrial AI MES agent architecture and edge deployment",
+        "Machine events, MES work order interfaces, edge inference, approval trails, and benchmark evaluation.",
+    )
 
 
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):

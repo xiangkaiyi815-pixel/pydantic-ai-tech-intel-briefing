@@ -161,6 +161,107 @@ _PLATFORM_TERMS = {
     "linkedin", "youtube", "reddit", "发布在", "原文链接",
 }
 _NOISE_TERMS = {"已经收获", "先问问", "你的手和脑", "请关注", "点击查看", "完整视频"}
+_MARKETING_CONTENT_DOMAINS = {
+    "mp.weixin.qq.com",
+    "weixin.qq.com",
+    "toutiao.com",
+    "xiaohongshu.com",
+    "xhslink.com",
+    "baijiahao.baidu.com",
+    "sohu.com",
+}
+_MARKETING_STRONG_PHRASES = (
+    "广告合作",
+    "本文为广告",
+    "商业推广",
+    "商务合作",
+    "商业合作",
+    "软文",
+    "赞助商",
+    "招商加盟",
+    "代理加盟",
+    "限时优惠",
+    "限时福利",
+    "免费领取",
+    "扫码领取",
+    "扫码加",
+    "加微信",
+    "联系微信",
+    "私信领取",
+    "私信进群",
+    "领取资料",
+    "点击购买",
+    "购买链接",
+    "优惠券",
+    "训练营",
+    "报名入口",
+    "课程报名",
+    "带货",
+    "引流",
+    "裂变",
+    "涨粉",
+    "变现",
+    "advertorial",
+    "sponsored",
+    "business cooperation",
+    "commercial cooperation",
+    "scan qr",
+    "add wechat",
+    "limited offer",
+    "limited discount",
+    "coupon",
+    "buy now",
+    "training camp",
+    "course enrollment",
+)
+_MARKETING_WEAK_PHRASES = (
+    "重磅福利",
+    "速看",
+    "震惊",
+    "必看",
+    "看完就懂",
+    "一文看懂",
+    "保姆级",
+    "干货满满",
+    "建议收藏",
+    "点赞关注",
+    "关注不迷路",
+    "转发收藏",
+    "评论区",
+    "错过再等一年",
+    "全网最全",
+    "你还不知道",
+    "must read",
+    "save this",
+    "follow us",
+)
+_SOURCE_EVIDENCE_PHRASES = (
+    "paper",
+    "论文",
+    "arxiv",
+    "github",
+    "benchmark",
+    "基准",
+    "dataset",
+    "数据集",
+    "white paper",
+    "official",
+    "官方",
+    "release",
+    "源码",
+    "architecture",
+    "架构",
+    "evaluation",
+    "评测",
+    "case study",
+    "案例",
+    "接口",
+    "模型",
+    "系统",
+    "算法",
+    "部署",
+    "开源",
+)
 
 
 _GENERIC_REFERENCE_DOMAINS = {
@@ -929,6 +1030,33 @@ class DailyBriefingService:
         host = urlparse(url).netloc.lower().removeprefix("www.")
         return any(host == domain or host.endswith(f".{domain}") for domain in _GENERIC_REFERENCE_DOMAINS)
 
+    @staticmethod
+    def _is_marketing_domain(url: str) -> bool:
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        return any(host == domain or host.endswith(f".{domain}") for domain in _MARKETING_CONTENT_DOMAINS)
+
+    @classmethod
+    def _is_marketing_account_content(cls, url: str, title: str, snippet: str) -> bool:
+        text = f"{title} {snippet}".lower()
+        compact_text = re.sub(r"\s+", "", text)
+        strong_hits = sum(
+            1 for phrase in _MARKETING_STRONG_PHRASES if phrase in text or phrase in compact_text
+        )
+        weak_hits = sum(1 for phrase in _MARKETING_WEAK_PHRASES if phrase in text or phrase in compact_text)
+        evidence_hits = sum(1 for phrase in _SOURCE_EVIDENCE_PHRASES if phrase in text or phrase in compact_text)
+        technical_hits = cls._technical_signal_count(title, snippet)
+        on_marketing_prone_domain = cls._is_marketing_domain(url)
+
+        if strong_hits >= 2:
+            return True
+        if on_marketing_prone_domain and strong_hits >= 1 and weak_hits >= 1:
+            return True
+        if on_marketing_prone_domain and strong_hits >= 1 and evidence_hits == 0 and technical_hits == 0:
+            return True
+        if weak_hits >= 3 and evidence_hits == 0 and technical_hits == 0:
+            return True
+        return False
+
     @classmethod
     def _technical_signal_count(cls, title: str, snippet: str) -> int:
         text = f"{title} {snippet}".lower()
@@ -969,6 +1097,8 @@ class DailyBriefingService:
             return False
         text = f"{title} {snippet}".lower()
         if cls._is_search_page_dump(title, snippet):
+            return False
+        if cls._is_marketing_account_content(url, title, snippet):
             return False
         if _is_cad_topic(f"{topic} {query}") and any(marker in text for marker in _CAD_MEDICAL_MARKERS):
             return False

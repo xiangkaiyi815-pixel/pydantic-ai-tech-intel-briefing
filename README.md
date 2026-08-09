@@ -34,9 +34,9 @@ turning their daily report into a list of headlines.
    detailed summaries choose their own evidence-led structure rather than
    filling a fixed theme form.
 4. **Fail closed on weak evidence.** Search-page dumps, login pages, generic
-   references, and known CAD medical false positives are filtered before
-   ranking. A synthesis timeout retries with a smaller high-ranked evidence
-   set instead of silently inventing material.
+   references, marketing-funnel posts, and known CAD medical false positives are
+   filtered before ranking. A synthesis timeout retries with a smaller
+   high-ranked evidence set instead of silently inventing material.
 5. **Local control.** Secrets stay in ignored local configuration or deployment
    secret stores. The checked-in configuration contains no credentials.
 
