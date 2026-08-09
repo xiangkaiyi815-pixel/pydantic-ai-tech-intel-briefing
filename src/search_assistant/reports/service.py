@@ -56,6 +56,20 @@ class ReportService:
         lines.extend(
             [
                 "",
+                "## Trajectory Evaluation Summary",
+            ]
+        )
+        lines.extend(self._trajectory_summary_lines())
+        lines.extend(
+            [
+                "",
+                "## Domain Knowledge Candidates",
+            ]
+        )
+        lines.extend(self._domain_knowledge_candidate_lines())
+        lines.extend(
+            [
+                "",
                 "## Unresolved Or Weakly Verified Areas",
             ]
         )
@@ -68,6 +82,43 @@ class ReportService:
         report_path.write_text(markdown, encoding="utf-8")
         self.store.add_learning_report(markdown, str(report_path))
         return markdown
+
+    def _trajectory_summary_lines(self) -> list[str]:
+        trajectories = self.store.list_trajectory_logs()
+        evaluations = self.store.list_trajectory_evaluations()
+        result_failures = sum(
+            1 for item in evaluations if not item["result_verification"].get("passed", False)
+        )
+        process_warnings = sum(
+            1 for item in evaluations if not item["process_verification"].get("passed", False)
+        )
+        quality_warnings = sum(
+            1 for item in evaluations if not item["quality_verification"].get("passed", False)
+        )
+        return [
+            f"- Immutable trajectories: {len(trajectories)}",
+            f"- Structured evaluations: {len(evaluations)}",
+            f"- Result failures: {result_failures}",
+            f"- Process warnings: {process_warnings}",
+            f"- Quality warnings: {quality_warnings}",
+        ]
+
+    def _domain_knowledge_candidate_lines(self) -> list[str]:
+        candidates = self.store.list_domain_knowledge_candidates()
+        if not candidates:
+            return ["- No search-derived domain knowledge candidates recorded yet."]
+        links_by_candidate: dict[str, int] = {}
+        for link in self.store.list_domain_candidate_graph_links():
+            candidate_id = str(link["candidate_id"])
+            links_by_candidate[candidate_id] = links_by_candidate.get(candidate_id, 0) + 1
+        return [
+            (
+                f"- [{item['status']}; confidence {item['confidence']}] {item['topic']}: "
+                f"{item['claim']} (evidence: {len(item['evidence'])}; "
+                f"graph links: {links_by_candidate.get(str(item['id']), 0)})"
+            )
+            for item in candidates
+        ]
 
     def _learning_topics(self) -> list[str]:
         seen: set[str] = set()

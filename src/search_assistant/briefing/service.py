@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, DailyBriefing, TopicSubscription
+from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchResult
 
@@ -457,6 +458,7 @@ class DailyBriefingService:
         )
         briefing.markdown = self.render_markdown(briefing)
         self.store.record_daily_briefing(briefing)
+        DomainKnowledgeCandidateService(self.store).capture_briefing(briefing)
         return briefing
 
     def build_search_plan(

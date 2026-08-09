@@ -13,6 +13,7 @@ in the other documents under `docs/`.
 | `search` | Browser, MCP, RSSHub, public Bilibili, Brave, SearXNG, and fallback search adapters. |
 | `mcp` | Read-only local MCP servers for public sources and domestic RSS feeds. |
 | `briefing` | Topic planning, source filtering, ranking, synthesis, Markdown rendering, and feedback handling. |
+| `knowledge_graph` | Reviewed domain graph seeds and query/export helpers for GraphRAG-style entity-relation knowledge. |
 | `workflow` | Ordinary question-answering, verification, calibration, final review, and active-skill context. |
 | `memory` | SQLite schema and scoped persistence. |
 | `verification` | Claim extraction, deterministic source matching, and evidence backfill. |
@@ -51,6 +52,8 @@ in the other documents under `docs/`.
 ## Extension Points
 
 - Add a public source through `search/provider.py` or a read-only MCP binding.
+- Add a reviewed domain graph through `knowledge_graph/seeds.py`, then cover it
+  with query/export tests before using it in retrieval or briefing logic.
 - Add platform constraints in `configs/domestic-rss.sources.json` and verify
   original-domain enforcement with tests.
 - Add a model runtime by implementing `AgentRuntime` and wiring it in
