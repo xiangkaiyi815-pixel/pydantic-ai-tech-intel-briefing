@@ -98,39 +98,65 @@ class GenericIndustrySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
             SearchResult(
-                title="NAAI发布2024年全球人工智能产业发展报告",
+                title="NAAI publishes a global artificial intelligence industry report",
                 url="https://mp.weixin.qq.com/s/industry-report",
-                snippet="人工智能产业发展报告梳理产业规模、产业链、政策环境和企业投入方向，但没有披露具体系统接口。",
+                snippet="The report covers industry scale, value chains, policy context, and investment directions, but no system interfaces.",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展中的AI数据集和benchmark建设",
+                title="AI datasets and benchmark construction in artificial intelligence industry development",
                 url="https://example.com/ai-dataset-benchmark",
-                snippet="文章讨论dataset、benchmark、开源模型和评测指标如何支撑人工智能产业发展。",
+                snippet="The article discusses datasets, benchmarks, open source models, and evaluation metrics.",
                 provider="browser-bing",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展推动制造业和政务场景落地",
+                title="Artificial intelligence industry development enters manufacturing and government workflows",
                 url="https://example.com/ai-application-case",
-                snippet="案例描述人工智能应用进入业务流程，但仍需要核验数据输入、系统接口、人工审批和量化收益。",
+                snippet="The case describes AI entering business workflows and still needing data input, system interface, human approval, and ROI validation.",
                 provider="browser-google",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="央视纪录片讨论人工智能产业发展与智能时代",
+                title="Public documentary discusses artificial intelligence industry development",
                 url="https://www.bilibili.com/video/av996452521",
-                snippet="公开视频和纪录片解释人工智能发展趋势，适合作为公众传播信号而不是系统实现证据。",
+                snippet="A public video explains AI development trends as a public communication signal rather than system implementation evidence.",
                 provider="bilibili-public-api",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展大会展示AI产品和生态合作",
+                title="Artificial intelligence industry conference showcases AI products and ecosystem cooperation",
                 url="https://example.com/ai-conference",
-                snippet="大会展示产品动态、生态合作和行业讨论，需要继续查找原始技术文档和客户部署指标。",
+                snippet="The conference showcases product updates, ecosystem cooperation, and industry discussion; original technical documents and deployment metrics remain needed.",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
+class MarketingSearchClient:
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return [
+            SearchResult(
+                title="Industrial AI MES agent training camp limited offer",
+                url="https://mp.weixin.qq.com/s/marketing-camp",
+                snippet=(
+                    "Industrial AI MES agent case with scan QR, add WeChat, coupon, "
+                    "course enrollment, and business cooperation."
+                ),
+                provider="browser-baidu",
+                checked_at="2026-07-25T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="Industrial AI MES agent architecture and edge deployment",
+                url="https://example.com/industrial-agent-architecture",
+                snippet=(
+                    "The system describes machine events, MES work order interfaces, "
+                    "edge inference deployment, approval trails, and benchmark evaluation."
+                ),
+                provider="mcp:public:test",
+                checked_at="2026-07-25T00:00:00+00:00",
             ),
         ][:limit]
 
@@ -276,6 +302,38 @@ def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path)
     )
 
     assert [source.url for source in sources] == ["https://example.com/industrial-agent"]
+
+
+def test_daily_briefing_filters_marketing_account_content_before_ranking(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, MarketingSearchClient())
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    sources = service._collect_sources(
+        subscription,
+        [("public-social", "industrial AI MES agent architecture deployment")],
+        [],
+    )
+
+    assert [source.url for source in sources] == ["https://example.com/industrial-agent-architecture"]
+
+
+def test_marketing_filter_keeps_technical_public_account_posts():
+    assert not DailyBriefingService._is_report_source_candidate(
+        "industrial AI",
+        "industrial AI MES agent architecture deployment",
+        "https://mp.weixin.qq.com/s/marketing-camp",
+        "Industrial AI MES agent training camp limited offer",
+        "Scan QR, add WeChat, coupon, course enrollment, and business cooperation.",
+    )
+    assert DailyBriefingService._is_report_source_candidate(
+        "industrial AI",
+        "industrial AI MES agent architecture deployment",
+        "https://mp.weixin.qq.com/s/technical-architecture",
+        "Industrial AI MES agent architecture and edge deployment",
+        "Machine events, MES work order interfaces, edge inference, approval trails, and benchmark evaluation.",
+    )
 
 
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):
