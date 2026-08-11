@@ -70,6 +70,13 @@ class ReportService:
         lines.extend(
             [
                 "",
+                "## AgentOps Infrastructure Readiness",
+            ]
+        )
+        lines.extend(self._agentops_infrastructure_lines())
+        lines.extend(
+            [
+                "",
                 "## Unresolved Or Weakly Verified Areas",
             ]
         )
@@ -118,6 +125,28 @@ class ReportService:
                 f"graph links: {links_by_candidate.get(str(item['id']), 0)})"
             )
             for item in candidates
+        ]
+
+    def _agentops_infrastructure_lines(self) -> list[str]:
+        counts = self.store.diagnostic_counts()
+        gates = self.store.list_gate_records()
+        gate_status = {
+            result: sum(1 for item in gates if item["result"] == result)
+            for result in ("passed", "failed", "waived")
+        }
+        provider_summary = self.store.search_provider_health_summary()
+        return [
+            f"- Project ledger entries: {counts['project_ledger_entries']}",
+            (
+                "- Self-evolution gate records: "
+                f"{counts['agentops_gate_records']} "
+                f"(passed {gate_status['passed']}, failed {gate_status['failed']}, waived {gate_status['waived']})"
+            ),
+            f"- Trace events: {counts['agentops_trace_events']}",
+            (
+                "- Search provider health records: "
+                f"{counts['search_provider_health']} across {len(provider_summary['platforms'])} requested platforms"
+            ),
         ]
 
     def _learning_topics(self) -> list[str]:

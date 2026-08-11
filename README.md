@@ -69,7 +69,7 @@ Python 3.12 on Windows.
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+python -m pip install -c constraints-dev.txt -e ".[dev]"
 Copy-Item .env.example .env.local
 ```
 
@@ -142,12 +142,22 @@ python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 864
 python -m search_assistant.cli knowledge-graph-seed
 python -m search_assistant.cli knowledge-graph-query "MES 工单 写回" --domain industrial-ai
 python -m search_assistant.cli knowledge-graph-export agent-engineering
+python -m search_assistant.cli agentops-report
+python -m search_assistant.cli provider-health
+python -m search_assistant.cli trace-list
+python -m search_assistant.cli ledger-list
+python -m search_assistant.cli gate-list
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
 ```
 
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
 Feishu guidance are in [docs/operations.md](docs/operations.md).
+
+The agent-ops commands expose append-only project ledger entries, self-evolution
+gate records, trace spans, and search-provider health records from the local
+SQLite store. These are intended to make daily briefing runs and self-evolution
+changes reviewable before they are promoted.
 
 ## Development And Verification
 

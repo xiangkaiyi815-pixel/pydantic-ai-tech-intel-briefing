@@ -106,6 +106,60 @@ def main(argv: list[str] | None = None) -> int:
     kg_export_parser.add_argument("--output", default=None)
     _add_data_dir(kg_export_parser)
 
+    candidate_list_parser = subparsers.add_parser("knowledge-candidate-list")
+    candidate_list_parser.add_argument("--status", choices=["candidate", "validated", "deprecated"], default=None)
+    _add_data_dir(candidate_list_parser)
+
+    candidate_validate_parser = subparsers.add_parser("knowledge-candidate-validate")
+    candidate_validate_parser.add_argument("candidate_id")
+    _add_data_dir(candidate_validate_parser)
+
+    candidate_approve_parser = subparsers.add_parser("knowledge-candidate-approve")
+    candidate_approve_parser.add_argument("candidate_id")
+    candidate_approve_parser.add_argument("--reviewer", default="local-reviewer")
+    candidate_approve_parser.add_argument("--reason", default="approved after human review")
+    _add_data_dir(candidate_approve_parser)
+
+    candidate_deprecate_parser = subparsers.add_parser("knowledge-candidate-deprecate")
+    candidate_deprecate_parser.add_argument("candidate_id")
+    candidate_deprecate_parser.add_argument("--reason", required=True)
+    _add_data_dir(candidate_deprecate_parser)
+
+    ledger_record_parser = subparsers.add_parser("ledger-record")
+    ledger_record_parser.add_argument("--type", default="manual")
+    ledger_record_parser.add_argument("--subject", required=True)
+    ledger_record_parser.add_argument("--status", default="recorded")
+    ledger_record_parser.add_argument("--summary", required=True)
+    ledger_record_parser.add_argument("--evidence-ref", action="append", default=[])
+    ledger_record_parser.add_argument("--risk", default="")
+    ledger_record_parser.add_argument("--rollback", default="")
+    ledger_record_parser.add_argument("--metadata-json", default="{}")
+    _add_data_dir(ledger_record_parser)
+
+    ledger_list_parser = subparsers.add_parser("ledger-list")
+    ledger_list_parser.add_argument("--type", default=None)
+    ledger_list_parser.add_argument("--limit", type=_positive_int, default=20)
+    _add_data_dir(ledger_list_parser)
+
+    gate_list_parser = subparsers.add_parser("gate-list")
+    gate_list_parser.add_argument("--type", default=None)
+    gate_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(gate_list_parser)
+
+    trace_list_parser = subparsers.add_parser("trace-list")
+    trace_list_parser.add_argument("--run-id", default=None)
+    trace_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(trace_list_parser)
+
+    provider_health_parser = subparsers.add_parser("provider-health")
+    provider_health_parser.add_argument("--run-id", default=None)
+    provider_health_parser.add_argument("--limit", type=_positive_int, default=100)
+    _add_data_dir(provider_health_parser)
+
+    agentops_report_parser = subparsers.add_parser("agentops-report")
+    agentops_report_parser.add_argument("--limit", type=_positive_int, default=20)
+    _add_data_dir(agentops_report_parser)
+
     skill_parser = subparsers.add_parser("skill-draft")
     skill_parser.add_argument("title")
     _add_data_dir(skill_parser)
@@ -315,6 +369,69 @@ def main(argv: list[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "knowledge-candidate-list":
+        result = store.list_domain_knowledge_candidates(args.status)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "knowledge-candidate-validate":
+        result = DomainKnowledgeCandidateService(store).validate(args.candidate_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["validated"] else 1
+    if args.command == "knowledge-candidate-approve":
+        result = DomainKnowledgeCandidateService(store).approve(
+            args.candidate_id,
+            reviewer=args.reviewer,
+            reason=args.reason,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["approved"] else 1
+    if args.command == "knowledge-candidate-deprecate":
+        DomainKnowledgeCandidateService(store).deprecate(args.candidate_id, args.reason)
+        print(json.dumps({"deprecated": True, "candidate_id": args.candidate_id}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "ledger-record":
+        ledger_id = store.add_project_ledger_entry(
+            entry_type=args.type,
+            subject=args.subject,
+            status=args.status,
+            summary=args.summary,
+            evidence_refs=list(args.evidence_ref),
+            risk=args.risk,
+            rollback=args.rollback,
+            metadata=_parse_metadata_json(args.metadata_json),
+        )
+        print(json.dumps({"ledger_id": ledger_id}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "ledger-list":
+        print(
+            json.dumps(
+                store.list_project_ledger_entries(entry_type=args.type, limit=args.limit),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "gate-list":
+        print(json.dumps(store.list_gate_records(gate_type=args.type, limit=args.limit), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "trace-list":
+        print(json.dumps(store.list_trace_events(run_id=args.run_id, limit=args.limit), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "provider-health":
+        print(
+            json.dumps(
+                {
+                    "summary": store.search_provider_health_summary(limit=args.limit),
+                    "records": store.list_search_provider_health(run_id=args.run_id, limit=args.limit),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "agentops-report":
+        print(json.dumps(_agentops_report(store, limit=args.limit), ensure_ascii=False, indent=2))
         return 0
     if args.command == "skill-draft":
         path = SkillDraftService(store, drafts_dir=data_dir / "skills" / "drafts").create_from_experience(
@@ -563,6 +680,64 @@ def _preview_text(text: str, max_chars: int = 160) -> str:
     return compact[: max_chars - 1].rstrip() + "…"
 
 
+def _parse_metadata_json(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--metadata-json must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("--metadata-json must be a JSON object")
+    return parsed
+
+
+def _agentops_report(store: MemoryStore, limit: int = 20) -> dict[str, Any]:
+    gates = store.list_gate_records(limit=limit)
+    traces = store.list_trace_events(limit=limit)
+    ledger_entries = store.list_project_ledger_entries(limit=limit)
+    provider_health = store.search_provider_health_summary(limit=limit * 5)
+    return {
+        "counts": store.diagnostic_counts(),
+        "dependency_lock": _dependency_lock_status(Path.cwd()),
+        "latest_project_ledger": ledger_entries,
+        "gate_summary": {
+            "total": len(gates),
+            "passed": sum(1 for item in gates if item["result"] == "passed"),
+            "failed": sum(1 for item in gates if item["result"] == "failed"),
+            "waived": sum(1 for item in gates if item["result"] == "waived"),
+            "latest": gates,
+        },
+        "trace_summary": {
+            "total_sampled": len(traces),
+            "failed": sum(1 for item in traces if item["status"] == "failed"),
+            "latest": traces,
+        },
+        "provider_health": provider_health,
+    }
+
+
+def _dependency_lock_status(root: Path) -> dict[str, Any]:
+    constraints_path = root / "constraints-dev.txt"
+    pyproject_path = root / "pyproject.toml"
+    status: dict[str, Any] = {
+        "constraints_path": str(constraints_path),
+        "constraints_present": constraints_path.exists(),
+        "pyproject_present": pyproject_path.exists(),
+    }
+    if constraints_path.exists():
+        pinned = [
+            line.strip()
+            for line in constraints_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        status["pinned_packages"] = len(pinned)
+        status["has_pydantic_ai_slim_pin"] = any(line.lower().startswith("pydantic-ai-slim==") for line in pinned)
+    else:
+        status["pinned_packages"] = 0
+        status["has_pydantic_ai_slim_pin"] = False
+    status["ok"] = bool(status["constraints_present"] and status["has_pydantic_ai_slim_pin"])
+    return status
+
+
 def _safe_reply_attempt(row: dict[str, Any]) -> dict[str, Any]:
     response_json = row.get("response_json") or "{}"
     return {
@@ -766,6 +941,25 @@ def _run_evolution(store: MemoryStore, data_dir: Path) -> dict[str, object]:
     skill_service = SkillDraftService(store, drafts_dir=data_dir / "skills" / "drafts")
     refreshed_skill_paths = skill_service.refresh_reviewable_drafts()
     skill_paths = skill_service.auto_create_from_experience(refresh_existing=False)
+    store.add_project_ledger_entry(
+        entry_type="evolution_run",
+        subject="local-self-evolution",
+        status="completed",
+        summary="Generated learning report, refreshed reviewable skill drafts, and linked knowledge candidates.",
+        evidence_refs=[
+            f"report:{report_path}",
+            *[f"skill:{path}" for path in refreshed_skill_paths[:5]],
+            *[f"skill:{path}" for path in skill_paths[:5]],
+        ],
+        risk="Generated drafts and candidates remain reviewable artifacts; they are not automatically deployed as trusted policy.",
+        rollback="Deprecate incorrect candidates and remove unapproved draft files from the isolated data directory.",
+        metadata={
+            "skill_paths": skill_paths,
+            "refreshed_skill_paths": refreshed_skill_paths,
+            "candidate_status_counts": candidate_status_counts,
+            "created_candidate_graph_links": link_result["created_links"],
+        },
+    )
     return {
         "report_path": str(report_path),
         "report_written": bool(markdown),

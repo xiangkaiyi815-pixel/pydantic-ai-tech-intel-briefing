@@ -98,37 +98,37 @@ class GenericIndustrySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
             SearchResult(
-                title="NAAI publishes a global artificial intelligence industry report",
+                title="NAAI 发布全球人工智能产业发展报告",
                 url="https://mp.weixin.qq.com/s/industry-report",
-                snippet="The report covers industry scale, value chains, policy context, and investment directions, but no system interfaces.",
+                snippet="报告覆盖人工智能产业发展规模、产业链、政策环境和投资方向，但没有直接说明系统接口。",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="AI datasets and benchmark construction in artificial intelligence industry development",
+                title="人工智能产业发展中的数据集与基准建设",
                 url="https://example.com/ai-dataset-benchmark",
-                snippet="The article discusses datasets, benchmarks, open source models, and evaluation metrics.",
+                snippet="文章讨论人工智能产业发展所需的数据集、基准、开源模型和评估指标。",
                 provider="browser-bing",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="Artificial intelligence industry development enters manufacturing and government workflows",
+                title="人工智能产业发展进入制造业与政务工作流",
                 url="https://example.com/ai-application-case",
-                snippet="The case describes AI entering business workflows and still needing data input, system interface, human approval, and ROI validation.",
+                snippet="案例描述人工智能进入业务流程后仍需要数据输入、系统接口、人工审批和 ROI 验证。",
                 provider="browser-google",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="Public documentary discusses artificial intelligence industry development",
+                title="公开视频解读人工智能产业发展趋势",
                 url="https://www.bilibili.com/video/av996452521",
-                snippet="A public video explains AI development trends as a public communication signal rather than system implementation evidence.",
+                snippet="公开视频从科普角度说明人工智能产业发展趋势，属于传播信号而非系统实现证据。",
                 provider="bilibili-public-api",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="Artificial intelligence industry conference showcases AI products and ecosystem cooperation",
+                title="人工智能产业发展大会展示产品与生态合作",
                 url="https://example.com/ai-conference",
-                snippet="The conference showcases product updates, ecosystem cooperation, and industry discussion; original technical documents and deployment metrics remain needed.",
+                snippet="大会展示人工智能产品更新、生态合作和产业讨论，仍需补充原始技术文档和部署指标。",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
@@ -266,6 +266,20 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert all(candidate["status"] == "candidate" for candidate in candidates)
     assert all(briefing.id in candidate["source_ids"] for candidate in candidates)
     assert all(candidate["evidence"] for candidate in candidates)
+    ledger_entries = store.list_project_ledger_entries(entry_type="briefing_run")
+    assert len(ledger_entries) == 1
+    assert ledger_entries[0]["metadata"]["source_count"] == 3
+    trace_names = {event["name"] for event in store.list_trace_events()}
+    assert {
+        "plan_queries",
+        "collect_sources",
+        "synthesize_report",
+        "capture_domain_knowledge_candidates",
+        "run",
+    }.issubset(trace_names)
+    provider_health = store.list_search_provider_health()
+    assert len(provider_health) == len(search.queries)
+    assert all(row["ok"] for row in provider_health)
 
 
 def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(tmp_path):

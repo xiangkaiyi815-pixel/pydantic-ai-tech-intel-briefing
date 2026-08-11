@@ -276,6 +276,58 @@ class MemoryStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS project_ledger_entries (
+                    id TEXT PRIMARY KEY,
+                    entry_type TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    risk TEXT NOT NULL,
+                    rollback TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agentops_gate_records (
+                    id TEXT PRIMARY KEY,
+                    gate_type TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'waived')),
+                    reason TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agentops_trace_events (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    event_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms REAL NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS search_provider_health (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    requested_platform TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    attempted INTEGER NOT NULL,
+                    ok INTEGER NOT NULL,
+                    result_count INTEGER NOT NULL,
+                    duration_ms REAL NOT NULL,
+                    error TEXT,
+                    checked_at TEXT NOT NULL
+                );
+
                 CREATE TRIGGER IF NOT EXISTS trajectory_logs_no_update
                 BEFORE UPDATE ON trajectory_logs
                 BEGIN
@@ -322,6 +374,54 @@ class MemoryStore:
                 BEFORE DELETE ON domain_knowledge_candidate_graph_links
                 BEGIN
                     SELECT RAISE(ABORT, 'domain knowledge candidate graph links are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS project_ledger_entries_no_update
+                BEFORE UPDATE ON project_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'project ledger entries are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS project_ledger_entries_no_delete
+                BEFORE DELETE ON project_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'project ledger entries are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_gate_records_no_update
+                BEFORE UPDATE ON agentops_gate_records
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops gate records are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_gate_records_no_delete
+                BEFORE DELETE ON agentops_gate_records
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops gate records are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_trace_events_no_update
+                BEFORE UPDATE ON agentops_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops trace events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_trace_events_no_delete
+                BEFORE DELETE ON agentops_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops trace events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS search_provider_health_no_update
+                BEFORE UPDATE ON search_provider_health
+                BEGIN
+                    SELECT RAISE(ABORT, 'search provider health records are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS search_provider_health_no_delete
+                BEFORE DELETE ON search_provider_health
+                BEGIN
+                    SELECT RAISE(ABORT, 'search provider health records are immutable');
                 END;
                 """
             )
@@ -732,6 +832,253 @@ class MemoryStore:
             rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
+    def add_project_ledger_entry(
+        self,
+        entry_type: str,
+        subject: str,
+        status: str,
+        summary: str,
+        evidence_refs: list[str] | None = None,
+        risk: str = "",
+        rollback: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        ledger_id = _new_id("ledger")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO project_ledger_entries (
+                    id, entry_type, subject, status, summary, evidence_refs_json,
+                    risk, rollback, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ledger_id,
+                    entry_type.strip() or "operation",
+                    subject.strip() or "unspecified",
+                    status.strip() or "recorded",
+                    summary.strip(),
+                    json.dumps(evidence_refs or [], ensure_ascii=False),
+                    risk.strip(),
+                    rollback.strip(),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return ledger_id
+
+    def list_project_ledger_entries(
+        self,
+        entry_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM project_ledger_entries"
+        parameters: list[Any] = []
+        if entry_type is not None:
+            query += " WHERE entry_type = ?"
+            parameters.append(entry_type)
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [self._json_row(row, ("evidence_refs", "metadata")) for row in rows]
+
+    def add_gate_record(
+        self,
+        gate_type: str,
+        subject_type: str,
+        subject_id: str,
+        result: str,
+        reason: str,
+        evidence_refs: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        if result not in {"passed", "failed", "waived"}:
+            raise ValueError("gate result must be passed, failed, or waived")
+        gate_id = _new_id("gate")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agentops_gate_records (
+                    id, gate_type, subject_type, subject_id, result, reason,
+                    evidence_refs_json, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    gate_id,
+                    gate_type.strip() or "generic_gate",
+                    subject_type.strip() or "unknown",
+                    subject_id.strip(),
+                    result,
+                    reason.strip(),
+                    json.dumps(evidence_refs or [], ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return gate_id
+
+    def list_gate_records(
+        self,
+        gate_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM agentops_gate_records"
+        parameters: list[Any] = []
+        if gate_type is not None:
+            query += " WHERE gate_type = ?"
+            parameters.append(gate_type)
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [self._json_row(row, ("evidence_refs", "metadata")) for row in rows]
+
+    def add_trace_event(
+        self,
+        run_id: str,
+        event_type: str,
+        name: str,
+        status: str,
+        duration_ms: float = 0.0,
+        metadata: dict[str, Any] | None = None,
+        error: str | None = None,
+        parent_id: str | None = None,
+    ) -> str:
+        trace_id = _new_id("trace")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agentops_trace_events (
+                    id, run_id, parent_id, event_type, name, status,
+                    duration_ms, metadata_json, error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace_id,
+                    run_id,
+                    parent_id,
+                    event_type.strip() or "event",
+                    name.strip() or "unnamed",
+                    status.strip() or "recorded",
+                    float(duration_ms),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    error,
+                    _now_iso(),
+                ),
+            )
+        return trace_id
+
+    def list_trace_events(
+        self,
+        run_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM agentops_trace_events"
+        parameters: list[Any] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters.append(run_id)
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [self._json_row(row, ("metadata",)) for row in rows]
+
+    def record_search_provider_health(
+        self,
+        run_id: str,
+        requested_platform: str,
+        provider: str,
+        query: str,
+        ok: bool,
+        result_count: int,
+        duration_ms: float = 0.0,
+        error: str | None = None,
+        attempted: bool = True,
+    ) -> str:
+        health_id = _new_id("provider_health")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO search_provider_health (
+                    id, run_id, requested_platform, provider, query_text,
+                    attempted, ok, result_count, duration_ms, error, checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    health_id,
+                    run_id,
+                    requested_platform,
+                    provider,
+                    query,
+                    int(attempted),
+                    int(ok),
+                    int(result_count),
+                    float(duration_ms),
+                    error,
+                    _now_iso(),
+                ),
+            )
+        return health_id
+
+    def list_search_provider_health(
+        self,
+        run_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM search_provider_health"
+        parameters: list[Any] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters.append(run_id)
+        query += " ORDER BY checked_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            {
+                **dict(row),
+                "attempted": bool(row["attempted"]),
+                "ok": bool(row["ok"]),
+            }
+            for row in rows
+        ]
+
+    def search_provider_health_summary(self, limit: int | None = None) -> dict[str, Any]:
+        rows = self.list_search_provider_health(limit=limit)
+        providers: dict[str, dict[str, Any]] = {}
+        platforms: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            provider = str(row["provider"])
+            platform = str(row["requested_platform"])
+            provider_item = providers.setdefault(
+                provider,
+                {"provider": provider, "attempts": 0, "successes": 0, "results": 0, "errors": 0},
+            )
+            platform_item = platforms.setdefault(
+                platform,
+                {"requested_platform": platform, "attempts": 0, "successes": 0, "results": 0, "errors": 0},
+            )
+            for item in (provider_item, platform_item):
+                item["attempts"] += 1
+                item["successes"] += 1 if row["ok"] else 0
+                item["results"] += int(row["result_count"])
+                item["errors"] += 1 if row.get("error") else 0
+        return {
+            "records": len(rows),
+            "providers": sorted(providers.values(), key=lambda item: str(item["provider"])),
+            "platforms": sorted(platforms.values(), key=lambda item: str(item["requested_platform"])),
+        }
+
     def update_answer_verification(
         self,
         question_id: str,
@@ -928,6 +1275,10 @@ class MemoryStore:
             "domain_knowledge_candidates",
             "domain_knowledge_candidate_events",
             "domain_knowledge_candidate_graph_links",
+            "project_ledger_entries",
+            "agentops_gate_records",
+            "agentops_trace_events",
+            "search_provider_health",
         )
         with self._connect() as connection:
             return {
@@ -1429,6 +1780,15 @@ class MemoryStore:
             "contradictions": json.loads(row["contradictions_json"]),
             "source_ids": json.loads(row["source_ids_json"]),
         }
+
+    @staticmethod
+    def _json_row(row: sqlite3.Row, fields: tuple[str, ...]) -> dict[str, Any]:
+        data = dict(row)
+        for field in fields:
+            json_field = f"{field}_json"
+            if json_field in data:
+                data[field] = json.loads(str(data.pop(json_field)))
+        return data
 
     @staticmethod
     def _insert_candidate_event(

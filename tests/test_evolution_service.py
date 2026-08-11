@@ -52,6 +52,14 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
 
     assert validation == {"validated": True, "candidate_id": first_ids[0], "failures": []}
     assert store.get_domain_knowledge_candidate(first_ids[0])["status"] == "deprecated"
+    gates = store.list_gate_records()
+    assert {gate["gate_type"] for gate in gates} == {
+        "domain_knowledge_candidate_validation",
+        "domain_knowledge_candidate_rollback",
+    }
+    assert all(gate["result"] == "passed" for gate in gates)
+    rollback_entries = store.list_project_ledger_entries(entry_type="knowledge_rollback")
+    assert rollback_entries[0]["status"] == "deprecated"
     events = store.list_domain_knowledge_candidate_events(first_ids[0])
     assert [event["to_status"] for event in events] == ["candidate", "validated", "deprecated"]
     assert events[-1]["reason"] == "superseded by a later evidence review"
@@ -74,6 +82,30 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert result["validated"] is False
     assert result["failures"] == ["fewer_than_two_original_sources", "low_confidence"]
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "candidate"
+    gates = store.list_gate_records(gate_type="domain_knowledge_candidate_validation")
+    assert len(gates) == 1
+    assert gates[0]["result"] == "failed"
+    assert gates[0]["metadata"]["evidence_url_count"] == 1
+
+
+def test_candidate_approval_records_human_gate_and_release_ledger(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
+
+    result = service.approve(candidate_id, reviewer="unit-reviewer", reason="safe to use as planning context")
+
+    assert result["approved"] is True
+    assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "validated"
+    gates = store.list_gate_records()
+    gate_types = {gate["gate_type"] for gate in gates}
+    assert "domain_knowledge_candidate_validation" in gate_types
+    assert "domain_knowledge_candidate_human_review" in gate_types
+    release_entries = store.list_project_ledger_entries(entry_type="knowledge_release")
+    assert len(release_entries) == 1
+    assert release_entries[0]["status"] == "approved"
+    assert result["gate_id"] in release_entries[0]["evidence_refs"]
 
 
 def test_evolve_command_backfills_existing_candidate_graph_links(tmp_path, capsys):

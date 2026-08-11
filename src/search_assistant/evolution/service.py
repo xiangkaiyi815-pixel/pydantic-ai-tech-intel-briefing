@@ -191,6 +191,20 @@ class DomainKnowledgeCandidateService:
         if candidate["confidence"] == "low":
             failures.append("low_confidence")
         if failures:
+            self.store.add_gate_record(
+                gate_type="domain_knowledge_candidate_validation",
+                subject_type="domain_knowledge_candidate",
+                subject_id=candidate_id,
+                result="failed",
+                reason=", ".join(failures),
+                evidence_refs=self._candidate_evidence_refs(candidate),
+                metadata={
+                    "topic": candidate["topic"],
+                    "confidence": candidate["confidence"],
+                    "evidence_url_count": len(evidence_urls),
+                    "candidate_status": candidate["status"],
+                },
+            )
             return {"validated": False, "candidate_id": candidate_id, "failures": failures}
 
         self.store.update_domain_knowledge_candidate_status(
@@ -198,12 +212,102 @@ class DomainKnowledgeCandidateService:
             "validated",
             "passed traceability gate: multiple original sources, no unresolved contradictions, non-low confidence",
         )
+        self.store.add_gate_record(
+            gate_type="domain_knowledge_candidate_validation",
+            subject_type="domain_knowledge_candidate",
+            subject_id=candidate_id,
+            result="passed",
+            reason="multiple original sources, no unresolved contradictions, non-low confidence",
+            evidence_refs=self._candidate_evidence_refs(candidate),
+            metadata={
+                "topic": candidate["topic"],
+                "confidence": candidate["confidence"],
+                "evidence_url_count": len(evidence_urls),
+                "candidate_status": candidate["status"],
+            },
+        )
         return {"validated": True, "candidate_id": candidate_id, "failures": []}
+
+    def approve(
+        self,
+        candidate_id: str,
+        reviewer: str = "local-reviewer",
+        reason: str = "approved after human review",
+    ) -> dict[str, Any]:
+        validation = self.validate(candidate_id)
+        candidate = self.store.get_domain_knowledge_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
+        if not validation["validated"]:
+            gate_id = self.store.add_gate_record(
+                gate_type="domain_knowledge_candidate_human_review",
+                subject_type="domain_knowledge_candidate",
+                subject_id=candidate_id,
+                result="failed",
+                reason="human approval blocked because validation gate failed: "
+                + ", ".join(validation["failures"]),
+                evidence_refs=self._candidate_evidence_refs(candidate),
+                metadata={"reviewer": reviewer, "topic": candidate["topic"]},
+            )
+            return {
+                "approved": False,
+                "candidate_id": candidate_id,
+                "gate_id": gate_id,
+                "validation": validation,
+            }
+
+        gate_id = self.store.add_gate_record(
+            gate_type="domain_knowledge_candidate_human_review",
+            subject_type="domain_knowledge_candidate",
+            subject_id=candidate_id,
+            result="passed",
+            reason=reason.strip() or "approved after human review",
+            evidence_refs=self._candidate_evidence_refs(candidate),
+            metadata={"reviewer": reviewer, "topic": candidate["topic"]},
+        )
+        self.store.add_project_ledger_entry(
+            entry_type="knowledge_release",
+            subject=candidate_id,
+            status="approved",
+            summary=f"Domain knowledge candidate approved for reviewed use: {candidate['topic']}",
+            evidence_refs=[gate_id, *self._candidate_evidence_refs(candidate)],
+            risk="Candidate is planning context only; source URLs must be reopened before current factual claims.",
+            rollback="Run knowledge-candidate-deprecate with a reason to remove the candidate from active use.",
+            metadata={"reviewer": reviewer, "claim": candidate["claim"]},
+        )
+        return {
+            "approved": True,
+            "candidate_id": candidate_id,
+            "gate_id": gate_id,
+            "validation": validation,
+        }
 
     def deprecate(self, candidate_id: str, reason: str) -> None:
         if not reason.strip():
             raise ValueError("deprecation reason must not be empty")
+        candidate = self.store.get_domain_knowledge_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
         self.store.update_domain_knowledge_candidate_status(candidate_id, "deprecated", reason.strip())
+        gate_id = self.store.add_gate_record(
+            gate_type="domain_knowledge_candidate_rollback",
+            subject_type="domain_knowledge_candidate",
+            subject_id=candidate_id,
+            result="passed",
+            reason=reason.strip(),
+            evidence_refs=self._candidate_evidence_refs(candidate),
+            metadata={"topic": candidate["topic"]},
+        )
+        self.store.add_project_ledger_entry(
+            entry_type="knowledge_rollback",
+            subject=candidate_id,
+            status="deprecated",
+            summary=f"Domain knowledge candidate deprecated: {candidate['topic']}",
+            evidence_refs=[gate_id, *self._candidate_evidence_refs(candidate)],
+            risk="Deprecated candidates remain in the audit trail but should not guide new synthesis.",
+            rollback="Create a fresh candidate from newer evidence and approve it through validation and human review.",
+            metadata={"reason": reason.strip(), "claim": candidate["claim"]},
+        )
 
     def _ensure_default_graphs(self) -> dict[str, object]:
         if self.graph_service.list_graphs():
@@ -236,3 +340,14 @@ class DomainKnowledgeCandidateService:
         if evidence_count >= 2:
             return "medium"
         return "low"
+
+    @staticmethod
+    def _candidate_evidence_refs(candidate: dict[str, Any]) -> list[str]:
+        refs = [f"candidate:{candidate['id']}"]
+        refs.extend(str(source_id) for source_id in candidate.get("source_ids", []))
+        refs.extend(
+            str(item.get("url"))
+            for item in candidate.get("evidence", [])
+            if str(item.get("url", "")).startswith(("http://", "https://"))
+        )
+        return list(dict.fromkeys(ref for ref in refs if ref))

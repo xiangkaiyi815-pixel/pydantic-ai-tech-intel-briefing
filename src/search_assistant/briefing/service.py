@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime
 from pathlib import Path
 import re
+import time
 import uuid
 from typing import Protocol
 from urllib.parse import urlparse
@@ -501,6 +502,17 @@ def _deterministic_technical_queries(topic: str) -> list[str]:
     ]
 
 
+def _duration_ms(started: float) -> float:
+    return round((time.monotonic() - started) * 1000, 3)
+
+
+def _safe_trace_error(exc: Exception) -> str:
+    text = str(exc)
+    for marker in ("api_key", "API key", "Authorization", "token", "secret", "password"):
+        text = text.replace(marker, "[redacted]")
+    return text[:500]
+
+
 class DailyBriefingService:
     def __init__(
         self,
@@ -531,36 +543,135 @@ class DailyBriefingService:
         chat_id: str,
         run_date: date | None = None,
     ) -> DailyBriefing:
-        subscription = self.store.upsert_topic(user_id, chat_id, topic)
-        feedback = self.store.list_topic_feedback(subscription.id)
-        search_plan = self.build_search_plan(subscription, feedback)
-        sources = self._collect_sources(subscription, search_plan, feedback)
-        ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[: self.max_sources]
-        synthesis = self._synthesize(
-            subscription.topic,
-            ranked_sources[: self.model_max_sources],
-            search_plan,
-            fallback_sources=ranked_sources,
-        )
-        resolved_date = run_date or self._briefing_date()
-        briefing = DailyBriefing(
-            id=f"brief_{uuid.uuid4().hex}",
-            topic_id=subscription.id,
-            user_id=user_id,
-            chat_id=chat_id,
-            topic=subscription.topic,
-            run_date=resolved_date,
-            search_directions=[f"{platform}: {query}" for platform, query in search_plan],
-            keywords=self._keywords(subscription.topic, feedback, search_plan),
-            sources=ranked_sources,
-            synthesis=synthesis,
-            markdown="",
-            created_at=datetime.now(UTC).isoformat(),
-        )
-        briefing.markdown = self.render_markdown(briefing)
-        self.store.record_daily_briefing(briefing)
-        DomainKnowledgeCandidateService(self.store).capture_briefing(briefing)
-        return briefing
+        run_id = f"brief_run_{uuid.uuid4().hex}"
+        run_started = time.monotonic()
+        try:
+            phase_started = time.monotonic()
+            subscription = self.store.upsert_topic(user_id, chat_id, topic)
+            feedback = self.store.list_topic_feedback(subscription.id)
+            search_plan = self.build_search_plan(subscription, feedback)
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "plan_queries",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "query_count": len(search_plan),
+                    "feedback_count": len(feedback),
+                },
+            )
+
+            phase_started = time.monotonic()
+            sources = self._collect_sources(subscription, search_plan, feedback, run_id=run_id)
+            ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[
+                : self.max_sources
+            ]
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "collect_sources",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "raw_source_count": len(sources),
+                    "ranked_source_count": len(ranked_sources),
+                    "max_sources": self.max_sources,
+                },
+            )
+
+            phase_started = time.monotonic()
+            synthesis = self._synthesize(
+                subscription.topic,
+                ranked_sources[: self.model_max_sources],
+                search_plan,
+                fallback_sources=ranked_sources,
+            )
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "synthesize_report",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
+                    "theme_count": len(synthesis.themes),
+                    "used_runtime": self.runtime is not None,
+                },
+            )
+
+            resolved_date = run_date or self._briefing_date()
+            briefing = DailyBriefing(
+                id=f"brief_{uuid.uuid4().hex}",
+                topic_id=subscription.id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic=subscription.topic,
+                run_date=resolved_date,
+                search_directions=[f"{platform}: {query}" for platform, query in search_plan],
+                keywords=self._keywords(subscription.topic, feedback, search_plan),
+                sources=ranked_sources,
+                synthesis=synthesis,
+                markdown="",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            briefing.markdown = self.render_markdown(briefing)
+            self.store.record_daily_briefing(briefing)
+
+            phase_started = time.monotonic()
+            candidate_ids = DomainKnowledgeCandidateService(self.store).capture_briefing(briefing)
+            self._record_trace_event(
+                run_id,
+                "evolution",
+                "capture_domain_knowledge_candidates",
+                phase_started,
+                metadata={"topic": subscription.topic, "candidate_count": len(candidate_ids)},
+            )
+            self.store.add_project_ledger_entry(
+                entry_type="briefing_run",
+                subject=subscription.topic,
+                status="completed",
+                summary=f"Generated daily briefing with {len(ranked_sources)} retained sources.",
+                evidence_refs=[
+                    f"briefing:{briefing.id}",
+                    *[source.url for source in ranked_sources[:8]],
+                    *[f"candidate:{candidate_id}" for candidate_id in candidate_ids[:8]],
+                ],
+                risk="Public search coverage can be incomplete or blocked; the report should be read with source URLs.",
+                rollback="Use an isolated --data-dir for tests, or delete the generated briefing/data directory.",
+                metadata={
+                    "run_id": run_id,
+                    "topic_id": subscription.id,
+                    "query_count": len(search_plan),
+                    "source_count": len(ranked_sources),
+                    "candidate_count": len(candidate_ids),
+                    "run_date": briefing.run_date.isoformat(),
+                },
+            )
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "run",
+                run_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "status": "completed",
+                    "query_count": len(search_plan),
+                    "source_count": len(ranked_sources),
+                },
+            )
+            return briefing
+        except Exception as exc:
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "run",
+                run_started,
+                status="failed",
+                metadata={"topic": topic},
+                error=_safe_trace_error(exc),
+            )
+            raise
 
     def build_search_plan(
         self,
@@ -641,27 +752,55 @@ class DailyBriefingService:
         subscription: TopicSubscription,
         search_plan: list[tuple[str, str]],
         feedback: list[dict[str, object]],
+        run_id: str | None = None,
     ) -> list[CollectedSource]:
         by_url: dict[str, CollectedSource] = {}
         query_results: list[tuple[str, str, list[SearchResult]]] = []
         workers = min(6, len(search_plan))
         executor = ThreadPoolExecutor(max_workers=max(1, workers))
         futures = [
-            (requested_platform, query, executor.submit(self._search, query))
+            (requested_platform, query, time.monotonic(), executor.submit(self._search, query))
             for requested_platform, query in search_plan
         ]
         try:
             completed, pending = wait(
-                [future for _, _, future in futures],
+                [future for _, _, _, future in futures],
                 timeout=self.search_budget_seconds,
             )
-            for requested_platform, query, future in futures:
+            for requested_platform, query, started, future in futures:
                 if future not in completed:
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        [],
+                        _duration_ms(started),
+                        ok=False,
+                        error="search budget expired before this query completed",
+                    )
                     continue
                 try:
                     results = future.result()
-                except Exception:
+                except Exception as exc:
                     results = []
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        results,
+                        _duration_ms(started),
+                        ok=False,
+                        error=_safe_trace_error(exc),
+                    )
+                else:
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        results,
+                        _duration_ms(started),
+                        ok=True,
+                    )
                 query_results.append((requested_platform, query, results))
             for future in pending:
                 future.cancel()
@@ -739,6 +878,60 @@ class DailyBriefingService:
 
     def _search(self, query: str) -> list[SearchResult]:
         return self.search_client.search(query, limit=self.results_per_query)
+
+    def _record_trace_event(
+        self,
+        run_id: str,
+        event_type: str,
+        name: str,
+        started: float,
+        status: str = "completed",
+        metadata: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            self.store.add_trace_event(
+                run_id=run_id,
+                event_type=event_type,
+                name=name,
+                status=status,
+                duration_ms=_duration_ms(started),
+                metadata=metadata or {},
+                error=error,
+            )
+        except Exception:
+            # Observability should never make a briefing fail.
+            return
+
+    def _record_provider_health(
+        self,
+        run_id: str | None,
+        requested_platform: str,
+        query: str,
+        results: list[SearchResult],
+        duration_ms: float,
+        ok: bool,
+        error: str | None = None,
+    ) -> None:
+        if run_id is None:
+            return
+        providers = sorted({result.provider for result in results if result.provider})
+        provider_label = ", ".join(providers[:3]) if providers else self.search_client.__class__.__name__
+        if len(providers) > 3:
+            provider_label = f"{provider_label}, +{len(providers) - 3} more"
+        try:
+            self.store.record_search_provider_health(
+                run_id=run_id,
+                requested_platform=requested_platform,
+                provider=provider_label,
+                query=query,
+                ok=ok,
+                result_count=len(results),
+                duration_ms=duration_ms,
+                error=error,
+            )
+        except Exception:
+            return
 
     def _synthesize(
         self,
