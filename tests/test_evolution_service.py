@@ -94,18 +94,42 @@ def test_candidate_approval_records_human_gate_and_release_ledger(tmp_path):
     service = DomainKnowledgeCandidateService(store)
     candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
 
-    result = service.approve(candidate_id, reviewer="unit-reviewer", reason="safe to use as planning context")
+    result = service.approve(
+        candidate_id,
+        reviewer="unit-reviewer",
+        reason="safe to use as planning context",
+        eval_gate={"passed": True, "reason": "unit eval passed", "report_path": "unit-evaluation-report.json"},
+    )
 
     assert result["approved"] is True
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "validated"
     gates = store.list_gate_records()
     gate_types = {gate["gate_type"] for gate in gates}
+    assert "domain_knowledge_candidate_eval_release" in gate_types
     assert "domain_knowledge_candidate_validation" in gate_types
     assert "domain_knowledge_candidate_human_review" in gate_types
     release_entries = store.list_project_ledger_entries(entry_type="knowledge_release")
     assert len(release_entries) == 1
     assert release_entries[0]["status"] == "approved"
     assert result["gate_id"] in release_entries[0]["evidence_refs"]
+    assert result["eval_gate"]["gate_id"] in release_entries[0]["evidence_refs"]
+
+
+def test_candidate_approval_requires_eval_gate_before_release(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
+
+    result = service.approve(candidate_id, reviewer="unit-reviewer")
+
+    assert result["approved"] is False
+    assert result["eval_gate"]["passed"] is False
+    assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "candidate"
+    gates = store.list_gate_records(gate_type="domain_knowledge_candidate_eval_release")
+    assert len(gates) == 1
+    assert gates[0]["result"] == "failed"
+    assert not store.list_project_ledger_entries(entry_type="knowledge_release")
 
 
 def test_evolve_command_backfills_existing_candidate_graph_links(tmp_path, capsys):

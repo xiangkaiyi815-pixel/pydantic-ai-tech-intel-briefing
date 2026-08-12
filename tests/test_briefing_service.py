@@ -266,9 +266,17 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert all(candidate["status"] == "candidate" for candidate in candidates)
     assert all(briefing.id in candidate["source_ids"] for candidate in candidates)
     assert all(candidate["evidence"] for candidate in candidates)
+    validation_gates = store.list_gate_records(gate_type="domain_knowledge_candidate_validation")
+    assert len(validation_gates) == len(candidates)
+    validation_passed = sum(1 for gate in validation_gates if gate["result"] == "passed")
+    validation_failed = sum(1 for gate in validation_gates if gate["result"] == "failed")
+    assert validation_passed + validation_failed == len(candidates)
     ledger_entries = store.list_project_ledger_entries(entry_type="briefing_run")
     assert len(ledger_entries) == 1
     assert ledger_entries[0]["metadata"]["source_count"] == 3
+    assert ledger_entries[0]["metadata"]["validation_gate_passed"] == validation_passed
+    assert ledger_entries[0]["metadata"]["validation_gate_failed"] == validation_failed
+    assert store.latest_project_ledger_snapshot("pydantic-ai-tech-intel-briefing")["status"] == "active"
     trace_names = {event["name"] for event in store.list_trace_events()}
     assert {
         "plan_queries",
@@ -277,6 +285,14 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
         "capture_domain_knowledge_candidates",
         "run",
     }.issubset(trace_names)
+    checkpoint_steps = {checkpoint["step"] for checkpoint in store.list_run_checkpoints()}
+    assert {
+        "planned",
+        "sources_collected",
+        "synthesized",
+        "candidates_captured",
+        "completed",
+    }.issubset(checkpoint_steps)
     provider_health = store.list_search_provider_health()
     assert len(provider_health) == len(search.queries)
     assert all(row["ok"] for row in provider_health)

@@ -289,6 +289,21 @@ class MemoryStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS project_ledger_snapshots (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    next_decision TEXT NOT NULL,
+                    open_blockers_json TEXT NOT NULL,
+                    constraints_json TEXT NOT NULL,
+                    decisions_json TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS agentops_gate_records (
                     id TEXT PRIMARY KEY,
                     gate_type TEXT NOT NULL,
@@ -311,6 +326,17 @@ class MemoryStore:
                     duration_ms REAL NOT NULL,
                     metadata_json TEXT NOT NULL,
                     error TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agentops_run_checkpoints (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    workflow TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
 
@@ -388,6 +414,18 @@ class MemoryStore:
                     SELECT RAISE(ABORT, 'project ledger entries are immutable');
                 END;
 
+                CREATE TRIGGER IF NOT EXISTS project_ledger_snapshots_no_update
+                BEFORE UPDATE ON project_ledger_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'project ledger snapshots are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS project_ledger_snapshots_no_delete
+                BEFORE DELETE ON project_ledger_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'project ledger snapshots are immutable');
+                END;
+
                 CREATE TRIGGER IF NOT EXISTS agentops_gate_records_no_update
                 BEFORE UPDATE ON agentops_gate_records
                 BEGIN
@@ -410,6 +448,18 @@ class MemoryStore:
                 BEFORE DELETE ON agentops_trace_events
                 BEGIN
                     SELECT RAISE(ABORT, 'agentops trace events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_run_checkpoints_no_update
+                BEFORE UPDATE ON agentops_run_checkpoints
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops run checkpoints are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS agentops_run_checkpoints_no_delete
+                BEFORE DELETE ON agentops_run_checkpoints
+                BEGIN
+                    SELECT RAISE(ABORT, 'agentops run checkpoints are immutable');
                 END;
 
                 CREATE TRIGGER IF NOT EXISTS search_provider_health_no_update
@@ -885,6 +935,100 @@ class MemoryStore:
             rows = connection.execute(query, tuple(parameters)).fetchall()
         return [self._json_row(row, ("evidence_refs", "metadata")) for row in rows]
 
+    def add_project_ledger_snapshot(
+        self,
+        project_id: str,
+        objective: str,
+        phase: str,
+        status: str,
+        next_decision: str,
+        open_blockers: list[str] | None = None,
+        constraints: dict[str, Any] | None = None,
+        decisions: list[dict[str, Any]] | None = None,
+        evidence_refs: list[str] | None = None,
+        version: str = "1",
+    ) -> str:
+        snapshot_id = _new_id("project_state")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO project_ledger_snapshots (
+                    id, project_id, objective, phase, status, next_decision,
+                    open_blockers_json, constraints_json, decisions_json,
+                    evidence_refs_json, version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    project_id.strip() or "default",
+                    objective.strip(),
+                    phase.strip() or "unspecified",
+                    status.strip() or "active",
+                    next_decision.strip(),
+                    json.dumps(open_blockers or [], ensure_ascii=False),
+                    json.dumps(constraints or {}, ensure_ascii=False),
+                    json.dumps(decisions or [], ensure_ascii=False),
+                    json.dumps(evidence_refs or [], ensure_ascii=False),
+                    version.strip() or "1",
+                    _now_iso(),
+                ),
+            )
+        return snapshot_id
+
+    def ensure_project_ledger_snapshot(
+        self,
+        project_id: str,
+        objective: str,
+        phase: str,
+        status: str,
+        next_decision: str,
+        open_blockers: list[str] | None = None,
+        constraints: dict[str, Any] | None = None,
+        decisions: list[dict[str, Any]] | None = None,
+        evidence_refs: list[str] | None = None,
+        version: str = "1",
+    ) -> str:
+        existing = self.latest_project_ledger_snapshot(project_id)
+        if existing is not None:
+            return str(existing["id"])
+        return self.add_project_ledger_snapshot(
+            project_id=project_id,
+            objective=objective,
+            phase=phase,
+            status=status,
+            next_decision=next_decision,
+            open_blockers=open_blockers,
+            constraints=constraints,
+            decisions=decisions,
+            evidence_refs=evidence_refs,
+            version=version,
+        )
+
+    def list_project_ledger_snapshots(
+        self,
+        project_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM project_ledger_snapshots"
+        parameters: list[Any] = []
+        if project_id is not None:
+            query += " WHERE project_id = ?"
+            parameters.append(project_id)
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            self._json_row(row, ("open_blockers", "constraints", "decisions", "evidence_refs"))
+            for row in rows
+        ]
+
+    def latest_project_ledger_snapshot(self, project_id: str = "default") -> dict[str, Any] | None:
+        rows = self.list_project_ledger_snapshots(project_id=project_id, limit=1)
+        return rows[0] if rows else None
+
     def add_gate_record(
         self,
         gate_type: str,
@@ -991,6 +1135,54 @@ class MemoryStore:
             rows = connection.execute(query, tuple(parameters)).fetchall()
         return [self._json_row(row, ("metadata",)) for row in rows]
 
+    def add_run_checkpoint(
+        self,
+        run_id: str,
+        workflow: str,
+        subject: str,
+        step: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        checkpoint_id = _new_id("checkpoint")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agentops_run_checkpoints (
+                    id, run_id, workflow, subject, step, status, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    run_id.strip(),
+                    workflow.strip() or "workflow",
+                    subject.strip() or "unspecified",
+                    step.strip() or "step",
+                    status.strip() or "recorded",
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return checkpoint_id
+
+    def list_run_checkpoints(
+        self,
+        run_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM agentops_run_checkpoints"
+        parameters: list[Any] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters.append(run_id)
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [self._json_row(row, ("payload",)) for row in rows]
+
     def record_search_provider_health(
         self,
         run_id: str,
@@ -1062,17 +1254,26 @@ class MemoryStore:
             platform = str(row["requested_platform"])
             provider_item = providers.setdefault(
                 provider,
-                {"provider": provider, "attempts": 0, "successes": 0, "results": 0, "errors": 0},
+                {"provider": provider, "attempts": 0, "successes": 0, "results": 0, "errors": 0, "empty_results": 0},
             )
             platform_item = platforms.setdefault(
                 platform,
-                {"requested_platform": platform, "attempts": 0, "successes": 0, "results": 0, "errors": 0},
+                {
+                    "requested_platform": platform,
+                    "attempts": 0,
+                    "successes": 0,
+                    "results": 0,
+                    "errors": 0,
+                    "empty_results": 0,
+                },
             )
             for item in (provider_item, platform_item):
                 item["attempts"] += 1
                 item["successes"] += 1 if row["ok"] else 0
                 item["results"] += int(row["result_count"])
                 item["errors"] += 1 if row.get("error") else 0
+                if row["attempted"] and row["ok"] and int(row["result_count"]) == 0:
+                    item["empty_results"] += 1
         return {
             "records": len(rows),
             "providers": sorted(providers.values(), key=lambda item: str(item["provider"])),
@@ -1276,8 +1477,10 @@ class MemoryStore:
             "domain_knowledge_candidate_events",
             "domain_knowledge_candidate_graph_links",
             "project_ledger_entries",
+            "project_ledger_snapshots",
             "agentops_gate_records",
             "agentops_trace_events",
+            "agentops_run_checkpoints",
             "search_provider_health",
         )
         with self._connect() as connection:

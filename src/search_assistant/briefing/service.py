@@ -548,6 +548,7 @@ class DailyBriefingService:
         try:
             phase_started = time.monotonic()
             subscription = self.store.upsert_topic(user_id, chat_id, topic)
+            self._ensure_project_state()
             feedback = self.store.list_topic_feedback(subscription.id)
             search_plan = self.build_search_plan(subscription, feedback)
             self._record_trace_event(
@@ -559,6 +560,17 @@ class DailyBriefingService:
                     "topic": subscription.topic,
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "planned",
+                payload={
+                    "topic_id": subscription.id,
+                    "query_count": len(search_plan),
+                    "feedback_count": len(feedback),
+                    "queries": [query for _, query in search_plan[:8]],
                 },
             )
 
@@ -579,6 +591,16 @@ class DailyBriefingService:
                     "max_sources": self.max_sources,
                 },
             )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "sources_collected",
+                payload={
+                    "raw_source_count": len(sources),
+                    "ranked_source_count": len(ranked_sources),
+                    "source_urls": [source.url for source in ranked_sources[:10]],
+                },
+            )
 
             phase_started = time.monotonic()
             synthesis = self._synthesize(
@@ -596,6 +618,16 @@ class DailyBriefingService:
                     "topic": subscription.topic,
                     "model_source_count": min(len(ranked_sources), self.model_max_sources),
                     "theme_count": len(synthesis.themes),
+                    "used_runtime": self.runtime is not None,
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "synthesized",
+                payload={
+                    "theme_count": len(synthesis.themes),
+                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
                     "used_runtime": self.runtime is not None,
                 },
             )
@@ -619,13 +651,31 @@ class DailyBriefingService:
             self.store.record_daily_briefing(briefing)
 
             phase_started = time.monotonic()
-            candidate_ids = DomainKnowledgeCandidateService(self.store).capture_briefing(briefing)
+            candidate_service = DomainKnowledgeCandidateService(self.store)
+            candidate_ids = candidate_service.capture_briefing(briefing)
+            validation_results = [candidate_service.record_validation_gate(candidate_id) for candidate_id in candidate_ids]
             self._record_trace_event(
                 run_id,
                 "evolution",
                 "capture_domain_knowledge_candidates",
                 phase_started,
-                metadata={"topic": subscription.topic, "candidate_count": len(candidate_ids)},
+                metadata={
+                    "topic": subscription.topic,
+                    "candidate_count": len(candidate_ids),
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "candidates_captured",
+                payload={
+                    "briefing_id": briefing.id,
+                    "candidate_ids": candidate_ids,
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                },
             )
             self.store.add_project_ledger_entry(
                 entry_type="briefing_run",
@@ -645,6 +695,8 @@ class DailyBriefingService:
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
                     "candidate_count": len(candidate_ids),
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
                     "run_date": briefing.run_date.isoformat(),
                 },
             )
@@ -660,6 +712,16 @@ class DailyBriefingService:
                     "source_count": len(ranked_sources),
                 },
             )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "completed",
+                payload={
+                    "briefing_id": briefing.id,
+                    "source_count": len(ranked_sources),
+                    "candidate_count": len(candidate_ids),
+                },
+            )
             return briefing
         except Exception as exc:
             self._record_trace_event(
@@ -670,6 +732,13 @@ class DailyBriefingService:
                 status="failed",
                 metadata={"topic": topic},
                 error=_safe_trace_error(exc),
+            )
+            self._record_checkpoint(
+                run_id,
+                topic,
+                "failed",
+                status="failed",
+                payload={"error": _safe_trace_error(exc)},
             )
             raise
 
@@ -901,6 +970,53 @@ class DailyBriefingService:
             )
         except Exception:
             # Observability should never make a briefing fail.
+            return
+
+    def _record_checkpoint(
+        self,
+        run_id: str,
+        subject: str,
+        step: str,
+        status: str = "completed",
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            self.store.add_run_checkpoint(
+                run_id=run_id,
+                workflow="daily_briefing",
+                subject=subject,
+                step=step,
+                status=status,
+                payload=payload or {},
+            )
+        except Exception:
+            # Checkpoint metadata should never make a briefing fail.
+            return
+
+    def _ensure_project_state(self) -> None:
+        try:
+            self.store.ensure_project_ledger_snapshot(
+                project_id="pydantic-ai-tech-intel-briefing",
+                objective="Generate source-backed technology intelligence briefings with reviewable self-evolution.",
+                phase="agentops-readiness",
+                status="active",
+                next_decision="Run eval replay, then release domain knowledge only after eval and human review gates pass.",
+                open_blockers=[],
+                constraints={
+                    "knowledge_release": "candidate-only until eval gate and human review pass",
+                    "search": "public source coverage can be incomplete or blocked",
+                    "privacy": "local configuration and secrets must not be persisted in audit logs",
+                },
+                decisions=[
+                    {
+                        "id": "agentops-p1-gates",
+                        "decision": "Record automatic evidence gates, checkpoints, provider health, and release ledger.",
+                    }
+                ],
+                evidence_refs=["README.md", "docs/development.md"],
+                version="1",
+            )
+        except Exception:
             return
 
     def _record_provider_health(

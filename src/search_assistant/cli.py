@@ -85,6 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     eval_parser.add_argument("--max-questions", type=_positive_int, default=None)
     _add_data_dir(eval_parser)
 
+    eval_replay_parser = subparsers.add_parser("eval-replay")
+    eval_replay_parser.add_argument("--report", default=None)
+    eval_replay_parser.add_argument("--max-items", type=_positive_int, default=None)
+    _add_data_dir(eval_replay_parser)
+
     evidence_backfill_parser = subparsers.add_parser("evidence-backfill")
     _add_data_dir(evidence_backfill_parser)
 
@@ -118,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     candidate_approve_parser.add_argument("candidate_id")
     candidate_approve_parser.add_argument("--reviewer", default="local-reviewer")
     candidate_approve_parser.add_argument("--reason", default="approved after human review")
+    candidate_approve_parser.add_argument("--waive-eval-gate", action="store_true")
     _add_data_dir(candidate_approve_parser)
 
     candidate_deprecate_parser = subparsers.add_parser("knowledge-candidate-deprecate")
@@ -141,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     ledger_list_parser.add_argument("--limit", type=_positive_int, default=20)
     _add_data_dir(ledger_list_parser)
 
+    ledger_state_parser = subparsers.add_parser("ledger-state")
+    ledger_state_parser.add_argument("--project-id", default="pydantic-ai-tech-intel-briefing")
+    ledger_state_parser.add_argument("--limit", type=_positive_int, default=5)
+    _add_data_dir(ledger_state_parser)
+
     gate_list_parser = subparsers.add_parser("gate-list")
     gate_list_parser.add_argument("--type", default=None)
     gate_list_parser.add_argument("--limit", type=_positive_int, default=50)
@@ -150,6 +161,11 @@ def main(argv: list[str] | None = None) -> int:
     trace_list_parser.add_argument("--run-id", default=None)
     trace_list_parser.add_argument("--limit", type=_positive_int, default=50)
     _add_data_dir(trace_list_parser)
+
+    checkpoint_list_parser = subparsers.add_parser("checkpoint-list")
+    checkpoint_list_parser.add_argument("--run-id", default=None)
+    checkpoint_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(checkpoint_list_parser)
 
     provider_health_parser = subparsers.add_parser("provider-health")
     provider_health_parser.add_argument("--run-id", default=None)
@@ -337,6 +353,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "eval-replay":
+        result = _run_evaluation_replay(
+            store,
+            data_dir,
+            report_path=Path(args.report) if args.report else None,
+            max_items=args.max_items,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
     if args.command == "evidence-backfill":
         result = VerificationBackfillService(store).run()
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -383,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
             args.candidate_id,
             reviewer=args.reviewer,
             reason=args.reason,
+            eval_gate=_waived_evaluation_gate(data_dir) if args.waive_eval_gate else _evaluation_gate_from_report(data_dir),
+            require_eval_gate=not args.waive_eval_gate,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["approved"] else 1
@@ -412,11 +439,32 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "ledger-state":
+        print(
+            json.dumps(
+                {
+                    "latest": store.latest_project_ledger_snapshot(args.project_id),
+                    "snapshots": store.list_project_ledger_snapshots(args.project_id, limit=args.limit),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "gate-list":
         print(json.dumps(store.list_gate_records(gate_type=args.type, limit=args.limit), ensure_ascii=False, indent=2))
         return 0
     if args.command == "trace-list":
         print(json.dumps(store.list_trace_events(run_id=args.run_id, limit=args.limit), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "checkpoint-list":
+        print(
+            json.dumps(
+                store.list_run_checkpoints(run_id=args.run_id, limit=args.limit),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "provider-health":
         print(
@@ -632,6 +680,207 @@ def _run_evaluation(
     )
 
 
+def _run_evaluation_replay(
+    store: MemoryStore,
+    data_dir: Path,
+    report_path: Path | None = None,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    source_path = report_path or data_dir / "evaluations" / "evaluation-report.json"
+    if not source_path.exists():
+        return {
+            "ok": False,
+            "reason": "evaluation report not found",
+            "report_path": str(source_path),
+            "hint": "Run eval-suite first, then rerun eval-replay.",
+        }
+    report = json.loads(source_path.read_text(encoding="utf-8-sig"))
+    items = report.get("items", [])
+    if not isinstance(items, list) or not items:
+        return {
+            "ok": False,
+            "reason": "evaluation report has no replayable items",
+            "report_path": str(source_path),
+        }
+    selected_items = items[:max_items] if max_items is not None else items
+    settings = Settings.from_env()
+    workflow = SearchAssistantWorkflow(
+        store=store,
+        runtime=runtime_from_settings(settings),
+        search_client=search_client_from_settings(settings),
+        search_budget_seconds=settings.workflow_search_budget_seconds,
+        skill_drafts_dir=data_dir / "skills" / "drafts",
+        report_output_dir=data_dir / "reports",
+        admin_user_ids=set(settings.admin_user_ids),
+    )
+
+    replay_items: list[dict[str, Any]] = []
+    failures = 0
+    changed_answers = 0
+    changed_source_sets = 0
+    for index, previous in enumerate(selected_items, start=1):
+        question = str(previous.get("question") or "").strip()
+        if not question:
+            failures += 1
+            replay_items.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "reason": "missing question",
+                    "previous_question_id": previous.get("question_id"),
+                }
+            )
+            continue
+        try:
+            message = IncomingMessage(
+                message_id=f"eval_replay_{uuid.uuid4().hex}",
+                event_id=None,
+                user_id="evaluation-replay-user",
+                chat_id="evaluation-replay",
+                text=question,
+                source="evaluation-replay",
+            )
+            package = workflow.answer(message)
+            ProfileService(store).update_from_answer(package)
+        except Exception as exc:
+            failures += 1
+            replay_items.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "question": question,
+                    "previous_question_id": previous.get("question_id"),
+                    "error": _safe_cli_error(exc),
+                }
+            )
+            continue
+
+        previous_answer = str(previous.get("answer_excerpt") or "").strip()
+        current_answer = _preview_text(package.answer_text, max_chars=1400)
+        previous_source_urls = sorted(str(url) for url in previous.get("source_urls", []) if str(url).strip())
+        current_source_urls = sorted(source.url for source in package.sources)
+        answer_changed = previous_answer != current_answer
+        source_set_changed = previous_source_urls != current_source_urls
+        changed_answers += 1 if answer_changed else 0
+        changed_source_sets += 1 if source_set_changed else 0
+        replay_items.append(
+            {
+                "index": index,
+                "ok": True,
+                "question": question,
+                "previous_question_id": previous.get("question_id"),
+                "current_question_id": package.question_id,
+                "answer_changed": answer_changed,
+                "source_set_changed": source_set_changed,
+                "previous_source_count": len(previous_source_urls),
+                "current_source_count": len(current_source_urls),
+                "previous_quality_flags": previous.get("quality_flags", []),
+                "current_confidence": package.confidence,
+            }
+        )
+
+    output_dir = data_dir / "evaluations"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    replay_path = output_dir / "evaluation-replay-report.json"
+    result = {
+        "ok": failures == 0,
+        "source_report_path": str(source_path),
+        "replay_report_path": str(replay_path),
+        "requested_items": len(selected_items),
+        "replayed": sum(1 for item in replay_items if item.get("ok")),
+        "failed": failures,
+        "answer_changed": changed_answers,
+        "source_set_changed": changed_source_sets,
+        "items": replay_items,
+    }
+    replay_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    gate_id = store.add_gate_record(
+        gate_type="evaluation_replay",
+        subject_type="evaluation_report",
+        subject_id=str(source_path),
+        result="passed" if result["ok"] else "failed",
+        reason="replayed all recorded evaluation questions" if result["ok"] else "one or more replay items failed",
+        evidence_refs=[str(source_path), str(replay_path)],
+        metadata={
+            "requested_items": result["requested_items"],
+            "replayed": result["replayed"],
+            "answer_changed": result["answer_changed"],
+            "source_set_changed": result["source_set_changed"],
+        },
+    )
+    store.add_project_ledger_entry(
+        entry_type="evaluation_replay",
+        subject=str(source_path),
+        status="completed" if result["ok"] else "failed",
+        summary=f"Replayed {result['replayed']} of {result['requested_items']} evaluation questions.",
+        evidence_refs=[gate_id, str(replay_path)],
+        risk="Replay compares deterministic fields and source sets; human review is still needed for semantic quality drift.",
+        rollback="Rerun eval-suite and eval-replay in an isolated data directory after fixing failures.",
+        metadata={
+            "answer_changed": result["answer_changed"],
+            "source_set_changed": result["source_set_changed"],
+            "failed": result["failed"],
+        },
+    )
+    return result
+
+
+def _evaluation_gate_from_report(data_dir: Path) -> dict[str, Any]:
+    report_path = data_dir / "evaluations" / "evaluation-report.json"
+    if not report_path.exists():
+        return {
+            "passed": False,
+            "reason": "evaluation report is missing; run eval-suite before approving knowledge candidates",
+            "report_path": str(report_path),
+        }
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        return {
+            "passed": False,
+            "reason": f"evaluation report is not valid JSON: {exc.msg}",
+            "report_path": str(report_path),
+        }
+    items = report.get("items", [])
+    summary = report.get("summary", {})
+    if not isinstance(items, list) or not items:
+        return {
+            "passed": False,
+            "reason": "evaluation report has no completed items",
+            "report_path": str(report_path),
+        }
+    flagged = int(summary.get("flagged_answers", 0) or 0)
+    rejected = int(summary.get("review_rejected_answers", 0) or 0)
+    result_failed = int(summary.get("result_failed_answers", 0) or 0)
+    process_flagged = int(summary.get("process_flagged_answers", 0) or 0)
+    passed = flagged == 0 and rejected == 0 and result_failed == 0 and process_flagged == 0
+    blocking = {
+        "flagged_answers": flagged,
+        "review_rejected_answers": rejected,
+        "result_failed_answers": result_failed,
+        "process_flagged_answers": process_flagged,
+    }
+    return {
+        "passed": passed,
+        "reason": "evaluation report passed release gate"
+        if passed
+        else "evaluation report has blocking quality/process findings",
+        "report_path": str(report_path),
+        "summary": blocking,
+        "total_questions": report.get("total_questions", len(items)),
+    }
+
+
+def _waived_evaluation_gate(data_dir: Path) -> dict[str, Any]:
+    report_path = data_dir / "evaluations" / "evaluation-report.json"
+    return {
+        "passed": False,
+        "waived": True,
+        "reason": "operator explicitly waived evaluation gate for a local experiment",
+        "report_path": str(report_path),
+    }
+
+
 def _load_evaluation_questions(source: str | Path) -> list[str]:
     source_text = str(source).strip()
     if source_text.startswith("["):
@@ -693,11 +942,13 @@ def _parse_metadata_json(value: str) -> dict[str, Any]:
 def _agentops_report(store: MemoryStore, limit: int = 20) -> dict[str, Any]:
     gates = store.list_gate_records(limit=limit)
     traces = store.list_trace_events(limit=limit)
+    checkpoints = store.list_run_checkpoints(limit=limit)
     ledger_entries = store.list_project_ledger_entries(limit=limit)
     provider_health = store.search_provider_health_summary(limit=limit * 5)
     return {
         "counts": store.diagnostic_counts(),
         "dependency_lock": _dependency_lock_status(Path.cwd()),
+        "latest_project_state": store.latest_project_ledger_snapshot("pydantic-ai-tech-intel-briefing"),
         "latest_project_ledger": ledger_entries,
         "gate_summary": {
             "total": len(gates),
@@ -710,6 +961,11 @@ def _agentops_report(store: MemoryStore, limit: int = 20) -> dict[str, Any]:
             "total_sampled": len(traces),
             "failed": sum(1 for item in traces if item["status"] == "failed"),
             "latest": traces,
+        },
+        "checkpoint_summary": {
+            "total_sampled": len(checkpoints),
+            "failed": sum(1 for item in checkpoints if item["status"] == "failed"),
+            "latest": checkpoints,
         },
         "provider_health": provider_health,
     }

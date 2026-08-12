@@ -146,18 +146,24 @@ python -m search_assistant.cli agentops-report
 python -m search_assistant.cli provider-health
 python -m search_assistant.cli trace-list
 python -m search_assistant.cli ledger-list
+python -m search_assistant.cli ledger-state
 python -m search_assistant.cli gate-list
+python -m search_assistant.cli checkpoint-list
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
+python -m search_assistant.cli eval-replay
 ```
 
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
 Feishu guidance are in [docs/operations.md](docs/operations.md).
 
-The agent-ops commands expose append-only project ledger entries, self-evolution
-gate records, trace spans, and search-provider health records from the local
-SQLite store. These are intended to make daily briefing runs and self-evolution
-changes reviewable before they are promoted.
+The agent-ops commands expose append-only project ledger entries, project-state
+snapshots, self-evolution gate records, trace spans, run checkpoints, and
+search-provider health records from the local SQLite store. These are intended to
+make daily briefing runs and self-evolution changes reviewable before they are
+promoted. `knowledge-candidate-approve` requires a passing `eval-suite` report by
+default; `eval-replay` reruns the questions from an existing evaluation report to
+surface behavior drift before releasing new knowledge.
 
 ## Development And Verification
 

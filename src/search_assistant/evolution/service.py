@@ -174,7 +174,14 @@ class DomainKnowledgeCandidateService:
             "links": created_links,
         }
 
+    def record_validation_gate(self, candidate_id: str) -> dict[str, Any]:
+        """Record the automatic traceability gate without promoting the candidate."""
+        return self._run_validation_gate(candidate_id, promote=False)
+
     def validate(self, candidate_id: str) -> dict[str, Any]:
+        return self._run_validation_gate(candidate_id, promote=True)
+
+    def _run_validation_gate(self, candidate_id: str, promote: bool) -> dict[str, Any]:
         candidate = self.store.get_domain_knowledge_candidate(candidate_id)
         if candidate is None:
             raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
@@ -207,11 +214,12 @@ class DomainKnowledgeCandidateService:
             )
             return {"validated": False, "candidate_id": candidate_id, "failures": failures}
 
-        self.store.update_domain_knowledge_candidate_status(
-            candidate_id,
-            "validated",
-            "passed traceability gate: multiple original sources, no unresolved contradictions, non-low confidence",
-        )
+        if promote:
+            self.store.update_domain_knowledge_candidate_status(
+                candidate_id,
+                "validated",
+                "passed traceability gate: multiple original sources, no unresolved contradictions, non-low confidence",
+            )
         self.store.add_gate_record(
             gate_type="domain_knowledge_candidate_validation",
             subject_type="domain_knowledge_candidate",
@@ -233,7 +241,23 @@ class DomainKnowledgeCandidateService:
         candidate_id: str,
         reviewer: str = "local-reviewer",
         reason: str = "approved after human review",
+        eval_gate: dict[str, Any] | None = None,
+        require_eval_gate: bool = True,
     ) -> dict[str, Any]:
+        eval_release_gate: dict[str, Any] | None = None
+        if require_eval_gate:
+            eval_release_gate = self._record_eval_release_gate(candidate_id, eval_gate)
+            if not eval_release_gate["passed"]:
+                return {
+                    "approved": False,
+                    "candidate_id": candidate_id,
+                    "gate_id": eval_release_gate["gate_id"],
+                    "validation": None,
+                    "eval_gate": eval_release_gate,
+                }
+        elif eval_gate is not None:
+            eval_release_gate = self._record_eval_release_gate(candidate_id, eval_gate)
+
         validation = self.validate(candidate_id)
         candidate = self.store.get_domain_knowledge_candidate(candidate_id)
         if candidate is None:
@@ -254,6 +278,7 @@ class DomainKnowledgeCandidateService:
                 "candidate_id": candidate_id,
                 "gate_id": gate_id,
                 "validation": validation,
+                "eval_gate": eval_release_gate or eval_gate,
             }
 
         gate_id = self.store.add_gate_record(
@@ -270,16 +295,21 @@ class DomainKnowledgeCandidateService:
             subject=candidate_id,
             status="approved",
             summary=f"Domain knowledge candidate approved for reviewed use: {candidate['topic']}",
-            evidence_refs=[gate_id, *self._candidate_evidence_refs(candidate)],
+            evidence_refs=[
+                gate_id,
+                *([str(eval_release_gate["gate_id"])] if eval_release_gate else []),
+                *self._candidate_evidence_refs(candidate),
+            ],
             risk="Candidate is planning context only; source URLs must be reopened before current factual claims.",
             rollback="Run knowledge-candidate-deprecate with a reason to remove the candidate from active use.",
-            metadata={"reviewer": reviewer, "claim": candidate["claim"]},
+            metadata={"reviewer": reviewer, "claim": candidate["claim"], "eval_gate": eval_release_gate or eval_gate or {}},
         )
         return {
             "approved": True,
             "candidate_id": candidate_id,
             "gate_id": gate_id,
             "validation": validation,
+            "eval_gate": eval_release_gate or eval_gate,
         }
 
     def deprecate(self, candidate_id: str, reason: str) -> None:
@@ -308,6 +338,44 @@ class DomainKnowledgeCandidateService:
             rollback="Create a fresh candidate from newer evidence and approve it through validation and human review.",
             metadata={"reason": reason.strip(), "claim": candidate["claim"]},
         )
+
+    def _record_eval_release_gate(self, candidate_id: str, eval_gate: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = self.store.get_domain_knowledge_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
+        gate = eval_gate or {
+            "passed": False,
+            "reason": "evaluation report is required before knowledge release",
+            "report_path": "",
+        }
+        passed = bool(gate.get("passed"))
+        waived = bool(gate.get("waived"))
+        gate_id = self.store.add_gate_record(
+            gate_type="domain_knowledge_candidate_eval_release",
+            subject_type="domain_knowledge_candidate",
+            subject_id=candidate_id,
+            result="waived" if waived else "passed" if passed else "failed",
+            reason=str(
+                gate.get("reason")
+                or ("evaluation gate waived" if waived else "evaluation gate passed" if passed else "evaluation gate failed")
+            ),
+            evidence_refs=[
+                ref
+                for ref in (
+                    str(gate.get("report_path") or ""),
+                    *self._candidate_evidence_refs(candidate),
+                )
+                if ref
+            ],
+            metadata={"topic": candidate["topic"], "eval_gate": gate},
+        )
+        return {
+            "passed": passed,
+            "waived": waived,
+            "gate_id": gate_id,
+            "reason": str(gate.get("reason") or ""),
+            "report_path": str(gate.get("report_path") or ""),
+        }
 
     def _ensure_default_graphs(self) -> dict[str, object]:
         if self.graph_service.list_graphs():
