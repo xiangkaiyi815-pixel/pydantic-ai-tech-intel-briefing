@@ -12,7 +12,13 @@ from search_assistant.contracts import IncomingMessage
 from search_assistant.briefing.service import DailyBriefingService
 from search_assistant.diagnostics.readiness import run_readiness_diagnostics
 from search_assistant.evaluation.service import EvaluationService
-from search_assistant.evolution.service import DomainKnowledgeCandidateService
+from search_assistant.evolution.service import (
+    KNOWLEDGE_LAYER_REJECTED,
+    KNOWLEDGE_LAYER_UNREVIEWED,
+    KNOWLEDGE_LAYER_VALIDATED,
+    KNOWLEDGE_LAYER_WEAK_SIGNAL,
+    DomainKnowledgeCandidateService,
+)
 from search_assistant.feishu.client import FakeFeishuClient, FeishuHttpClient
 from search_assistant.feishu.events import parse_feishu_event
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
@@ -113,6 +119,16 @@ def main(argv: list[str] | None = None) -> int:
 
     candidate_list_parser = subparsers.add_parser("knowledge-candidate-list")
     candidate_list_parser.add_argument("--status", choices=["candidate", "validated", "deprecated"], default=None)
+    candidate_list_parser.add_argument(
+        "--layer",
+        choices=[
+            KNOWLEDGE_LAYER_VALIDATED,
+            KNOWLEDGE_LAYER_WEAK_SIGNAL,
+            KNOWLEDGE_LAYER_REJECTED,
+            KNOWLEDGE_LAYER_UNREVIEWED,
+        ],
+        default=None,
+    )
     _add_data_dir(candidate_list_parser)
 
     candidate_validate_parser = subparsers.add_parser("knowledge-candidate-validate")
@@ -396,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "knowledge-candidate-list":
-        result = store.list_domain_knowledge_candidates(args.status)
+        result = DomainKnowledgeCandidateService(store).list_candidates(status=args.status, layer=args.layer)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-candidate-validate":

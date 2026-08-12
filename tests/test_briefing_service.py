@@ -276,6 +276,7 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert ledger_entries[0]["metadata"]["source_count"] == 3
     assert ledger_entries[0]["metadata"]["validation_gate_passed"] == validation_passed
     assert ledger_entries[0]["metadata"]["validation_gate_failed"] == validation_failed
+    assert sum(ledger_entries[0]["metadata"]["knowledge_layers"].values()) == len(candidates)
     assert store.latest_project_ledger_snapshot("pydantic-ai-tech-intel-briefing")["status"] == "active"
     trace_names = {event["name"] for event in store.list_trace_events()}
     assert {

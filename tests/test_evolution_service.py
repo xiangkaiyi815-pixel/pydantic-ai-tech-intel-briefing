@@ -1,6 +1,8 @@
 from datetime import date
 import json
 import sqlite3
+import sys
+from io import BytesIO, TextIOWrapper
 
 import pytest
 
@@ -50,7 +52,10 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     validation = service.validate(first_ids[0])
     service.deprecate(first_ids[0], "superseded by a later evidence review")
 
-    assert validation == {"validated": True, "candidate_id": first_ids[0], "failures": []}
+    assert validation["validated"] is True
+    assert validation["candidate_id"] == first_ids[0]
+    assert validation["failures"] == []
+    assert validation["knowledge_layer"] == "validated_knowledge"
     assert store.get_domain_knowledge_candidate(first_ids[0])["status"] == "deprecated"
     gates = store.list_gate_records()
     assert {gate["gate_type"] for gate in gates} == {
@@ -86,6 +91,43 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert len(gates) == 1
     assert gates[0]["result"] == "failed"
     assert gates[0]["metadata"]["evidence_url_count"] == 1
+    assert gates[0]["metadata"]["knowledge_layer"] == "weak_signal"
+    assert "exploratory clue" in gates[0]["metadata"]["intended_use"]
+    assert result["knowledge_layer"] == "weak_signal"
+
+
+def test_candidate_list_can_surface_weak_signals_without_promoting_them(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing(source_count=1))[0]
+
+    service.record_validation_gate(candidate_id)
+    weak_signals = service.list_candidates(layer="weak_signal")
+
+    assert [candidate["id"] for candidate in weak_signals] == [candidate_id]
+    assert weak_signals[0]["status"] == "candidate"
+    assert weak_signals[0]["knowledge_layer"] == "weak_signal"
+    assert "independent corroborating sources" in weak_signals[0]["knowledge_layer_next_action"]
+
+
+def test_cli_candidate_list_filters_by_knowledge_layer(tmp_path, monkeypatch):
+    from search_assistant import cli
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing(source_count=1))[0]
+    service.record_validation_gate(candidate_id)
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["knowledge-candidate-list", "--layer", "weak_signal", "--data-dir", str(tmp_path)]) == 0
+    stream.flush()
+    output = json.loads(stream.buffer.getvalue().decode("utf-8"))
+
+    assert [candidate["id"] for candidate in output] == [candidate_id]
+    assert output[0]["knowledge_layer"] == "weak_signal"
 
 
 def test_candidate_approval_records_human_gate_and_release_ledger(tmp_path):

@@ -152,6 +152,7 @@ python -m search_assistant.cli checkpoint-list
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
 python -m search_assistant.cli eval-replay
+python -m search_assistant.cli knowledge-candidate-list --layer weak_signal
 ```
 
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
@@ -164,6 +165,12 @@ make daily briefing runs and self-evolution changes reviewable before they are
 promoted. `knowledge-candidate-approve` requires a passing `eval-suite` report by
 default; `eval-replay` reruns the questions from an existing evaluation report to
 surface behavior drift before releasing new knowledge.
+
+Knowledge candidates are layered by the latest validation gate metadata:
+`validated_knowledge` can move toward human-reviewed release, `weak_signal`
+keeps single-source or low-confidence clues for follow-up search, and
+`rejected_noise` is retained only as an audit trail. This prevents weak but
+useful leads from being deleted while keeping them out of trusted knowledge.
 
 ## Development And Verification
 

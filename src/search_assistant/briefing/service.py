@@ -506,6 +506,14 @@ def _duration_ms(started: float) -> float:
     return round((time.monotonic() - started) * 1000, 3)
 
 
+def _count_knowledge_layers(validation_results: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in validation_results:
+        layer = str(item.get("knowledge_layer") or "unreviewed_candidate")
+        counts[layer] = counts.get(layer, 0) + 1
+    return counts
+
+
 def _safe_trace_error(exc: Exception) -> str:
     text = str(exc)
     for marker in ("api_key", "API key", "Authorization", "token", "secret", "password"):
@@ -654,6 +662,7 @@ class DailyBriefingService:
             candidate_service = DomainKnowledgeCandidateService(self.store)
             candidate_ids = candidate_service.capture_briefing(briefing)
             validation_results = [candidate_service.record_validation_gate(candidate_id) for candidate_id in candidate_ids]
+            knowledge_layers = _count_knowledge_layers(validation_results)
             self._record_trace_event(
                 run_id,
                 "evolution",
@@ -664,6 +673,7 @@ class DailyBriefingService:
                     "candidate_count": len(candidate_ids),
                     "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
                     "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
                 },
             )
             self._record_checkpoint(
@@ -675,6 +685,7 @@ class DailyBriefingService:
                     "candidate_ids": candidate_ids,
                     "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
                     "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
                 },
             )
             self.store.add_project_ledger_entry(
@@ -697,6 +708,7 @@ class DailyBriefingService:
                     "candidate_count": len(candidate_ids),
                     "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
                     "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
                     "run_date": briefing.run_date.isoformat(),
                 },
             )

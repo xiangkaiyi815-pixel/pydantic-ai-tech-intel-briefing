@@ -15,6 +15,12 @@ from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 
 
+KNOWLEDGE_LAYER_VALIDATED = "validated_knowledge"
+KNOWLEDGE_LAYER_WEAK_SIGNAL = "weak_signal"
+KNOWLEDGE_LAYER_REJECTED = "rejected_noise"
+KNOWLEDGE_LAYER_UNREVIEWED = "unreviewed_candidate"
+
+
 class EvolutionDiagnosisService:
     """Route structured evaluation failures to a reviewable update carrier."""
 
@@ -181,6 +187,25 @@ class DomainKnowledgeCandidateService:
     def validate(self, candidate_id: str) -> dict[str, Any]:
         return self._run_validation_gate(candidate_id, promote=True)
 
+    def list_candidates(self, status: str | None = None, layer: str | None = None) -> list[dict[str, Any]]:
+        candidates = self.store.list_domain_knowledge_candidates(status)
+        latest_layers = self._latest_validation_layers()
+        enriched: list[dict[str, Any]] = []
+        for candidate in candidates:
+            validation = latest_layers.get(str(candidate["id"]), {})
+            item = {
+                **candidate,
+                "knowledge_layer": validation.get("knowledge_layer", KNOWLEDGE_LAYER_UNREVIEWED),
+                "knowledge_layer_reason": validation.get("reason", "validation gate has not run"),
+                "knowledge_layer_next_action": validation.get(
+                    "next_action",
+                    "run knowledge-candidate-validate or generate a new briefing",
+                ),
+            }
+            if layer is None or item["knowledge_layer"] == layer:
+                enriched.append(item)
+        return enriched
+
     def _run_validation_gate(self, candidate_id: str, promote: bool) -> dict[str, Any]:
         candidate = self.store.get_domain_knowledge_candidate(candidate_id)
         if candidate is None:
@@ -191,12 +216,16 @@ class DomainKnowledgeCandidateService:
             if str(item.get("url", "")).startswith(("http://", "https://"))
         }
         failures: list[str] = []
-        if len(evidence_urls) < 2:
+        if not evidence_urls:
+            failures.append("no_original_source")
+        elif len(evidence_urls) < 2:
             failures.append("fewer_than_two_original_sources")
         if candidate["contradictions"]:
             failures.append("unresolved_contradictions")
         if candidate["confidence"] == "low":
             failures.append("low_confidence")
+        knowledge_layer = self._knowledge_layer(failures)
+        layer_metadata = self._layer_metadata(knowledge_layer)
         if failures:
             self.store.add_gate_record(
                 gate_type="domain_knowledge_candidate_validation",
@@ -210,9 +239,17 @@ class DomainKnowledgeCandidateService:
                     "confidence": candidate["confidence"],
                     "evidence_url_count": len(evidence_urls),
                     "candidate_status": candidate["status"],
+                    "knowledge_layer": knowledge_layer,
+                    **layer_metadata,
                 },
             )
-            return {"validated": False, "candidate_id": candidate_id, "failures": failures}
+            return {
+                "validated": False,
+                "candidate_id": candidate_id,
+                "failures": failures,
+                "knowledge_layer": knowledge_layer,
+                **layer_metadata,
+            }
 
         if promote:
             self.store.update_domain_knowledge_candidate_status(
@@ -232,9 +269,17 @@ class DomainKnowledgeCandidateService:
                 "confidence": candidate["confidence"],
                 "evidence_url_count": len(evidence_urls),
                 "candidate_status": candidate["status"],
+                "knowledge_layer": knowledge_layer,
+                **layer_metadata,
             },
         )
-        return {"validated": True, "candidate_id": candidate_id, "failures": []}
+        return {
+            "validated": True,
+            "candidate_id": candidate_id,
+            "failures": [],
+            "knowledge_layer": knowledge_layer,
+            **layer_metadata,
+        }
 
     def approve(
         self,
@@ -381,6 +426,45 @@ class DomainKnowledgeCandidateService:
         if self.graph_service.list_graphs():
             return {"seeded_graphs": 0, "graphs": self.graph_service.list_graphs()}
         return self.graph_service.seed_default_graphs()
+
+    @staticmethod
+    def _knowledge_layer(failures: list[str]) -> str:
+        if not failures:
+            return KNOWLEDGE_LAYER_VALIDATED
+        if "no_original_source" in failures or "unresolved_contradictions" in failures:
+            return KNOWLEDGE_LAYER_REJECTED
+        return KNOWLEDGE_LAYER_WEAK_SIGNAL
+
+    @staticmethod
+    def _layer_metadata(layer: str) -> dict[str, str]:
+        if layer == KNOWLEDGE_LAYER_VALIDATED:
+            return {
+                "intended_use": "stable planning context after eval and human review gates pass",
+                "next_action": "eligible for knowledge-candidate-approve after eval gate passes",
+            }
+        if layer == KNOWLEDGE_LAYER_WEAK_SIGNAL:
+            return {
+                "intended_use": "exploratory clue for the next search plan; do not use as trusted knowledge",
+                "next_action": "search for independent corroborating sources before promotion",
+            }
+        return {
+            "intended_use": "audit trail only; do not use for planning or synthesis",
+            "next_action": "ignore unless a human reviewer supplies corrected evidence",
+        }
+
+    def _latest_validation_layers(self) -> dict[str, dict[str, str]]:
+        latest: dict[str, dict[str, str]] = {}
+        for gate in self.store.list_gate_records(gate_type="domain_knowledge_candidate_validation"):
+            candidate_id = str(gate["subject_id"])
+            if candidate_id in latest:
+                continue
+            metadata = gate.get("metadata") or {}
+            latest[candidate_id] = {
+                "knowledge_layer": str(metadata.get("knowledge_layer") or KNOWLEDGE_LAYER_UNREVIEWED),
+                "reason": str(gate.get("reason") or ""),
+                "next_action": str(metadata.get("next_action") or ""),
+            }
+        return latest
 
     @staticmethod
     def _candidate_graph_query(candidate: dict[str, Any]) -> str:
