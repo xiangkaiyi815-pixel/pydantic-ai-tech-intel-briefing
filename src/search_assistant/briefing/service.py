@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, DailyBriefing, TopicSubscription
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
+from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchResult
 
@@ -159,6 +160,14 @@ def _has_intent_marker(text: str, compact_text: str, markers: tuple[str, ...]) -
         if normalized_marker in text or compact_marker in compact_text:
             return True
     return False
+
+
+def _topic_terms(topic: str) -> list[str]:
+    terms = re.findall(r"[A-Za-z][A-Za-z0-9+._/-]{1,}|[\u4e00-\u9fff]{2,}", topic.lower())
+    compact = re.sub(r"\s+", "", topic.lower())
+    if compact and compact not in terms and len(compact) >= 2:
+        terms.insert(0, compact)
+    return list(dict.fromkeys(term for term in terms if _is_meaningful_query(term)))
 
 
 def _classify_briefing_intent(
@@ -784,7 +793,13 @@ class DailyBriefingService:
             self._ensure_project_state()
             feedback = self.store.list_topic_feedback(subscription.id)
             briefing_intent = _classify_briefing_intent(subscription.topic, feedback)
-            search_plan = self.build_search_plan(subscription, feedback, intent=briefing_intent)
+            knowledge_context = self._knowledge_context(subscription.topic)
+            search_plan = self.build_search_plan(
+                subscription,
+                feedback,
+                intent=briefing_intent,
+                knowledge_context=knowledge_context,
+            )
             self._record_trace_event(
                 run_id,
                 "briefing",
@@ -796,6 +811,7 @@ class DailyBriefingService:
                     "intent_label": briefing_intent.label,
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
             )
             self._record_checkpoint(
@@ -808,6 +824,7 @@ class DailyBriefingService:
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
                     "queries": [query for _, query in search_plan[:8]],
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
             )
 
@@ -846,6 +863,7 @@ class DailyBriefingService:
                 search_plan,
                 fallback_sources=ranked_sources,
                 briefing_intent=briefing_intent,
+                knowledge_context=knowledge_context,
             )
             self._record_trace_event(
                 run_id,
@@ -859,6 +877,7 @@ class DailyBriefingService:
                     "model_source_count": min(len(ranked_sources), self.model_max_sources),
                     "theme_count": len(synthesis.themes),
                     "used_runtime": self.runtime is not None,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
             )
             self._record_checkpoint(
@@ -869,6 +888,7 @@ class DailyBriefingService:
                     "theme_count": len(synthesis.themes),
                     "model_source_count": min(len(ranked_sources), self.model_max_sources),
                     "used_runtime": self.runtime is not None,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
             )
 
@@ -937,6 +957,7 @@ class DailyBriefingService:
                     "topic_id": subscription.id,
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
                     "candidate_count": len(candidate_ids),
@@ -956,6 +977,7 @@ class DailyBriefingService:
                     "status": "completed",
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
                 },
@@ -995,9 +1017,11 @@ class DailyBriefingService:
         subscription: TopicSubscription,
         feedback: list[dict[str, object]],
         intent: BriefingIntentProfile | None = None,
+        knowledge_context: dict[str, object] | None = None,
     ) -> list[tuple[str, str]]:
         briefing_intent = intent or _classify_briefing_intent(subscription.topic, feedback)
-        plans: list[tuple[str, str]] = []
+        knowledge_context = knowledge_context or self._knowledge_context(subscription.topic)
+        generated_plans: list[tuple[str, str]] = []
         if self.runtime is not None:
             try:
                 generated = self.runtime.plan_briefing_queries(
@@ -1006,22 +1030,31 @@ class DailyBriefingService:
                         "feedback": feedback[:5],
                         "channels": [platform for platform, _ in CHANNEL_QUERIES],
                         "briefing_intent": briefing_intent.model_dump(),
+                        "knowledge_context": knowledge_context,
                         "report_skill": _load_report_skill(),
                     },
                 )
             except Exception:
                 generated = []
-            plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
-        plans.extend(
+            generated_plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
+        deterministic_plans = [
             ("技术路线（确定性保障）", query)
             for query in _deterministic_technical_queries(subscription.topic, briefing_intent)
-        )
-
+        ]
+        feedback_plans: list[tuple[str, str]] = []
         for item in feedback[:3]:
             note = " ".join(str(item.get("body") or "").split())
             if note and _is_meaningful_feedback(note):
-                plans.append(("案例反馈", f"{subscription.topic} {note[:160]}"))
-        plans.extend((platform, template.format(topic=subscription.topic)) for platform, template in CHANNEL_QUERIES)
+                feedback_plans.append(("案例反馈", f"{subscription.topic} {note[:160]}"))
+        knowledge_plans = self._knowledge_guided_queries(subscription.topic, knowledge_context)
+        channel_plans = [(platform, template.format(topic=subscription.topic)) for platform, template in CHANNEL_QUERIES]
+        plans = self._compose_search_plan(
+            generated_plans,
+            deterministic_plans,
+            feedback_plans,
+            knowledge_plans,
+            channel_plans,
+        )
         unique: list[tuple[str, str]] = []
         seen: set[str] = set()
         for platform, query in plans:
@@ -1032,6 +1065,22 @@ class DailyBriefingService:
             if len(unique) >= self.max_queries:
                 break
         return unique
+
+    def _compose_search_plan(
+        self,
+        generated_plans: list[tuple[str, str]],
+        deterministic_plans: list[tuple[str, str]],
+        feedback_plans: list[tuple[str, str]],
+        knowledge_plans: list[tuple[str, str]],
+        channel_plans: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Compose query plans while reserving room for the original channels."""
+
+        if self.max_queries >= len(channel_plans):
+            non_channel_budget = max(0, self.max_queries - len(channel_plans))
+            high_value = generated_plans[:4] + feedback_plans + knowledge_plans + deterministic_plans + generated_plans[4:]
+            return high_value[:non_channel_budget] + channel_plans
+        return generated_plans + deterministic_plans + feedback_plans + channel_plans + knowledge_plans
 
     def add_feedback(
         self,
@@ -1047,6 +1096,118 @@ class DailyBriefingService:
         if case_context:
             enriched_body = "\n".join(part for part in (enriched_body, case_context) if part)
         return self.store.add_topic_feedback(subscription.id, user_id, chat_id, enriched_body, source_url)
+
+    def _knowledge_context(self, topic: str) -> dict[str, object]:
+        """Retrieve reviewed graph and self-evolution context before planning.
+
+        Reviewed graph hits may guide both query planning and synthesis framing.
+        Self-evolution candidates are split by release state: validated candidates
+        can be used as planning context, while weak signals only suggest what to
+        verify next.  Neither category is treated as a current factual source.
+        """
+
+        graph_service = DomainKnowledgeGraphService(self.store)
+        seeded_graphs = 0
+        try:
+            if not graph_service.list_graphs():
+                seeded_graphs = int(graph_service.seed_default_graphs()["seeded_graphs"])
+            graph_hits = graph_service.query_relevant(topic, limit=4, min_score=5.0)
+        except Exception:
+            graph_hits = []
+
+        latest_layers = self._latest_candidate_layers()
+        validated_candidates: list[dict[str, object]] = []
+        weak_signals: list[dict[str, object]] = []
+        topic_terms = set(_topic_terms(topic))
+        for candidate in self.store.list_domain_knowledge_candidates():
+            if str(candidate.get("status")) == "deprecated":
+                continue
+            layer = latest_layers.get(str(candidate.get("id")), "unreviewed_candidate")
+            if not self._candidate_matches_topic(candidate, topic_terms):
+                continue
+            item = {
+                "id": candidate["id"],
+                "topic": candidate["topic"],
+                "claim": str(candidate.get("claim", ""))[:360],
+                "confidence": candidate.get("confidence"),
+                "knowledge_layer": layer,
+                "evidence_url_count": len(
+                    [
+                        evidence
+                        for evidence in candidate.get("evidence", [])
+                        if str(evidence.get("url", "")).startswith(("http://", "https://"))
+                    ]
+                ),
+            }
+            if layer == "validated_knowledge" or str(candidate.get("status")) == "validated":
+                validated_candidates.append(item)
+            elif layer == "weak_signal":
+                weak_signals.append(item)
+
+        return {
+            "policy": (
+                "Use reviewed graph hits and validated self-evolution candidates only as planning and framing context; "
+                "re-open original sources before making current factual claims. Use weak signals only for next research "
+                "directions, not as evidence."
+            ),
+            "seeded_graphs": seeded_graphs,
+            "reviewed_graph_hits": [hit.model_dump(mode="json") for hit in graph_hits],
+            "validated_candidates": validated_candidates[:3],
+            "weak_signals": weak_signals[:3],
+        }
+
+    def _knowledge_guided_queries(
+        self,
+        topic: str,
+        knowledge_context: dict[str, object],
+    ) -> list[tuple[str, str]]:
+        queries: list[tuple[str, str]] = []
+        for hit in knowledge_context.get("reviewed_graph_hits", [])[:3]:
+            if not isinstance(hit, dict):
+                continue
+            entity_name = str(hit.get("entity_name") or "").strip()
+            if entity_name:
+                queries.append(("知识图谱补充", f"{topic} {entity_name} implementation evidence"))
+        for candidate in knowledge_context.get("validated_candidates", [])[:2]:
+            if not isinstance(candidate, dict):
+                continue
+            claim_terms = re.findall(r"[A-Za-z][A-Za-z0-9+._/-]{2,}|[\u4e00-\u9fff]{2,}", str(candidate.get("claim", "")))
+            useful_terms = [term for term in claim_terms if _is_meaningful_query(term)][:4]
+            if useful_terms:
+                queries.append(("自进化知识补充", f"{topic} {' '.join(useful_terms)}"))
+        return queries
+
+    def _latest_candidate_layers(self) -> dict[str, str]:
+        latest: dict[str, str] = {}
+        for gate in self.store.list_gate_records(gate_type="domain_knowledge_candidate_validation"):
+            candidate_id = str(gate["subject_id"])
+            if candidate_id in latest:
+                continue
+            metadata = gate.get("metadata") or {}
+            latest[candidate_id] = str(metadata.get("knowledge_layer") or "unreviewed_candidate")
+        return latest
+
+    @staticmethod
+    def _candidate_matches_topic(candidate: dict[str, object], topic_terms: set[str]) -> bool:
+        if not topic_terms:
+            return False
+        text = " ".join(
+            (
+                str(candidate.get("topic", "")),
+                str(candidate.get("claim", "")),
+                str(candidate.get("applies_when", "")),
+            )
+        ).lower()
+        return any(term.lower() in text for term in topic_terms)
+
+    @staticmethod
+    def _knowledge_context_metadata(knowledge_context: dict[str, object]) -> dict[str, object]:
+        return {
+            "seeded_graphs": knowledge_context.get("seeded_graphs", 0),
+            "reviewed_graph_hits": len(knowledge_context.get("reviewed_graph_hits", [])),
+            "validated_candidates": len(knowledge_context.get("validated_candidates", [])),
+            "weak_signals": len(knowledge_context.get("weak_signals", [])),
+        }
 
     def _inspect_case_source(self, source_url: str | None) -> str:
         if not source_url:
@@ -1310,6 +1471,7 @@ class DailyBriefingService:
         search_plan: list[tuple[str, str]],
         fallback_sources: list[CollectedSource] | None = None,
         briefing_intent: BriefingIntentProfile | None = None,
+        knowledge_context: dict[str, object] | None = None,
     ) -> BriefingSynthesis:
         if self.runtime is not None:
             try:
@@ -1322,6 +1484,7 @@ class DailyBriefingService:
                         "search_plan": search_plan,
                         "readability": REPORT_CONTRACT["readability"],
                         "briefing_intent": briefing_intent.model_dump() if briefing_intent else None,
+                        "knowledge_context": knowledge_context or {},
                     },
                 )
             except Exception:

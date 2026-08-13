@@ -141,7 +141,7 @@ class DomainKnowledgeCandidateService:
             if candidate["status"] == "deprecated":
                 continue
             query = self._candidate_graph_query(candidate)
-            hits = self.graph_service.query(query, limit=limit_per_candidate)
+            hits = self.graph_service.query_relevant(query, limit=limit_per_candidate, min_score=5.0)
             for hit in hits:
                 key = (
                     str(candidate["id"]),

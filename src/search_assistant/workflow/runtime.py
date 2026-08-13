@@ -144,7 +144,9 @@ class DeepSeekChatRuntime:
             "data and workflow, evaluation metrics, deployment cases, and primary/open-source material. "
             "Queries may mix Chinese and English when useful. Do not include platform names, site: filters, "
             "title fragments, conversational filler, or quoted user feedback. User feedback is only evidence "
-            "for inferring a technical direction. Return only a JSON array of strings."
+            "for inferring a technical direction. If knowledge_context is present, use reviewed graph hits and "
+            "validated candidates to add focused follow-up queries, but never treat weak signals as facts. "
+            "Return only a JSON array of strings."
         )
         content = self.agent_runner(
             self.model,
@@ -164,6 +166,8 @@ class DeepSeekChatRuntime:
                             "primary or open-source material",
                         ],
                     },
+                    "briefing_intent": context.get("briefing_intent"),
+                    "knowledge_context": context.get("knowledge_context", {}),
                 },
                 ensure_ascii=False,
             ),
@@ -351,6 +355,9 @@ class DeepSeekChatRuntime:
             "market, ecosystem, and implementation evidence; engineering_landing follows architecture, "
             "interfaces, data flow, validation, rollout, and rollback; comparison_decision compares tradeoffs, "
             "decision criteria, limitations, and suitable scenarios. "
+            "If knowledge_context is present, use reviewed_graph_hits and validated_candidates only to frame the "
+            "analysis and decide what gaps to verify; never cite them as current evidence. Use weak_signals only in "
+            "next_search_directions. Current factual claims must still come from sources. "
             "short_summary must be a 120-220 Chinese-character executive technical brief: state what this batch is "
             "actually building and name the evidenced implementation path, such as the input form, representation or "
             "model, transformation/tool chain, integration point, and validation/control mechanism. It must contrast "
@@ -386,6 +393,7 @@ class DeepSeekChatRuntime:
             "report_skill": context.get("report_skill"),
             "readability": context.get("readability"),
             "briefing_intent": context.get("briefing_intent"),
+            "knowledge_context": context.get("knowledge_context", {}),
             "search_plan": context.get("search_plan", [])[:12],
             "sources": source_payload,
         }
@@ -755,6 +763,12 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
             " themes 仅用于可追溯的证据锚点，返回 1 至 5 个，每个主题包含名称、至少 45 字的技术判断和一个或多个输入 URL。"
             "不要因为证据不完整而编造实现细节，应明确下一步需要核验的原始材料。"
         )
+        instructions += (
+            " If knowledge_context is present, use reviewed_graph_hits and validated_candidates only as planning "
+            "and framing context, never as current factual evidence. Use weak_signals only for next research "
+            "directions. Current factual claims must still come from the supplied sources."
+        )
+
         async def run_once() -> BriefingSynthesis:
             import httpx
 
@@ -780,6 +794,7 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
                                 "report_skill": context.get("report_skill"),
                                 "readability": context.get("readability"),
                                 "briefing_intent": context.get("briefing_intent"),
+                                "knowledge_context": context.get("knowledge_context", {}),
                                 "sources": [source.model_dump(mode="json") for source in sources],
                             },
                             ensure_ascii=False,

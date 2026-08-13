@@ -213,6 +213,48 @@ def test_evolve_command_backfills_existing_candidate_graph_links(tmp_path, capsy
     assert links[0]["entity_id"] in {"dicom-pacs", "multimodal-medical-imaging-model"}
 
 
+def test_candidate_graph_linking_ignores_unrelated_low_score_matches(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    now = "2026-08-13T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-unrelated-chemistry",
+        topic="盐酸的作用",
+        claim="盐酸常用于调节酸碱度和参与化学实验，材料没有讨论 Agent、GraphRAG 或工具编排。",
+        applies_when="Use when researching chemistry basics.",
+        evidence=[
+            DomainKnowledgeEvidence(
+                title="Hydrochloric acid basics",
+                url="https://example.com/hcl/one",
+                provider="example",
+                retrieved_at=now,
+            ),
+            DomainKnowledgeEvidence(
+                title="Chemistry laboratory safety",
+                url="https://example.com/hcl/two",
+                provider="example",
+                retrieved_at=now,
+            ),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-hcl"],
+        fingerprint="unrelated-chemistry-candidate-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+
+    result = service.link_candidates_to_knowledge_graphs([candidate.id])
+
+    assert result["candidates_considered"] == 1
+    assert result["created_links"] == 0
+    assert result["links"] == []
+    assert store.list_domain_candidate_graph_links(candidate.id) == []
+
+
 def test_learning_report_surfaces_trajectory_and_domain_candidate_status(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()

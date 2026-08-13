@@ -7,7 +7,15 @@ from search_assistant.briefing.service import (
     _classify_briefing_intent,
     _is_substantive_synthesis,
 )
-from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, IncomingMessage
+from search_assistant.contracts import (
+    BriefingSynthesis,
+    BriefingTheme,
+    CollectedSource,
+    DomainKnowledgeCandidate,
+    DomainKnowledgeEvidence,
+    IncomingMessage,
+)
+from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
 from search_assistant.workflow.runtime import DeepSeekChatRuntime, FakeAgentRuntime
@@ -166,6 +174,36 @@ class MarketingSearchClient:
         ][:limit]
 
 
+class HarnessSearchClient:
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        return [
+            SearchResult(
+                title="Agent harness orchestration and tool execution contract",
+                url="https://example.com/agent-harness-architecture",
+                snippet=(
+                    "A harness coordinates prompts, context assembly, tool permissions, "
+                    "state checkpoints, eval gates, replay logs, and failure recovery for agent systems."
+                ),
+                provider="mcp:public:test",
+                checked_at="2026-08-13T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="Harness evaluation traces for agent workflows",
+                url="https://example.com/agent-harness-evals",
+                snippet=(
+                    "Harness traces record tool calls, source evidence, output validation, "
+                    "and replayable regression tests before a capability is released."
+                ),
+                provider="browser-google",
+                checked_at="2026-08-13T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
 class PlanningRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
@@ -178,6 +216,21 @@ class PlanningRuntime(FakeAgentRuntime):
             "LinkedIn industrial AI discussion",
             "predictive maintenance time-series anomaly detection evaluation",
         ]
+
+
+class KnowledgeContextRuntime(FakeAgentRuntime):
+    def __init__(self):
+        super().__init__()
+        self.planning_context: dict[str, object] | None = None
+        self.synthesis_context: dict[str, object] | None = None
+
+    def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
+        self.planning_context = context
+        return ["agent harness workflow eval replay architecture"]
+
+    def synthesize_briefing(self, topic, sources, context):
+        self.synthesis_context = context
+        return None
 
 
 class SourceLimitRuntime(FakeAgentRuntime):
@@ -440,6 +493,68 @@ def test_daily_briefing_uses_model_planned_technical_queries_and_static_skill(tm
     assert runtime.briefing_context["briefing_intent"]["primary_intent"] == "technical_tracking"
     assert "内容搜集报告" in str(runtime.briefing_context["report_skill"])
     assert REPORT_SKILL_PATH.exists()
+
+
+def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = "2026-08-13T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-agent-harness",
+        topic="harness是什么",
+        claim=(
+            "Agent harness 是模型外侧的工程控制层，负责上下文组装、工具权限、状态检查点、"
+            "评测回放和失败恢复。"
+        ),
+        applies_when="Use when researching agent harness architecture and replayable evals.",
+        evidence=[
+            DomainKnowledgeEvidence(
+                title="Agent harness architecture",
+                url="https://example.com/agent-harness-architecture",
+                provider="example",
+                retrieved_at=now,
+            ),
+            DomainKnowledgeEvidence(
+                title="Agent harness replay evaluation",
+                url="https://example.com/agent-harness-evals",
+                provider="example",
+                retrieved_at=now,
+            ),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-harness"],
+        fingerprint="validated-agent-harness-candidate-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+    DomainKnowledgeCandidateService(store).validate(candidate.id)
+    runtime = KnowledgeContextRuntime()
+    service = DailyBriefingService(
+        store,
+        HarnessSearchClient(),
+        runtime=runtime,
+        max_queries=30,
+        results_per_query=2,
+        max_sources=6,
+        model_max_sources=2,
+    )
+
+    briefing = service.run("harness是什么", "u-1", "c-1", run_date=date(2026, 8, 13))
+
+    assert runtime.planning_context is not None
+    planning_context = runtime.planning_context["knowledge_context"]
+    assert any(hit["entity_id"] == "harness-engineering" for hit in planning_context["reviewed_graph_hits"])
+    assert [item["id"] for item in planning_context["validated_candidates"]] == [candidate.id]
+    assert runtime.synthesis_context is not None
+    assert runtime.synthesis_context["knowledge_context"]["validated_candidates"][0]["id"] == candidate.id
+    assert any(direction.startswith("知识图谱补充:") for direction in briefing.search_directions)
+    assert any(direction.startswith("自进化知识补充:") for direction in briefing.search_directions)
+    plan_trace = next(event for event in store.list_trace_events() if event["name"] == "plan_queries")
+    assert plan_trace["metadata"]["knowledge_context"]["reviewed_graph_hits"] >= 1
+    assert plan_trace["metadata"]["knowledge_context"]["validated_candidates"] == 1
 
 
 def test_case_feedback_uses_public_index_context_before_the_next_planning_step(tmp_path):
@@ -785,7 +900,15 @@ def test_glm_briefing_synthesis_validates_text_json_against_collected_urls():
         return json.dumps(output)
 
     runtime = GLMPydanticAIRuntime(api_key="test-key", agent_runner=runner)
-    synthesis = runtime.synthesize_briefing("industrial AI", [source], {"report_contract": {}, "report_skill": "contract"})
+    synthesis = runtime.synthesize_briefing(
+        "industrial AI",
+        [source],
+        {
+            "report_contract": {},
+            "report_skill": "contract",
+            "knowledge_context": {"reviewed_graph_hits": [{"entity_id": "mes"}]},
+        },
+    )
 
     assert synthesis.themes[0].source_urls == [source.url]
     assert _is_substantive_synthesis(synthesis) is True
@@ -794,6 +917,7 @@ def test_glm_briefing_synthesis_validates_text_json_against_collected_urls():
     assert "detailed_summary" in calls[0][3]
     assert "input form" in calls[0][3]
     assert "industry-wide claim" in calls[0][3]
+    assert json.loads(calls[0][4])["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
 
     retry_calls = []
 
@@ -883,8 +1007,13 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
         agent_runner=runner,
     )
 
-    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": []})
-    synthesis = runtime.synthesize_briefing("industrial AI", [source], {"report_contract": {}, "report_skill": "contract"})
+    knowledge_context = {"reviewed_graph_hits": [{"entity_id": "mes"}]}
+    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": [], "knowledge_context": knowledge_context})
+    synthesis = runtime.synthesize_briefing(
+        "industrial AI",
+        [source],
+        {"report_contract": {}, "report_skill": "contract", "knowledge_context": knowledge_context},
+    )
 
     assert queries == ["industrial AI MES workflow architecture"]
     assert synthesis.themes[0].source_urls == [source.url]
@@ -895,7 +1024,9 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
     assert calls[1]["model"] == "deepseek-v4-flash"
     assert calls[1]["base_url"] == "https://api.deepseek.com"
     assert "Return ONLY one valid JSON object" in str(calls[1]["instructions"])
+    assert json.loads(str(calls[0]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
     assert json.loads(str(calls[1]["prompt"]))["sources"][0]["url"] == source.url
+    assert json.loads(str(calls[1]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
 
 
 def test_glm_provider_selects_the_pydantic_ai_runtime():
