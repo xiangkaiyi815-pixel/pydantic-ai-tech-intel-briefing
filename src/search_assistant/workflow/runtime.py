@@ -12,6 +12,9 @@ from search_assistant.config import Settings
 from search_assistant.contracts import BriefingSynthesis, CollectedSource
 
 
+BRIEFING_MODEL_SEARCH_PLAN_LIMIT = 20
+
+
 _UNSUPPORTED_SCOPE_PATTERNS = (
     re.compile(r"(?:行业|领域|市场|严肃的).{0,30}(?:已经|已).{0,20}(?:放弃|淘汰)"),
     re.compile(r"(?<!没有)(?<!未)(?:放弃了|放弃|淘汰)"),
@@ -394,7 +397,7 @@ class DeepSeekChatRuntime:
             "readability": context.get("readability"),
             "briefing_intent": context.get("briefing_intent"),
             "knowledge_context": context.get("knowledge_context", {}),
-            "search_plan": context.get("search_plan", [])[:12],
+            "search_plan": context.get("search_plan", [])[:BRIEFING_MODEL_SEARCH_PLAN_LIMIT],
             "sources": source_payload,
         }
         try:

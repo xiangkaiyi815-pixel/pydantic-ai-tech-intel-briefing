@@ -536,7 +536,7 @@ def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(t
         store,
         HarnessSearchClient(),
         runtime=runtime,
-        max_queries=30,
+        max_queries=20,
         results_per_query=2,
         max_sources=6,
         model_max_sources=2,
@@ -1012,7 +1012,12 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
     synthesis = runtime.synthesize_briefing(
         "industrial AI",
         [source],
-        {"report_contract": {}, "report_skill": "contract", "knowledge_context": knowledge_context},
+        {
+            "report_contract": {},
+            "report_skill": "contract",
+            "knowledge_context": knowledge_context,
+            "search_plan": [("technical", f"query-{index}") for index in range(25)],
+        },
     )
 
     assert queries == ["industrial AI MES workflow architecture"]
@@ -1027,6 +1032,7 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
     assert json.loads(str(calls[0]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
     assert json.loads(str(calls[1]["prompt"]))["sources"][0]["url"] == source.url
     assert json.loads(str(calls[1]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
+    assert len(json.loads(str(calls[1]["prompt"]))["search_plan"]) == 20
 
 
 def test_glm_provider_selects_the_pydantic_ai_runtime():
