@@ -43,6 +43,15 @@ REPORT_CONTRACT = {
         "原文链接",
     ],
     "detail_sections": "模型按本轮证据自行组织 2 至 5 个分析块，不使用固定技术地图模板。",
+    "readability": {
+        "keep_existing_headings": True,
+        "target_total_chars": "3500-4500",
+        "short_summary_chars": "120-220",
+        "detail_block_paragraphs": "1-2",
+        "detail_paragraph_chars": "160-220",
+        "preserve_original_urls": True,
+        "forbidden_fixed_labels": ["结论：", "依据：", "意义："],
+    },
 }
 
 REPORT_SKILL_PATH = Path(__file__).resolve().parents[3] / "skills" / "content-collection-report" / "SKILL.md"
@@ -1077,6 +1086,7 @@ class DailyBriefingService:
                         "report_contract": REPORT_CONTRACT,
                         "report_skill": _load_report_skill(),
                         "search_plan": search_plan,
+                        "readability": REPORT_CONTRACT["readability"],
                     },
                 )
             except Exception:
@@ -1341,6 +1351,7 @@ class DailyBriefingService:
             synthesis.themes,
             key_signal_interpretation=synthesis.key_signal_interpretation,
         )
+        detailed_summary = self._compact_detailed_summary_body(detailed_summary)
         lines.extend(detailed_summary.splitlines())
         lines.extend(
             [
@@ -1360,6 +1371,106 @@ class DailyBriefingService:
         for index, source in enumerate(briefing.sources, start=1):
             lines.append(f"{index}. [{source.title}]({source.url}) | {source.platform} | 重要度 {source.importance_score:.1f}")
         return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _compact_detailed_summary_body(
+        cls,
+        markdown: str,
+        *,
+        max_paragraph_chars: int = 220,
+        max_paragraphs_per_heading: int = 2,
+    ) -> str:
+        """Shorten detailed-summary prose while preserving model-selected headings."""
+        lines = markdown.splitlines()
+        blocks: list[tuple[str, list[str]]] = []
+        current_heading: str | None = None
+        current_body: list[str] = []
+        preamble: list[str] = []
+
+        for line in lines:
+            if line.startswith("### "):
+                if current_heading is not None:
+                    blocks.append((current_heading, current_body))
+                elif current_body:
+                    preamble.extend(current_body)
+                current_heading = line
+                current_body = []
+            else:
+                current_body.append(line)
+        if current_heading is not None:
+            blocks.append((current_heading, current_body))
+        elif current_body:
+            preamble.extend(current_body)
+
+        seen_sentences: set[str] = set()
+        output: list[str] = []
+        if preamble:
+            output.extend(cls._compact_body_lines(preamble, seen_sentences, max_paragraph_chars, 1))
+        for heading, body in blocks:
+            compact_body = cls._compact_body_lines(
+                body,
+                seen_sentences,
+                max_paragraph_chars,
+                max_paragraphs_per_heading,
+            )
+            output.append(heading)
+            output.extend(compact_body or ["本节材料较少，保留为待核验线索。"])
+            output.append("")
+        return "\n".join(output).strip()
+
+    @classmethod
+    def _compact_body_lines(
+        cls,
+        lines: list[str],
+        seen_sentences: set[str],
+        max_paragraph_chars: int,
+        max_paragraphs: int,
+    ) -> list[str]:
+        text = "\n".join(lines).strip()
+        if not text:
+            return []
+        paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+        compact: list[str] = []
+        for paragraph in paragraphs:
+            shortened = cls._compact_paragraph_without_repetition(
+                paragraph,
+                seen_sentences,
+                max_chars=max_paragraph_chars,
+            )
+            if shortened:
+                compact.append(shortened)
+            if len(compact) >= max_paragraphs:
+                break
+        return compact
+
+    @staticmethod
+    def _compact_paragraph_without_repetition(
+        paragraph: str,
+        seen_sentences: set[str],
+        *,
+        max_chars: int,
+    ) -> str:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[。！？；;])", " ".join(paragraph.split()))
+            if sentence.strip()
+        ]
+        if not sentences:
+            sentences = [" ".join(paragraph.split()).strip()]
+        kept: list[str] = []
+        for sentence in sentences:
+            fingerprint = re.sub(r"\W+", "", sentence.lower())[:60]
+            if fingerprint and fingerprint in seen_sentences:
+                continue
+            if fingerprint:
+                seen_sentences.add(fingerprint)
+            if len("".join(kept)) + len(sentence) > max_chars and kept:
+                break
+            kept.append(sentence)
+        text = "".join(kept) or sentences[0]
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip("，,；;。 ") + "…"
+        return text
 
     @staticmethod
     def _normalize_url(url: str) -> str:

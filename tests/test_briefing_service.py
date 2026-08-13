@@ -515,6 +515,40 @@ def test_daily_briefing_keeps_model_selected_detail_structure_without_injecting_
     assert "### 模型不直接控制设备，而是生成受控的工单候选" in briefing.markdown
 
 
+def test_detailed_summary_compaction_preserves_headings_without_fixed_template_labels():
+    long_first = (
+        "Harness 在这里不是模型本身，而是模型之外的控制层。"
+        "它负责上下文整理、工具调用、状态保存、输出校验和失败恢复。"
+        "Harness 在这里不是模型本身，而是模型之外的控制层。"
+        "如果继续展开，还会涉及观测、回放、权限和部署边界。"
+    )
+    long_second = (
+        "持续交付语境里的 Harness.io 更偏发布流水线、健康检查和回滚。"
+        "它和 AI Agent harness 共享外围控制思想，但对象不是同一个。"
+        "因此报告需要区分语境，不能把所有来源合并成单一架构。"
+    )
+    original = (
+        "### Agent Harness：把不可靠的模型放进确定性执行环境\n"
+        f"{long_first}\n\n{long_first}\n\n"
+        "### Harness.io 作为发布稳定性 harness\n"
+        f"{long_second}\n\n{long_second}"
+    )
+
+    compacted = DailyBriefingService._compact_detailed_summary_body(
+        original,
+        max_paragraph_chars=120,
+        max_paragraphs_per_heading=1,
+    )
+
+    assert "### Agent Harness：把不可靠的模型放进确定性执行环境" in compacted
+    assert "### Harness.io 作为发布稳定性 harness" in compacted
+    assert compacted.count("### ") == 2
+    assert "- 结论：" not in compacted
+    assert "- 依据：" not in compacted
+    assert "- 意义：" not in compacted
+    assert len(compacted) < len(original)
+
+
 def test_cad_topic_filter_rejects_generic_ai_content_and_keeps_engineering_evidence():
     topic = "AI 3D CAD engineering drawing"
     query = "text-to-CAD parametric modeling B-Rep evaluation"
