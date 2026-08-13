@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 import re
@@ -55,6 +56,221 @@ REPORT_CONTRACT = {
 }
 
 REPORT_SKILL_PATH = Path(__file__).resolve().parents[3] / "skills" / "content-collection-report" / "SKILL.md"
+
+
+@dataclass(frozen=True)
+class BriefingIntentProfile:
+    primary_intent: str
+    label: str
+    summary: str
+    search_focus: tuple[str, ...]
+    synthesis_focus: tuple[str, ...]
+    keyword_hints: tuple[str, ...]
+    query_templates: tuple[str, ...]
+
+    def model_dump(self) -> dict[str, object]:
+        return {
+            "primary_intent": self.primary_intent,
+            "label": self.label,
+            "summary": self.summary,
+            "search_focus": list(self.search_focus),
+            "synthesis_focus": list(self.synthesis_focus),
+            "keyword_hints": list(self.keyword_hints),
+            "query_templates": list(self.query_templates),
+        }
+
+
+_INTENT_PROFILES: dict[str, BriefingIntentProfile] = {
+    "concept_explanation": BriefingIntentProfile(
+        primary_intent="concept_explanation",
+        label="概念解释",
+        summary="用户更像是在问一个概念、术语或产品是什么，报告应先讲清定义、边界和常见语境。",
+        search_focus=("定义与官方说明", "概念边界", "典型使用场景", "易混淆对象"),
+        synthesis_focus=("先用通俗语言解释概念", "区分不同语境下的含义", "避免直接扩展成产业综述"),
+        keyword_hints=("定义", "概念边界", "典型语境", "易混淆点"),
+        query_templates=(
+            "{topic} definition concept technical context",
+            "{topic} official documentation architecture overview",
+            "{topic} use cases terminology common misconceptions",
+        ),
+    ),
+    "technical_tracking": BriefingIntentProfile(
+        primary_intent="technical_tracking",
+        label="技术追踪",
+        summary="用户更像是在跟踪某项技术，报告应关注实现路线、论文/开源、评测和部署边界。",
+        search_focus=("技术架构", "论文与开源", "评测基准", "部署接口"),
+        synthesis_focus=("提炼实现机制", "说明可验证证据", "指出评测和工程边界"),
+        keyword_hints=("技术架构", "开源项目", "论文", "评测", "部署"),
+        query_templates=(
+            "{topic} technical architecture implementation evaluation",
+            "{topic} open source repository paper dataset benchmark",
+            "{topic} deployment workflow data interface case study",
+        ),
+    ),
+    "industry_trend": BriefingIntentProfile(
+        primary_intent="industry_trend",
+        label="产业趋势",
+        summary="用户更像是在看产业发展，报告应把政策、市场、企业动作和真实落地证据分开讲。",
+        search_focus=("政策与市场", "产业链与生态", "公司/产品动作", "真实落地案例"),
+        synthesis_focus=("区分宏观信号和工程证据", "避免把宣传材料当成落地结论", "给出产业判断边界"),
+        keyword_hints=("政策", "产业链", "市场规模", "企业动作", "落地案例"),
+        query_templates=(
+            "{topic} policy market industry chain report",
+            "{topic} company product release investment adoption",
+            "{topic} case study deployment metrics ecosystem",
+        ),
+    ),
+    "engineering_landing": BriefingIntentProfile(
+        primary_intent="engineering_landing",
+        label="工程落地",
+        summary="用户更像是在找怎么落地，报告应关注架构、接口、数据流、验收指标和失败回滚。",
+        search_focus=("系统架构", "接口与数据流", "部署验证", "回滚与运维"),
+        synthesis_focus=("还原端到端链路", "明确集成点和约束", "优先输出可执行建议"),
+        keyword_hints=("系统架构", "接口", "数据流", "验证", "回滚"),
+        query_templates=(
+            "{topic} architecture integration workflow data interface",
+            "{topic} deployment operations validation rollback",
+            "{topic} case study implementation metrics",
+        ),
+    ),
+    "comparison_decision": BriefingIntentProfile(
+        primary_intent="comparison_decision",
+        label="对比选型",
+        summary="用户更像是在比较方案，报告应给出差异、取舍、适用场景和选型判断。",
+        search_focus=("方案差异", "评测对比", "迁移成本", "适用场景"),
+        synthesis_focus=("按决策维度比较", "说明证据支持和缺口", "给出低风险选择建议"),
+        keyword_hints=("对比", "差异", "适用场景", "选型", "限制"),
+        query_templates=(
+            "{topic} comparison architecture tradeoffs benchmark",
+            "{topic} vs official documentation differences",
+            "{topic} migration decision criteria limitations",
+        ),
+    ),
+}
+
+
+_DEFAULT_BRIEFING_INTENT = _INTENT_PROFILES["technical_tracking"]
+
+
+def _has_intent_marker(text: str, compact_text: str, markers: tuple[str, ...]) -> bool:
+    for marker in markers:
+        normalized_marker = marker.lower()
+        compact_marker = normalized_marker.replace(" ", "")
+        if normalized_marker in text or compact_marker in compact_text:
+            return True
+    return False
+
+
+def _classify_briefing_intent(
+    topic: str,
+    feedback: list[dict[str, object]] | None = None,
+) -> BriefingIntentProfile:
+    feedback_text = " ".join(str(item.get("body") or "") for item in (feedback or [])[:3])
+    text = f"{topic} {feedback_text}".lower()
+    compact_text = re.sub(r"\s+", "", text)
+
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "对比",
+            "比较",
+            "区别",
+            "差异",
+            "哪个",
+            "选型",
+            "vs",
+            "versus",
+            "compare",
+            "comparison",
+            "tradeoff",
+            "better",
+            "which",
+        ),
+    ):
+        return _INTENT_PROFILES["comparison_decision"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "是什么",
+            "什么是",
+            "解释",
+            "概念",
+            "入门",
+            "介绍一下",
+            "what is",
+            "define",
+            "definition",
+            "meaning",
+        ),
+    ):
+        return _INTENT_PROFILES["concept_explanation"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "部署",
+            "接入",
+            "落地",
+            "架构",
+            "方案",
+            "工作流",
+            "接口",
+            "集成",
+            "生产",
+            "workflow",
+            "architecture",
+            "deployment",
+            "deploy",
+            "integration",
+            "implementation",
+            "case study",
+        ),
+    ):
+        return _INTENT_PROFILES["engineering_landing"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "产业",
+            "发展",
+            "趋势",
+            "政策",
+            "市场",
+            "投融资",
+            "公司",
+            "生态",
+            "industry",
+            "market",
+            "trend",
+            "policy",
+            "investment",
+            "business",
+            "development",
+        ),
+    ):
+        return _INTENT_PROFILES["industry_trend"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "技术",
+            "论文",
+            "模型",
+            "大模型",
+            "开源",
+            "评测",
+            "benchmark",
+            "paper",
+            "repository",
+            "open source",
+            "model",
+            "dataset",
+        ),
+    ):
+        return _INTENT_PROFILES["technical_tracking"]
+    return _DEFAULT_BRIEFING_INTENT
 
 
 CHANNEL_QUERIES: tuple[tuple[str, str], ...] = (
@@ -495,7 +711,10 @@ def _has_cad_anchor(title: str, snippet: str) -> bool:
     return False
 
 
-def _deterministic_technical_queries(topic: str) -> list[str]:
+def _deterministic_technical_queries(
+    topic: str,
+    intent: BriefingIntentProfile | None = None,
+) -> list[str]:
     if _is_cad_topic(topic):
         return [
             "Text-to-CAD parametric B-Rep generation open source evaluation",
@@ -504,11 +723,8 @@ def _deterministic_technical_queries(topic: str) -> list[str]:
             "CAD copilot sketch constraint solving feature modeling architecture",
             "B-Rep topology validation geometric constraints manufacturability generated CAD",
         ]
-    return [
-        f"{topic} technical architecture implementation evaluation",
-        f"{topic} open source repository paper dataset benchmark",
-        f"{topic} deployment workflow data interface case study",
-    ]
+    profile = intent or _DEFAULT_BRIEFING_INTENT
+    return [template.format(topic=topic) for template in profile.query_templates]
 
 
 def _duration_ms(started: float) -> float:
@@ -567,7 +783,8 @@ class DailyBriefingService:
             subscription = self.store.upsert_topic(user_id, chat_id, topic)
             self._ensure_project_state()
             feedback = self.store.list_topic_feedback(subscription.id)
-            search_plan = self.build_search_plan(subscription, feedback)
+            briefing_intent = _classify_briefing_intent(subscription.topic, feedback)
+            search_plan = self.build_search_plan(subscription, feedback, intent=briefing_intent)
             self._record_trace_event(
                 run_id,
                 "briefing",
@@ -575,6 +792,8 @@ class DailyBriefingService:
                 phase_started,
                 metadata={
                     "topic": subscription.topic,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
                 },
@@ -585,6 +804,7 @@ class DailyBriefingService:
                 "planned",
                 payload={
                     "topic_id": subscription.id,
+                    "briefing_intent": briefing_intent.model_dump(),
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
                     "queries": [query for _, query in search_plan[:8]],
@@ -625,6 +845,7 @@ class DailyBriefingService:
                 ranked_sources[: self.model_max_sources],
                 search_plan,
                 fallback_sources=ranked_sources,
+                briefing_intent=briefing_intent,
             )
             self._record_trace_event(
                 run_id,
@@ -633,6 +854,8 @@ class DailyBriefingService:
                 phase_started,
                 metadata={
                     "topic": subscription.topic,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
                     "model_source_count": min(len(ranked_sources), self.model_max_sources),
                     "theme_count": len(synthesis.themes),
                     "used_runtime": self.runtime is not None,
@@ -658,7 +881,7 @@ class DailyBriefingService:
                 topic=subscription.topic,
                 run_date=resolved_date,
                 search_directions=[f"{platform}: {query}" for platform, query in search_plan],
-                keywords=self._keywords(subscription.topic, feedback, search_plan),
+                keywords=self._keywords(subscription.topic, feedback, search_plan, intent=briefing_intent),
                 sources=ranked_sources,
                 synthesis=synthesis,
                 markdown="",
@@ -712,6 +935,8 @@ class DailyBriefingService:
                 metadata={
                     "run_id": run_id,
                     "topic_id": subscription.id,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
                     "candidate_count": len(candidate_ids),
@@ -729,6 +954,8 @@ class DailyBriefingService:
                 metadata={
                     "topic": subscription.topic,
                     "status": "completed",
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
                 },
@@ -767,7 +994,9 @@ class DailyBriefingService:
         self,
         subscription: TopicSubscription,
         feedback: list[dict[str, object]],
+        intent: BriefingIntentProfile | None = None,
     ) -> list[tuple[str, str]]:
+        briefing_intent = intent or _classify_briefing_intent(subscription.topic, feedback)
         plans: list[tuple[str, str]] = []
         if self.runtime is not None:
             try:
@@ -776,13 +1005,17 @@ class DailyBriefingService:
                     {
                         "feedback": feedback[:5],
                         "channels": [platform for platform, _ in CHANNEL_QUERIES],
+                        "briefing_intent": briefing_intent.model_dump(),
                         "report_skill": _load_report_skill(),
                     },
                 )
             except Exception:
                 generated = []
             plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
-        plans.extend(("技术路线（确定性保障）", query) for query in _deterministic_technical_queries(subscription.topic))
+        plans.extend(
+            ("技术路线（确定性保障）", query)
+            for query in _deterministic_technical_queries(subscription.topic, briefing_intent)
+        )
 
         for item in feedback[:3]:
             note = " ".join(str(item.get("body") or "").split())
@@ -1076,6 +1309,7 @@ class DailyBriefingService:
         sources: list[CollectedSource],
         search_plan: list[tuple[str, str]],
         fallback_sources: list[CollectedSource] | None = None,
+        briefing_intent: BriefingIntentProfile | None = None,
     ) -> BriefingSynthesis:
         if self.runtime is not None:
             try:
@@ -1087,6 +1321,7 @@ class DailyBriefingService:
                         "report_skill": _load_report_skill(),
                         "search_plan": search_plan,
                         "readability": REPORT_CONTRACT["readability"],
+                        "briefing_intent": briefing_intent.model_dump() if briefing_intent else None,
                     },
                 )
             except Exception:
@@ -1516,8 +1751,11 @@ class DailyBriefingService:
         topic: str,
         feedback: list[dict[str, object]],
         search_plan: list[tuple[str, str]],
+        intent: BriefingIntentProfile | None = None,
     ) -> list[str]:
         candidates = [topic]
+        if intent is not None:
+            candidates.extend(intent.keyword_hints)
         candidates.extend(
             query
             for platform, query in search_plan

@@ -345,6 +345,12 @@ class DeepSeekChatRuntime:
             "Return ONLY one valid JSON object with exactly these keys: search_content_summary, short_summary, "
             "detailed_summary, themes, key_signal_interpretation, analysis_judgment, next_search_directions, "
             "landing_suggestions. "
+            "If briefing_intent is present, keep the required report headings unchanged but adapt the emphasis: "
+            "concept_explanation defines the concept and boundaries first; technical_tracking focuses on "
+            "models, papers, repositories, benchmarks, and deployment limits; industry_trend separates policy, "
+            "market, ecosystem, and implementation evidence; engineering_landing follows architecture, "
+            "interfaces, data flow, validation, rollout, and rollback; comparison_decision compares tradeoffs, "
+            "decision criteria, limitations, and suitable scenarios. "
             "short_summary must be a 120-220 Chinese-character executive technical brief: state what this batch is "
             "actually building and name the evidenced implementation path, such as the input form, representation or "
             "model, transformation/tool chain, integration point, and validation/control mechanism. It must contrast "
@@ -379,6 +385,7 @@ class DeepSeekChatRuntime:
             "report_contract": context.get("report_contract"),
             "report_skill": context.get("report_skill"),
             "readability": context.get("readability"),
+            "briefing_intent": context.get("briefing_intent"),
             "search_plan": context.get("search_plan", [])[:12],
             "sources": source_payload,
         }
@@ -740,6 +747,9 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
             "接口、确定性校验、评估缺口或工程取舍展开。禁止使用“本轮技术主题地图”“核心技术提炼”“重点线索解读”作为标题。"
             "拒绝标题串烧和泛泛表述；短总结需要给出跨来源共同的实现路径与关键差异。"
             "在不改变自选小标题的前提下压缩正文：每个小标题下写 1-2 个短段落，不使用“结论：”“依据：”“意义：”等固定字段。"
+            "如果 briefing_intent 存在，保留报告固定小标题，只调整关注点：概念解释先讲定义和边界；技术追踪优先模型、"
+            "论文、开源、评测和部署限制；产业趋势区分政策、市场、生态和真实落地证据；工程落地关注架构、接口、"
+            "数据流、验证、上线和回滚；对比选型给出取舍、限制和适用场景。"
         )
         instructions += (
             " themes 仅用于可追溯的证据锚点，返回 1 至 5 个，每个主题包含名称、至少 45 字的技术判断和一个或多个输入 URL。"
@@ -769,6 +779,7 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
                                 "report_contract": context.get("report_contract"),
                                 "report_skill": context.get("report_skill"),
                                 "readability": context.get("readability"),
+                                "briefing_intent": context.get("briefing_intent"),
                                 "sources": [source.model_dump(mode="json") for source in sources],
                             },
                             ensure_ascii=False,

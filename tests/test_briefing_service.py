@@ -1,7 +1,12 @@
 from datetime import date
 import json
 import time
-from search_assistant.briefing.service import DailyBriefingService, REPORT_SKILL_PATH, _is_substantive_synthesis
+from search_assistant.briefing.service import (
+    DailyBriefingService,
+    REPORT_SKILL_PATH,
+    _classify_briefing_intent,
+    _is_substantive_synthesis,
+)
 from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, IncomingMessage
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
@@ -179,9 +184,11 @@ class SourceLimitRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
         self.synthesis_source_count = 0
+        self.synthesis_context: dict[str, object] | None = None
 
     def synthesize_briefing(self, topic, sources, context):
         self.synthesis_source_count = len(sources)
+        self.synthesis_context = context
         return None
 
 
@@ -367,6 +374,35 @@ def test_marketing_filter_keeps_technical_public_account_posts():
     )
 
 
+def test_briefing_intent_classifies_common_user_questions():
+    assert _classify_briefing_intent("harness是什么").primary_intent == "concept_explanation"
+    assert _classify_briefing_intent("人工智能产业发展").primary_intent == "industry_trend"
+    assert _classify_briefing_intent("具身智能技术").primary_intent == "technical_tracking"
+    assert _classify_briefing_intent("LangGraph vs Pydantic AI 选型").primary_intent == "comparison_decision"
+
+
+def test_concept_intent_changes_deterministic_queries_without_dropping_channels(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, RecordingSearchClient(), max_queries=20)
+    subscription = store.upsert_topic("u-1", "c-1", "harness是什么")
+
+    plan = service.build_search_plan(subscription, [])
+    deterministic_queries = [query for platform, query in plan if "确定性保障" in platform]
+    keywords = DailyBriefingService._keywords(
+        subscription.topic,
+        [],
+        plan,
+        intent=_classify_briefing_intent(subscription.topic),
+    )
+
+    assert any("definition" in query.lower() for query in deterministic_queries)
+    assert any(platform == "全球网页" for platform, _ in plan)
+    assert any(platform == "YouTube" for platform, _ in plan)
+    assert "概念边界" in keywords
+    assert "典型语境" in keywords
+
+
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -401,6 +437,7 @@ def test_daily_briefing_uses_model_planned_technical_queries_and_static_skill(tm
     assert "predictive maintenance time-series anomaly detection evaluation" in search.queries
     assert "LinkedIn industrial AI discussion" not in briefing.keywords
     assert runtime.briefing_context is not None
+    assert runtime.briefing_context["briefing_intent"]["primary_intent"] == "technical_tracking"
     assert "内容搜集报告" in str(runtime.briefing_context["report_skill"])
     assert REPORT_SKILL_PATH.exists()
 
@@ -457,6 +494,8 @@ def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp
     briefing = service.run("人工智能产业发展", "u-1", "c-1", run_date=date(2026, 8, 8))
 
     assert runtime.synthesis_source_count == 2
+    assert runtime.synthesis_context is not None
+    assert runtime.synthesis_context["briefing_intent"]["primary_intent"] == "industry_trend"
     assert len(briefing.sources) == 5
     assert "保留了 5 条公开线索" in briefing.synthesis.search_content_summary
     assert "### 政策、规模与产业链信号" in briefing.synthesis.detailed_summary
