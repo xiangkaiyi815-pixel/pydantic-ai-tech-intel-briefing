@@ -91,6 +91,10 @@ class Settings(BaseModel):
     searxng_timeout_seconds: float = 12.0
     mcp_search_config_path: Path | None = None
     mcp_search_timeout_seconds: float = 18.0
+    agent_reach_enabled: bool = False
+    agent_reach_command: str = "agent-reach"
+    agent_reach_timeout_seconds: float = 30.0
+    agent_reach_doctor_cache_seconds: float = 300.0
     domestic_rss_base_url: str = "http://127.0.0.1:1200"
     domestic_rss_config_path: Path | None = None
     domestic_rss_timeout_seconds: float = 8.0
@@ -160,6 +164,10 @@ class Settings(BaseModel):
                 else None
             ),
             "mcp_search_timeout_seconds": _to_float(source.get("MCP_SEARCH_TIMEOUT_SECONDS"), 18.0),
+            "agent_reach_enabled": _to_bool(source.get("SEARCH_ASSISTANT_AGENT_REACH_ENABLED"), default=False),
+            "agent_reach_command": source.get("AGENT_REACH_COMMAND", "agent-reach"),
+            "agent_reach_timeout_seconds": _to_float(source.get("AGENT_REACH_TIMEOUT_SECONDS"), 30.0),
+            "agent_reach_doctor_cache_seconds": _to_float(source.get("AGENT_REACH_DOCTOR_CACHE_SECONDS"), 300.0),
             "domestic_rss_base_url": source.get("RSSHUB_BASE_URL", "http://127.0.0.1:1200"),
             "domestic_rss_config_path": (
                 Path(source["SEARCH_ASSISTANT_DOMESTIC_RSS_CONFIG"])
