@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,7 +19,7 @@ from threading import Lock
 from typing import Any, Protocol
 
 from search_assistant.config import Settings
-from search_assistant.contracts import SourceEvidence
+from search_assistant.contracts import ProviderTraceEvent, SourceEvidence
 
 
 SearchResult = SourceEvidence
@@ -32,6 +33,12 @@ class SearchClient(Protocol):
 
 class SearchProviderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    results: list[SearchResult]
+    provider_events: list[ProviderTraceEvent]
 
 
 @dataclass(frozen=True)
@@ -63,25 +70,52 @@ class McpSearchClient:
         self._call_lock = Lock()
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
         with self._call_lock:
-            return _run_async_from_sync(lambda: self._search_async(query, limit))
+            return _run_async_from_sync(lambda: self._search_async_with_events(query, limit))
 
     async def _search_async(self, query: str, limit: int) -> list[SearchResult]:
+        return (await self._search_async_with_events(query, limit)).results
+
+    async def _search_async_with_events(self, query: str, limit: int) -> SearchOutcome:
         merged: list[SearchResult] = []
         seen: set[str] = set()
+        provider_events: list[ProviderTraceEvent] = []
         scoped_domains = _site_domains(query)
         for binding in self.bindings:
+            provider = f"mcp:{binding.name}"
             if scoped_domains and not _binding_supports_scoped_domains(binding, scoped_domains):
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="skipped",
+                        reason="site_query_not_bound_to_mcp_source",
+                    )
+                )
                 continue
+            started = time.monotonic()
             try:
                 payload = _materialize_mcp_arguments(binding.argument_template, query, limit)
                 raw_result = await asyncio.wait_for(
                     binding.toolset.direct_call_tool(binding.tool_name, payload),
                     timeout=self.timeout_seconds,
                 )
-            except Exception:
+            except Exception as exc:
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
                 continue
 
+            binding_results: list[SearchResult] = []
             for result in _mcp_results_to_search_results(raw_result, binding.name):
                 if scoped_domains and not _matches_scoped_domains(result.url, scoped_domains):
                     continue
@@ -89,10 +123,29 @@ class McpSearchClient:
                 if key in seen:
                     continue
                 seen.add(key)
+                binding_results.append(result)
                 merged.append(result)
                 if len(merged) >= limit:
-                    return merged
-        return merged
+                    provider_events.append(
+                        _provider_event(
+                            provider=provider,
+                            query=query,
+                            status="success",
+                            result_count=len(binding_results),
+                            elapsed_ms=_elapsed_ms(started),
+                        )
+                    )
+                    return SearchOutcome(merged, provider_events)
+            provider_events.append(
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if binding_results else "empty",
+                    result_count=len(binding_results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
+        return SearchOutcome(merged, provider_events)
 
     def health(self) -> dict[str, object]:
         return {
@@ -164,25 +217,46 @@ class CompositeSearchClient:
         self.primary_sufficient_results = primary_sufficient_results
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
         merged: list[SearchResult] = []
         seen: set[str] = set()
+        provider_events: list[ProviderTraceEvent] = []
         for index, client in enumerate(self.clients):
-            try:
-                candidates = client.search(query, limit=limit)
-            except Exception:
-                continue
+            outcome = search_with_provider_events(client, query, limit=limit)
+            provider_events.extend(outcome.provider_events)
+            candidates = outcome.results
             for result in candidates:
                 key = _dedupe_key(result.url)
                 if key in seen:
+                    provider_events.append(
+                        _provider_event(
+                            provider=result.provider,
+                            query=query,
+                            status="skipped",
+                            result_count=0,
+                            reason="duplicate_url",
+                        )
+                    )
                     continue
                 seen.add(key)
                 merged.append(result)
                 if len(merged) >= limit:
-                    return merged
+                    return SearchOutcome(merged, provider_events)
             if index == 0 and self.primary_sufficient_results is not None:
                 if len(merged) >= min(limit, self.primary_sufficient_results):
-                    return merged
-        return merged
+                    provider_events.append(
+                        _provider_event(
+                            provider="composite",
+                            query=query,
+                            status="skipped",
+                            result_count=len(merged),
+                            reason="primary_sufficient_results",
+                        )
+                    )
+                    return SearchOutcome(merged, provider_events)
+        return SearchOutcome(merged, provider_events)
 
 
 class BrowserSearchClient:
@@ -214,16 +288,44 @@ class BrowserSearchClient:
         )
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
+        provider_events: list[ProviderTraceEvent] = []
         scoped_domains = _site_domains(query)
-        supplemental_results = [] if self._requires_baidu_only(scoped_domains) else self._supplemental_results(query, limit)
+        supplemental_results: list[SearchResult] = []
+        if self._requires_baidu_only(scoped_domains):
+            provider_events.append(
+                _provider_event(
+                    provider="browser-supplemental",
+                    query=query,
+                    status="skipped",
+                    reason="baidu_only_scoped_query",
+                )
+            )
+        else:
+            supplemental_start = time.monotonic()
+            supplemental_results = self._supplemental_results(query, limit)
+            provider_events.append(
+                _provider_event(
+                    provider="browser-supplemental",
+                    query=query,
+                    status="success" if supplemental_results else "empty",
+                    result_count=len(supplemental_results),
+                    elapsed_ms=_elapsed_ms(supplemental_start),
+                )
+            )
         merged = self._filter_scoped_results(supplemental_results, scoped_domains)
-        merged.extend(self._scoped_results(query, scoped_domains, limit))
+        scoped_results, scoped_events = self._scoped_results_with_events(query, scoped_domains, limit)
+        provider_events.extend(scoped_events)
+        merged.extend(scoped_results)
         merged = self._dedupe_results(merged, limit)
         seen = {_dedupe_key(result.url) for result in merged}
         if len(merged) >= limit:
-            return merged[:limit]
+            return SearchOutcome(merged[:limit], provider_events)
 
-        engine_results = self._search_engines(query, limit)
+        engine_results, engine_events = self._search_engines_with_events(query, limit)
+        provider_events.extend(engine_events)
 
         max_length = max((len(results) for results in engine_results), default=0)
         for index in range(max_length):
@@ -239,23 +341,63 @@ class BrowserSearchClient:
                 seen.add(key)
                 merged.append(result)
                 if len(merged) >= limit:
-                    return self._enrich_results(query, merged)
-        return self._enrich_results(query, merged)
+                    return SearchOutcome(self._enrich_results(query, merged), provider_events)
+        return SearchOutcome(self._enrich_results(query, merged), provider_events)
 
     def _scoped_results(self, query: str, scoped_domains: tuple[str, ...], limit: int) -> list[SearchResult]:
+        results, _ = self._scoped_results_with_events(query, scoped_domains, limit)
+        return results
+
+    def _scoped_results_with_events(
+        self,
+        query: str,
+        scoped_domains: tuple[str, ...],
+        limit: int,
+    ) -> tuple[list[SearchResult], list[ProviderTraceEvent]]:
         results: list[SearchResult] = []
+        provider_events: list[ProviderTraceEvent] = []
         for domain in scoped_domains:
             client = self.scoped_search_clients.get(domain)
             if client is None:
+                provider_events.append(
+                    _provider_event(
+                        provider=f"scoped:{domain}",
+                        query=query,
+                        status="skipped",
+                        reason="no_explicit_scoped_client",
+                    )
+                )
                 continue
+            started = time.monotonic()
             try:
                 candidates = client.search(query, limit=limit)
-            except Exception:
+            except Exception as exc:
+                provider_events.append(
+                    _provider_event(
+                        provider=_client_provider_name(client),
+                        query=query,
+                        status="error",
+                        reason="scoped_client_error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
                 continue
-            results.extend(result for result in candidates if _matches_scoped_domains(result.url, (domain,)))
+            scoped = [result for result in candidates if _matches_scoped_domains(result.url, (domain,))]
+            provider_events.append(
+                _provider_event(
+                    provider=_client_provider_name(client),
+                    query=query,
+                    status="success" if scoped else "empty",
+                    result_count=len(scoped),
+                    reason=None if scoped else "no_on_domain_results",
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
+            results.extend(scoped)
             if len(results) >= limit:
                 break
-        return results[:limit]
+        return results[:limit], provider_events
 
     @staticmethod
     def _filter_scoped_results(results: list[SearchResult], scoped_domains: tuple[str, ...]) -> list[SearchResult]:
@@ -614,28 +756,76 @@ class BrowserSearchClient:
         )
 
     def _search_engines(self, query: str, limit: int) -> list[list[SearchResult]]:
+        results, _ = self._search_engines_with_events(query, limit)
+        return results
+
+    def _search_engines_with_events(
+        self,
+        query: str,
+        limit: int,
+    ) -> tuple[list[list[SearchResult]], list[ProviderTraceEvent]]:
         engines = self.engines
         if self._requires_baidu_only(_site_domains(query)):
             engines = [engine for engine in engines if isinstance(engine, BaiduBrowserSearchClient)]
         if not engines:
-            return []
+            return [], [
+                _provider_event(
+                    provider="browser-engines",
+                    query=query,
+                    status="skipped",
+                    reason="no_enabled_engine_for_query",
+                )
+            ]
 
         executor = ThreadPoolExecutor(max_workers=len(engines))
-        futures = [executor.submit(engine.search, query, limit) for engine in engines]
-        wait(futures, timeout=self.engine_timeout_seconds)
+        started_at = {engine: time.monotonic() for engine in engines}
+        futures = [(engine, executor.submit(engine.search, query, limit)) for engine in engines]
+        wait([future for _, future in futures], timeout=self.engine_timeout_seconds)
 
         engine_results: list[list[SearchResult]] = []
-        for future in futures:
+        provider_events: list[ProviderTraceEvent] = []
+        for engine, future in futures:
+            provider = _client_provider_name(engine)
+            started = started_at[engine]
             if not future.done():
                 future.cancel()
                 engine_results.append([])
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="timeout",
+                        reason=f"exceeded_{self.engine_timeout_seconds:g}s_budget",
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
                 continue
             try:
-                engine_results.append(future.result())
-            except Exception:
+                results = future.result()
+            except Exception as exc:
                 engine_results.append([])
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
+                continue
+            engine_results.append(results)
+            provider_events.append(
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if results else "empty",
+                    result_count=len(results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
         executor.shutdown(wait=False, cancel_futures=True)
-        return engine_results
+        return engine_results, provider_events
 
     def _enrich_results(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         if not self.enrich_content or self._requires_baidu_only(_site_domains(query)):
@@ -1083,6 +1273,42 @@ class FakeSearchClient:
         return []
 
 
+def search_with_provider_events(client: SearchClient, query: str, limit: int = 5) -> SearchOutcome:
+    traced_search = getattr(client, "search_with_events", None)
+    if callable(traced_search):
+        return traced_search(query, limit=limit)
+
+    provider = _client_provider_name(client)
+    started = time.monotonic()
+    try:
+        results = client.search(query, limit=limit)
+    except Exception as exc:
+        return SearchOutcome(
+            results=[],
+            provider_events=[
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="error",
+                    error=_safe_provider_error(exc),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            ],
+        )
+    return SearchOutcome(
+        results=results,
+        provider_events=[
+            _provider_event(
+                provider=provider,
+                query=query,
+                status="success" if results else "empty",
+                result_count=len(results),
+                elapsed_ms=_elapsed_ms(started),
+            )
+        ],
+    )
+
+
 def search_client_from_settings(settings: Settings) -> SearchClient:
     provider = settings.search_provider.lower()
     if provider == "browser":
@@ -1185,6 +1411,49 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
     return engines
 
 
+def _provider_event(
+    *,
+    provider: str,
+    query: str,
+    status: str,
+    result_count: int = 0,
+    reason: str | None = None,
+    error: str | None = None,
+    elapsed_ms: float | None = None,
+) -> ProviderTraceEvent:
+    return ProviderTraceEvent(
+        provider=provider,
+        query=query,
+        status=status,  # type: ignore[arg-type]
+        result_count=result_count,
+        reason=reason,
+        error=error,
+        elapsed_ms=elapsed_ms,
+        checked_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.monotonic() - started) * 1000, 3)
+
+
+def _safe_provider_error(exc: Exception, max_chars: int = 240) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    for marker in ("api_key", "token", "authorization", "secret", "cookie", "key="):
+        text = re.sub(marker, "[redacted]", text, flags=re.IGNORECASE)
+    return text[:max_chars]
+
+
+def _client_provider_name(client: SearchClient) -> str:
+    if isinstance(client, CompositeSearchClient):
+        return "composite"
+    if isinstance(client, BrowserSearchClient):
+        return "browser"
+    if isinstance(client, McpSearchClient):
+        return "mcp"
+    return _browser_engine_name(client)
+
+
 def _browser_engine_name(engine: SearchClient) -> str:
     if isinstance(engine, BingBrowserSearchClient):
         return "bing"
@@ -1192,6 +1461,16 @@ def _browser_engine_name(engine: SearchClient) -> str:
         return "baidu"
     if isinstance(engine, GoogleBrowserSearchClient):
         return "google"
+    if isinstance(engine, DuckDuckGoSearchClient):
+        return "duckduckgo"
+    if isinstance(engine, BraveSearchClient):
+        return "brave"
+    if isinstance(engine, SearxngSearchClient):
+        return "searxng"
+    if isinstance(engine, BilibiliPublicSearchClient):
+        return "bilibili-public-api"
+    if isinstance(engine, FakeSearchClient):
+        return "fake"
     return type(engine).__name__
 
 
@@ -1513,8 +1792,11 @@ def _mcp_toolset_from_config(
     config_directory: Path,
     timeout_seconds: float,
 ) -> Any:
-    from fastmcp.client.transports import StdioTransport
-    from pydantic_ai.mcp import MCPToolset
+    try:
+        from fastmcp.client.transports import StdioTransport
+        from pydantic_ai.mcp import MCPToolset
+    except ModuleNotFoundError as exc:
+        return _UnavailableMcpToolset(f"MCP dependency is missing: {exc.name}")
 
     expanded_server = _expand_mcp_environment(server)
     raw_url = expanded_server.get("url")
@@ -1557,6 +1839,14 @@ def _mcp_toolset_from_config(
         init_timeout=timeout_seconds,
         read_timeout=timeout_seconds,
     )
+
+
+class _UnavailableMcpToolset:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    async def direct_call_tool(self, name: str, args: dict[str, object]) -> object:
+        raise SearchProviderError(self.reason)
 
 
 def _expand_mcp_environment(value: object) -> object:

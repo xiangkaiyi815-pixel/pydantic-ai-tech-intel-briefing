@@ -1,4 +1,4 @@
-from search_assistant.contracts import AnswerPackage, IncomingMessage, VerifiedClaim
+from search_assistant.contracts import AnswerPackage, IncomingMessage, ProviderTraceEvent, SourceCandidate, VerifiedClaim
 from search_assistant.memory.store import MemoryStore
 
 
@@ -211,3 +211,62 @@ def test_records_experience_items(tmp_path):
     assert rows[0]["title"] == "Verify API claims before replying"
     assert "search first" in rows[0]["body"]
     assert rows[0]["source_ids_json"] == '["q-1", "ev-1"]'
+
+
+def test_records_source_candidates_provider_trace_feedback_signals_and_layered_memory(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    topic = store.upsert_topic("u-1", "c-1", "industrial AI")
+    store.set_topic_source_recipe(topic.id, {"general-web": 3.0, "bilibili": 1.0})
+    refreshed = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    candidate = SourceCandidate(
+        id="cand-1",
+        topic_id=topic.id,
+        user_id="u-1",
+        title="Industrial AI",
+        url="https://example.com/industrial-ai",
+        snippet="Agent connects MES work orders.",
+        platform="web",
+        provider="browser-bing",
+        query="industrial AI",
+        status="accepted",
+        reason="accepted for briefing ranking",
+        relevance_score=2.0,
+        importance_score=8.0,
+        retrieved_at="2026-07-25T00:00:00Z",
+        created_at="2026-07-25T00:00:00Z",
+    )
+    event = ProviderTraceEvent(
+        provider="browser-bing",
+        query="industrial AI",
+        status="success",
+        result_count=1,
+        checked_at="2026-07-25T00:00:00Z",
+    )
+
+    store.record_source_candidate(candidate)
+    store.record_provider_trace_event(event, run_id="brief-1", topic_id=topic.id)
+    signal_id = store.add_topic_feedback_signal(
+        topic.id,
+        "u-1",
+        "c-1",
+        signal_type="style",
+        scope="topic",
+        body="Make the briefing easier to read.",
+        metadata={"feedback_id": "feedback-1"},
+    )
+    memory_id = store.add_layered_memory_item(
+        "preference",
+        "briefing_style_feedback",
+        "Make the briefing easier to read.",
+        source_id=signal_id,
+        user_id="u-1",
+        chat_id="c-1",
+    )
+
+    assert refreshed.source_recipe == {"general-web": 3.0, "bilibili": 1.0}
+    assert store.list_source_candidates(topic_id=topic.id)[0].status == "accepted"
+    assert store.list_provider_trace_events(topic_id=topic.id)[0].provider == "browser-bing"
+    assert store.list_topic_feedback_signals(topic.id)[0].metadata["feedback_id"] == "feedback-1"
+    assert store.list_layered_memory_items("preference", "u-1", "c-1")[0].id == memory_id

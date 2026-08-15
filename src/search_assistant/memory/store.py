@@ -12,6 +12,10 @@ from search_assistant.contracts import (
     CollectedSource,
     DailyBriefing,
     IncomingMessage,
+    LayeredMemoryItem,
+    ProviderTraceEvent,
+    SourceCandidate,
+    TopicFeedbackSignal,
     TopicSubscription,
     VerifiedClaim,
 )
@@ -23,6 +27,20 @@ def _new_id(prefix: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class MemoryStore:
@@ -176,6 +194,66 @@ class MemoryStore:
                     created_at TEXT NOT NULL,
                     UNIQUE(topic_id, run_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS source_candidates (
+                    id TEXT PRIMARY KEY,
+                    topic_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    snippet TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    relevance_score REAL NOT NULL,
+                    importance_score REAL NOT NULL,
+                    retrieved_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_trace_events (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    topic_id TEXT,
+                    provider TEXT NOT NULL,
+                    query_text TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_count INTEGER NOT NULL,
+                    reason TEXT,
+                    error TEXT,
+                    elapsed_ms REAL,
+                    checked_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS layered_memory_items (
+                    id TEXT PRIMARY KEY,
+                    layer TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_feedback_signals (
+                    id TEXT PRIMARY KEY,
+                    topic_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    source_url TEXT,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "memory_items", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
@@ -184,6 +262,7 @@ class MemoryStore:
             self._ensure_column(connection, "experience_items", "chat_id", "TEXT NOT NULL DEFAULT 'legacy'")
             self._ensure_column(connection, "skill_drafts", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
             self._ensure_column(connection, "skill_drafts", "chat_id", "TEXT NOT NULL DEFAULT 'legacy'")
+            self._ensure_column(connection, "topic_subscriptions", "source_recipe_json", "TEXT NOT NULL DEFAULT '{}'")
 
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -543,6 +622,10 @@ class MemoryStore:
             "topic_feedback",
             "collected_sources",
             "daily_briefings",
+            "source_candidates",
+            "provider_trace_events",
+            "layered_memory_items",
+            "topic_feedback_signals",
         )
         with self._connect() as connection:
             return {
@@ -690,6 +773,83 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_topic_source_recipe(self, topic_id: str, source_recipe: dict[str, float]) -> None:
+        payload = {
+            str(key): float(value)
+            for key, value in source_recipe.items()
+            if _is_number(value) and float(value) > 0
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE topic_subscriptions
+                SET source_recipe_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True), _now_iso(), topic_id),
+            )
+
+    def add_topic_feedback_signal(
+        self,
+        topic_id: str,
+        user_id: str,
+        chat_id: str,
+        signal_type: str,
+        scope: str,
+        body: str,
+        source_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        signal_id = _new_id("signal")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO topic_feedback_signals (
+                    id, topic_id, user_id, chat_id, signal_type, scope, body, source_url, metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signal_id,
+                    topic_id,
+                    user_id,
+                    chat_id,
+                    signal_type,
+                    scope,
+                    body,
+                    source_url,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return signal_id
+
+    def list_topic_feedback_signals(self, topic_id: str | None = None, limit: int = 100) -> list[TopicFeedbackSignal]:
+        query = "SELECT * FROM topic_feedback_signals"
+        parameters: tuple[object, ...] = ()
+        if topic_id is not None:
+            query += " WHERE topic_id = ?"
+            parameters = (topic_id,)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        parameters = (*parameters, limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            TopicFeedbackSignal(
+                id=str(row["id"]),
+                topic_id=str(row["topic_id"]),
+                user_id=str(row["user_id"]),
+                chat_id=str(row["chat_id"]),
+                signal_type=str(row["signal_type"]),  # type: ignore[arg-type]
+                scope=str(row["scope"]),  # type: ignore[arg-type]
+                body=str(row["body"]),
+                source_url=row["source_url"],
+                metadata=_json_object(row["metadata_json"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
     def upsert_collected_source(self, source: CollectedSource) -> CollectedSource:
         with self._connect() as connection:
             existing = connection.execute(
@@ -730,6 +890,77 @@ class MemoryStore:
                 ),
             )
         return source.model_copy(update={"id": source_id})
+
+    def record_source_candidate(self, candidate: SourceCandidate) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO source_candidates (
+                    id, topic_id, user_id, title, url, snippet, platform, provider, query_text,
+                    status, reason, relevance_score, importance_score, retrieved_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.id,
+                    candidate.topic_id,
+                    candidate.user_id,
+                    candidate.title,
+                    candidate.url,
+                    candidate.snippet,
+                    candidate.platform,
+                    candidate.provider,
+                    candidate.query,
+                    candidate.status,
+                    candidate.reason,
+                    candidate.relevance_score,
+                    candidate.importance_score,
+                    candidate.retrieved_at,
+                    candidate.created_at,
+                ),
+            )
+
+    def list_source_candidates(
+        self,
+        topic_id: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[SourceCandidate]:
+        query = "SELECT * FROM source_candidates"
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if topic_id is not None:
+            conditions.append("topic_id = ?")
+            parameters.append(topic_id)
+        if status is not None:
+            conditions.append("status = ?")
+            parameters.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            SourceCandidate(
+                id=str(row["id"]),
+                topic_id=str(row["topic_id"]),
+                user_id=str(row["user_id"]),
+                title=str(row["title"]),
+                url=str(row["url"]),
+                snippet=str(row["snippet"]),
+                platform=str(row["platform"]),
+                provider=str(row["provider"]),
+                query=str(row["query_text"]),
+                status=str(row["status"]),  # type: ignore[arg-type]
+                reason=str(row["reason"]),
+                relevance_score=float(row["relevance_score"]),
+                importance_score=float(row["importance_score"]),
+                retrieved_at=str(row["retrieved_at"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     def list_collected_sources(self, topic_id: str, limit: int = 100) -> list[CollectedSource]:
         with self._connect() as connection:
@@ -782,6 +1013,151 @@ class MemoryStore:
                 ),
             )
 
+    def record_provider_trace_event(
+        self,
+        event: ProviderTraceEvent,
+        run_id: str | None = None,
+        topic_id: str | None = None,
+    ) -> str:
+        event_id = _new_id("provider")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_trace_events (
+                    id, run_id, topic_id, provider, query_text, status, result_count,
+                    reason, error, elapsed_ms, checked_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    run_id,
+                    topic_id,
+                    event.provider,
+                    event.query,
+                    event.status,
+                    event.result_count,
+                    event.reason,
+                    event.error,
+                    event.elapsed_ms,
+                    event.checked_at,
+                    _now_iso(),
+                ),
+            )
+        return event_id
+
+    def list_provider_trace_events(
+        self,
+        topic_id: str | None = None,
+        run_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ProviderTraceEvent]:
+        query = "SELECT * FROM provider_trace_events"
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if topic_id is not None:
+            conditions.append("topic_id = ?")
+            parameters.append(topic_id)
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            parameters.append(run_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            ProviderTraceEvent(
+                provider=str(row["provider"]),
+                query=str(row["query_text"]),
+                status=str(row["status"]),  # type: ignore[arg-type]
+                result_count=int(row["result_count"]),
+                reason=row["reason"],
+                error=row["error"],
+                elapsed_ms=float(row["elapsed_ms"]) if row["elapsed_ms"] is not None else None,
+                checked_at=str(row["checked_at"]),
+            )
+            for row in rows
+        ]
+
+    def add_layered_memory_item(
+        self,
+        layer: str,
+        kind: str,
+        content: str,
+        source_id: str,
+        confidence: str = "medium",
+        status: str = "active",
+        user_id: str = "system",
+        chat_id: str = "system",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        item_id = _new_id("layer")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO layered_memory_items (
+                    id, layer, kind, content, source_id, confidence, status,
+                    user_id, chat_id, metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    layer,
+                    kind,
+                    content,
+                    source_id,
+                    confidence,
+                    status,
+                    user_id,
+                    chat_id,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
+        return item_id
+
+    def list_layered_memory_items(
+        self,
+        layer: str | None = None,
+        user_id: str | None = None,
+        chat_id: str | None = None,
+        limit: int = 200,
+    ) -> list[LayeredMemoryItem]:
+        query = "SELECT * FROM layered_memory_items"
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if layer is not None:
+            conditions.append("layer = ?")
+            parameters.append(layer)
+        if user_id is not None and chat_id is not None:
+            conditions.append("((user_id = ? AND chat_id = ?) OR (user_id = 'system' AND chat_id = 'system'))")
+            parameters.extend([user_id, chat_id])
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            LayeredMemoryItem(
+                id=str(row["id"]),
+                layer=str(row["layer"]),  # type: ignore[arg-type]
+                kind=str(row["kind"]),
+                content=str(row["content"]),
+                source_id=str(row["source_id"]),
+                confidence=str(row["confidence"]),  # type: ignore[arg-type]
+                status=str(row["status"]),  # type: ignore[arg-type]
+                user_id=str(row["user_id"]),
+                chat_id=str(row["chat_id"]),
+                metadata=_json_object(row["metadata_json"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
     def latest_daily_briefing(self, topic_id: str) -> DailyBriefing | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -792,12 +1168,19 @@ class MemoryStore:
 
     @staticmethod
     def _topic_from_row(row: sqlite3.Row) -> TopicSubscription:
+        try:
+            source_recipe = json.loads(str(row["source_recipe_json"] or "{}"))
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+            source_recipe = {}
+        if not isinstance(source_recipe, dict):
+            source_recipe = {}
         return TopicSubscription(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
             chat_id=str(row["chat_id"]),
             topic=str(row["topic"]),
             enabled=bool(row["enabled"]),
+            source_recipe={str(key): float(value) for key, value in source_recipe.items() if _is_number(value)},
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )

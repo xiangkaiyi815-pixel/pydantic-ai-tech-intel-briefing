@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 import re
@@ -9,9 +10,18 @@ from typing import Protocol
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, DailyBriefing, TopicSubscription
+from search_assistant.contracts import (
+    BriefingSynthesis,
+    BriefingTheme,
+    CollectedSource,
+    DailyBriefing,
+    ProviderTraceEvent,
+    SourceCandidate,
+    TopicSubscription,
+)
 from search_assistant.memory.store import MemoryStore
-from search_assistant.search.provider import SearchClient, SearchResult
+from search_assistant.search.provider import SearchClient, SearchOutcome, SearchResult, search_with_provider_events
+from search_assistant.search.source_registry import normalize_source_recipe, source_recipe_summary
 
 
 class BriefingRuntime(Protocol):
@@ -25,6 +35,13 @@ class BriefingRuntime(Protocol):
         context: dict[str, object],
     ) -> BriefingSynthesis | None:
         ...
+
+
+@dataclass(frozen=True)
+class BriefingCollectionTrace:
+    sources: list[CollectedSource]
+    source_candidates: list[SourceCandidate]
+    provider_events: list[ProviderTraceEvent]
 
 
 REPORT_CONTRACT = {
@@ -337,6 +354,53 @@ def _deterministic_technical_queries(topic: str) -> list[str]:
     ]
 
 
+def _order_plan_by_source_recipe(
+    plans: list[tuple[str, str]],
+    source_recipe: dict[str, float] | None,
+) -> list[tuple[str, str]]:
+    if not plans:
+        return []
+    if not source_recipe:
+        return plans
+    recipe = normalize_source_recipe(source_recipe)
+    indexed = list(enumerate(plans))
+    return [
+        plan
+        for _, plan in sorted(
+            indexed,
+            key=lambda item: (
+                -recipe.get(_source_slug_for_plan(*item[1]), recipe.get("general-web", 1.0)),
+                item[0],
+            ),
+        )
+    ]
+
+
+def _source_slug_for_plan(platform: str, query: str) -> str:
+    lowered = f"{platform} {query}".lower()
+    if "mp.weixin.qq.com" in lowered or "weixin.qq.com" in lowered:
+        return "wechat-public-index"
+    if "bilibili.com" in lowered or "b站" in lowered or "bilibili" in lowered:
+        return "bilibili"
+    if "zhihu.com" in lowered or "知乎" in lowered:
+        return "zhihu"
+    if "toutiao.com" in lowered or "今日头条" in lowered:
+        return "toutiao-public-index"
+    if "xiaohongshu.com" in lowered or "xhslink.com" in lowered or "小红书" in lowered:
+        return "xiaohongshu-public-index"
+    if "youtube.com" in lowered:
+        return "youtube"
+    if "reddit.com" in lowered:
+        return "reddit"
+    if "linkedin.com" in lowered:
+        return "linkedin-public-index"
+    if "site:x.com" in lowered or "twitter.com" in lowered:
+        return "x-public-index"
+    if "github.com" in lowered or "arxiv.org" in lowered:
+        return "mcp-public"
+    return "general-web"
+
+
 class DailyBriefingService:
     def __init__(
         self,
@@ -370,7 +434,9 @@ class DailyBriefingService:
         subscription = self.store.upsert_topic(user_id, chat_id, topic)
         feedback = self.store.list_topic_feedback(subscription.id)
         search_plan = self.build_search_plan(subscription, feedback)
-        sources = self._collect_sources(subscription, search_plan, feedback)
+        briefing_id = f"brief_{uuid.uuid4().hex}"
+        collection = self._collect_sources_with_trace(subscription, search_plan, feedback, run_id=briefing_id)
+        sources = collection.sources
         ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[: self.max_sources]
         synthesis = self._synthesize(
             subscription.topic,
@@ -379,7 +445,7 @@ class DailyBriefingService:
         )
         resolved_date = run_date or self._briefing_date()
         briefing = DailyBriefing(
-            id=f"brief_{uuid.uuid4().hex}",
+            id=briefing_id,
             topic_id=subscription.id,
             user_id=user_id,
             chat_id=chat_id,
@@ -388,6 +454,8 @@ class DailyBriefingService:
             search_directions=[f"{platform}: {query}" for platform, query in search_plan],
             keywords=self._keywords(subscription.topic, feedback, search_plan),
             sources=ranked_sources,
+            source_candidates=collection.source_candidates,
+            provider_events=collection.provider_events,
             synthesis=synthesis,
             markdown="",
             created_at=datetime.now(UTC).isoformat(),
@@ -410,6 +478,7 @@ class DailyBriefingService:
                         "feedback": feedback[:5],
                         "channels": [platform for platform, _ in CHANNEL_QUERIES],
                         "report_skill": _load_report_skill(),
+                        "source_recipe": source_recipe_summary(subscription.source_recipe),
                     },
                 )
             except Exception:
@@ -429,9 +498,7 @@ class DailyBriefingService:
             if normalized and normalized not in seen:
                 unique.append((platform, query))
                 seen.add(normalized)
-            if len(unique) >= self.max_queries:
-                break
-        return unique
+        return _order_plan_by_source_recipe(unique, subscription.source_recipe)[: self.max_queries]
 
     def add_feedback(
         self,
@@ -446,7 +513,46 @@ class DailyBriefingService:
         case_context = self._inspect_case_source(source_url)
         if case_context:
             enriched_body = "\n".join(part for part in (enriched_body, case_context) if part)
-        return self.store.add_topic_feedback(subscription.id, user_id, chat_id, enriched_body, source_url)
+        feedback_id = self.store.add_topic_feedback(subscription.id, user_id, chat_id, enriched_body, source_url)
+        signal_type, scope = self._feedback_signal_type(enriched_body, source_url)
+        self.store.add_topic_feedback_signal(
+            subscription.id,
+            user_id,
+            chat_id,
+            signal_type=signal_type,
+            scope=scope,
+            body=enriched_body,
+            source_url=source_url,
+            metadata={"feedback_id": feedback_id},
+        )
+        memory_layer = "preference" if signal_type == "style" else "run_experience"
+        self.store.add_layered_memory_item(
+            memory_layer,
+            f"briefing_{signal_type}_feedback",
+            enriched_body,
+            source_id=feedback_id,
+            confidence="medium",
+            status="active",
+            user_id=user_id,
+            chat_id=chat_id,
+            metadata={"topic_id": subscription.id, "scope": scope, "source_url": source_url},
+        )
+        return feedback_id
+
+    @staticmethod
+    def _feedback_signal_type(body: str, source_url: str | None) -> tuple[str, str]:
+        lowered = body.lower()
+        if any(term in lowered for term in ("too long", "too verbose", "readability", "style", "简洁", "太长", "难读")):
+            return "style", "topic"
+        if any(term in lowered for term in ("provider", "agent reach", "search source", "没走", "来源", "搜索源")):
+            return "provider", "provider"
+        if any(term in lowered for term in ("wrong", "incorrect", "事实", "错误", "纠正")):
+            return "fact_correction", "source" if source_url else "topic"
+        if source_url:
+            return "case", "source"
+        if any(term in lowered for term in ("evidence", "source", "证据", "原文", "引用")):
+            return "evidence", "source"
+        return "general", "topic"
 
     def _inspect_case_source(self, source_url: str | None) -> str:
         if not source_url:
@@ -476,12 +582,23 @@ class DailyBriefingService:
         search_plan: list[tuple[str, str]],
         feedback: list[dict[str, object]],
     ) -> list[CollectedSource]:
+        return self._collect_sources_with_trace(subscription, search_plan, feedback).sources
+
+    def _collect_sources_with_trace(
+        self,
+        subscription: TopicSubscription,
+        search_plan: list[tuple[str, str]],
+        feedback: list[dict[str, object]],
+        run_id: str | None = None,
+    ) -> BriefingCollectionTrace:
         by_url: dict[str, CollectedSource] = {}
-        query_results: list[tuple[str, str, list[SearchResult]]] = []
+        query_results: list[tuple[str, str, SearchOutcome]] = []
+        source_candidates: list[SourceCandidate] = []
+        provider_events: list[ProviderTraceEvent] = []
         workers = min(6, len(search_plan))
         executor = ThreadPoolExecutor(max_workers=max(1, workers))
         futures = [
-            (requested_platform, query, executor.submit(self._search, query))
+            (requested_platform, query, executor.submit(self._search_with_trace, query))
             for requested_platform, query in search_plan
         ]
         try:
@@ -493,10 +610,25 @@ class DailyBriefingService:
                 if future not in completed:
                     continue
                 try:
-                    results = future.result()
-                except Exception:
-                    results = []
-                query_results.append((requested_platform, query, results))
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = SearchOutcome(
+                        results=[],
+                        provider_events=[
+                            ProviderTraceEvent(
+                                provider="briefing-search",
+                                query=query,
+                                status="error",
+                                result_count=0,
+                                error=f"{type(exc).__name__}: {exc}"[:240],
+                                checked_at=datetime.now(UTC).isoformat(),
+                            )
+                        ],
+                    )
+                query_results.append((requested_platform, query, outcome))
+                for event in outcome.provider_events:
+                    provider_events.append(event)
+                    self.store.record_provider_trace_event(event, run_id=run_id, topic_id=subscription.id)
             for future in pending:
                 future.cancel()
         finally:
@@ -504,22 +636,39 @@ class DailyBriefingService:
             # results are retained; queued calls are cancelled when possible.
             executor.shutdown(wait=False, cancel_futures=True)
 
-        for requested_platform, query, results in query_results:
-            for result in results:
+        for requested_platform, query, outcome in query_results:
+            for result in outcome.results:
                 normalized_url = self._normalize_url(result.url)
-                if self._is_search_page_dump(result.title, result.snippet):
-                    continue
                 title = self._compact_source_text(result.title, 240)
                 snippet = self._compact_source_text(result.snippet, 900)
-                if not normalized_url or not self._is_report_source_candidate(
+                relevance_score = max(
+                    self._relevance_score(subscription.topic, title, snippet),
+                    self._query_relevance_score(query, title, snippet),
+                )
+                importance_score = self._importance_score(
                     subscription.topic,
                     query,
-                    normalized_url,
                     title,
                     snippet,
-                ):
-                    continue
-                if not title and not snippet:
+                    result.provider,
+                )
+                rejection = self._source_rejection_reason(subscription.topic, query, normalized_url, title, snippet)
+                if rejection is not None:
+                    rejected = self._source_candidate(
+                        subscription=subscription,
+                        requested_platform=requested_platform,
+                        query=query,
+                        result=result,
+                        normalized_url=normalized_url,
+                        title=title,
+                        snippet=snippet,
+                        status=rejection[0],
+                        reason=rejection[1],
+                        relevance_score=relevance_score,
+                        importance_score=importance_score,
+                    )
+                    source_candidates.append(rejected)
+                    self.store.record_source_candidate(rejected)
                     continue
                 candidate = CollectedSource(
                     id=f"src_{uuid.uuid4().hex}",
@@ -531,20 +680,28 @@ class DailyBriefingService:
                     platform=self._platform_from_url(normalized_url, requested_platform),
                     provider=result.provider,
                     query=query,
-                    relevance_score=max(
-                        self._relevance_score(subscription.topic, title, snippet),
-                        self._query_relevance_score(query, title, snippet),
-                    ),
-                    importance_score=self._importance_score(
-                        subscription.topic,
-                        query,
-                        title,
-                        snippet,
-                        result.provider,
-                    ),
+                    relevance_score=relevance_score,
+                    importance_score=importance_score,
                     retrieved_at=result.checked_at,
                 )
                 prior = by_url.get(normalized_url)
+                if prior is not None and candidate.importance_score <= prior.importance_score:
+                    duplicate = self._source_candidate(
+                        subscription=subscription,
+                        requested_platform=requested_platform,
+                        query=query,
+                        result=result,
+                        normalized_url=normalized_url,
+                        title=title,
+                        snippet=snippet,
+                        status="duplicate",
+                        reason="same normalized URL already has an equal or stronger candidate",
+                        relevance_score=relevance_score,
+                        importance_score=importance_score,
+                    )
+                    source_candidates.append(duplicate)
+                    self.store.record_source_candidate(duplicate)
+                    continue
                 if prior is None or candidate.importance_score > prior.importance_score:
                     by_url[normalized_url] = candidate
 
@@ -567,12 +724,60 @@ class DailyBriefingService:
                 importance_score=12.0,
                 retrieved_at=str(item.get("created_at") or datetime.now(UTC).isoformat()),
             )
+            feedback_candidate = SourceCandidate(
+                id=f"cand_{uuid.uuid4().hex}",
+                topic_id=subscription.id,
+                user_id=subscription.user_id,
+                title=by_url[source_url].title,
+                url=source_url,
+                snippet=self._compact_source_text(body, 900),
+                platform=by_url[source_url].platform,
+                provider="user-feedback",
+                query=subscription.topic,
+                status="feedback_seed",
+                reason="user supplied a public case URL",
+                relevance_score=10.0,
+                importance_score=12.0,
+                retrieved_at=by_url[source_url].retrieved_at,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            source_candidates.append(feedback_candidate)
+            self.store.record_source_candidate(feedback_candidate)
 
-        persisted = [self.store.upsert_collected_source(source) for source in by_url.values()]
-        return persisted
+        persisted: list[CollectedSource] = []
+        for source in by_url.values():
+            stored_source = self.store.upsert_collected_source(source)
+            persisted.append(stored_source)
+            accepted = SourceCandidate(
+                id=f"cand_{uuid.uuid4().hex}",
+                topic_id=subscription.id,
+                user_id=subscription.user_id,
+                title=stored_source.title,
+                url=stored_source.url,
+                snippet=stored_source.snippet,
+                platform=stored_source.platform,
+                provider=stored_source.provider,
+                query=stored_source.query,
+                status="accepted",
+                reason="accepted for briefing ranking",
+                relevance_score=stored_source.relevance_score,
+                importance_score=stored_source.importance_score,
+                retrieved_at=stored_source.retrieved_at,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            source_candidates.append(accepted)
+            self.store.record_source_candidate(accepted)
+        return BriefingCollectionTrace(
+            sources=persisted,
+            source_candidates=source_candidates,
+            provider_events=provider_events,
+        )
 
     def _search(self, query: str) -> list[SearchResult]:
         return self.search_client.search(query, limit=self.results_per_query)
+
+    def _search_with_trace(self, query: str) -> SearchOutcome:
+        return search_with_provider_events(self.search_client, query, limit=self.results_per_query)
 
     def _synthesize(
         self,
@@ -983,6 +1188,74 @@ class DailyBriefingService:
                 cls._technical_signal_count(title, snippet) > 0 and max(topic_score, query_score) >= 1
             )
         return topic_score >= 2 or query_score >= 2 or cls._technical_signal_count(title, snippet) > 0
+
+    @classmethod
+    def _source_rejection_reason(
+        cls,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+    ) -> tuple[str, str] | None:
+        if not url:
+            return "rejected_invalid_url", "missing or non-http URL"
+        if not title and not snippet:
+            return "rejected_empty_content", "title and snippet are both empty"
+        if cls._is_search_page_dump(title, snippet):
+            return "rejected_search_page_dump", "result looked like a search-result page dump"
+        if cls._is_generic_reference_domain(url):
+            return "rejected_generic_reference", "generic reference domain is not strong briefing evidence"
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().removeprefix("www.")
+        path = parsed.path.lower()
+        if host in {"baidu.com", "m.baidu.com"}:
+            return "rejected_search_page_dump", "Baidu wrapper URL is not an original public source"
+        if any(marker in path for marker in _LOGIN_PATH_MARKERS):
+            return "rejected_login_page", "login-gated URL path is outside public-source boundary"
+        text = f"{title} {snippet}".lower()
+        if _is_cad_topic(f"{topic} {query}") and any(marker in text for marker in _CAD_MEDICAL_MARKERS):
+            return "rejected_cad_medical", "CAD query matched medical CAD acronym content"
+        if _is_cad_topic(f"{topic} {query}") and not _has_cad_anchor(title, snippet):
+            return "rejected_cad_missing_anchor", "CAD query lacked engineering CAD anchors"
+        if cls._requires_industrial_anchor(topic, query) and not cls._has_industrial_anchor(title, snippet):
+            return "rejected_missing_industrial_anchor", "industrial query lacked manufacturing or industrial anchors"
+        if not cls._is_report_source_candidate(topic, query, url, title, snippet):
+            return "rejected_low_relevance", "insufficient topic, query, or technical signal"
+        return None
+
+    def _source_candidate(
+        self,
+        *,
+        subscription: TopicSubscription,
+        requested_platform: str,
+        query: str,
+        result: SearchResult,
+        normalized_url: str,
+        title: str,
+        snippet: str,
+        status: str,
+        reason: str,
+        relevance_score: float,
+        importance_score: float,
+    ) -> SourceCandidate:
+        return SourceCandidate(
+            id=f"cand_{uuid.uuid4().hex}",
+            topic_id=subscription.id,
+            user_id=subscription.user_id,
+            title=title,
+            url=normalized_url,
+            snippet=snippet,
+            platform=self._platform_from_url(normalized_url, requested_platform) if normalized_url else requested_platform,
+            provider=result.provider,
+            query=query,
+            status=status,  # type: ignore[arg-type]
+            reason=reason,
+            relevance_score=relevance_score,
+            importance_score=importance_score,
+            retrieved_at=result.checked_at,
+            created_at=datetime.now(UTC).isoformat(),
+        )
 
     def _importance_score(self, topic: str, query: str, title: str, snippet: str, provider: str) -> float:
         text = f"{title} {snippet}".lower()

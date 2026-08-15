@@ -8,6 +8,31 @@ from pydantic import BaseModel, Field
 
 Classification = Literal["simple", "research", "hard", "high_stakes"]
 Confidence = Literal["low", "medium", "high"]
+ProviderEventStatus = Literal[
+    "called",
+    "success",
+    "empty",
+    "error",
+    "timeout",
+    "skipped",
+    "fallback_used",
+]
+SourceCandidateStatus = Literal[
+    "pending",
+    "accepted",
+    "duplicate",
+    "feedback_seed",
+    "rejected_invalid_url",
+    "rejected_empty_content",
+    "rejected_search_page_dump",
+    "rejected_login_page",
+    "rejected_generic_reference",
+    "rejected_cad_medical",
+    "rejected_cad_missing_anchor",
+    "rejected_missing_industrial_anchor",
+    "rejected_low_relevance",
+]
+MemoryLayer = Literal["event", "preference", "domain_knowledge", "run_experience"]
 
 
 class IncomingMessage(BaseModel):
@@ -40,12 +65,82 @@ class SourceEvidence(BaseModel):
     checked_at: str
 
 
+class ProviderTraceEvent(BaseModel):
+    """A compact, local-only record of one provider attempt.
+
+    This does not store credentials or response bodies.  It exists so a user can
+    tell whether a run really called a provider, skipped it, timed out, or fell
+    back to another route.
+    """
+
+    provider: str
+    query: str
+    status: ProviderEventStatus
+    result_count: int = 0
+    reason: str | None = None
+    error: str | None = None
+    elapsed_ms: float | None = None
+    checked_at: str
+
+
 class SearchRecord(BaseModel):
     executed: bool
     queries: list[str] = Field(default_factory=list)
     sources: list[SourceEvidence] = Field(default_factory=list)
     engines: list[str] = Field(default_factory=list)
     skipped_reason: str | None = None
+
+
+class SourceCandidate(BaseModel):
+    """A normalized source candidate before and after briefing filters.
+
+    Accepted candidates become ``CollectedSource`` rows.  Rejected candidates are
+    kept as short audit records so overly strict filters can be diagnosed without
+    leaking private data or forcing noisy items into the final report.
+    """
+
+    id: str
+    topic_id: str
+    user_id: str
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+    platform: str = ""
+    provider: str = ""
+    query: str = ""
+    status: SourceCandidateStatus = "pending"
+    reason: str = ""
+    relevance_score: float = 0.0
+    importance_score: float = 0.0
+    retrieved_at: str
+    created_at: str
+
+
+class LayeredMemoryItem(BaseModel):
+    id: str
+    layer: MemoryLayer
+    kind: str
+    content: str
+    source_id: str
+    confidence: Confidence = "medium"
+    status: Literal["candidate", "active", "superseded", "rejected"] = "active"
+    user_id: str = "system"
+    chat_id: str = "system"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class TopicFeedbackSignal(BaseModel):
+    id: str
+    topic_id: str
+    user_id: str
+    chat_id: str
+    signal_type: Literal["style", "evidence", "provider", "fact_correction", "case", "general"]
+    scope: Literal["run", "source", "section", "topic", "provider"]
+    body: str
+    source_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
 
 
 class CalibrationResult(BaseModel):
@@ -80,6 +175,7 @@ class TopicSubscription(BaseModel):
     chat_id: str
     topic: str
     enabled: bool = True
+    source_recipe: dict[str, float] = Field(default_factory=dict)
     created_at: str
     updated_at: str
 
@@ -153,6 +249,8 @@ class DailyBriefing(BaseModel):
     search_directions: list[str]
     keywords: list[str]
     sources: list[CollectedSource]
+    source_candidates: list[SourceCandidate] = Field(default_factory=list)
+    provider_events: list[ProviderTraceEvent] = Field(default_factory=list)
     synthesis: BriefingSynthesis
     markdown: str
     created_at: str

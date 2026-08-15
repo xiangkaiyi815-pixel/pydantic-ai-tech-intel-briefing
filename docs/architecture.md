@@ -55,9 +55,34 @@ flowchart TD
 feedback, collected sources, daily briefings, interactions, answers, claim
 evidence, profiles, reports, runtime sessions, and skill drafts.
 
+Source observability adds four local-only tables:
+
+- `source_candidates` records accepted, duplicate, feedback-seeded, and
+  rejected briefing candidates with short reason codes.
+- `provider_trace_events` records whether a provider succeeded, returned no
+  results, timed out, errored, or was skipped.
+- `topic_feedback_signals` classifies explicit user feedback as style,
+  evidence, provider, fact-correction, case, or general feedback.
+- `layered_memory_items` separates event, preference, domain-knowledge, and
+  run-experience memory so self-improvement does not mix user style feedback
+  with factual knowledge.
+
 The database is scoped by user and chat where applicable. The default location
 is `.local-data/assistant.sqlite3`; use `--data-dir` for isolated test or
 deployment environments.
+
+## Source Contracts and Replay
+
+Public source families are described in a local source contract registry.  A
+contract records aliases, URL hosts, provider families, allowed read-only
+actions, unsupported login/write actions, and default search-budget weight.  The
+registry is intentionally descriptive: it does not bypass platform controls and
+does not add logged-in automation.
+
+Each `brief-run` writes the Markdown report and a sidecar JSON artifact with
+ranked sources, source candidates, and provider events.  The sidecar is the
+minimum replay unit for comparing PRs or diagnosing why a report had too few
+sources.
 
 ## Model Boundary
 

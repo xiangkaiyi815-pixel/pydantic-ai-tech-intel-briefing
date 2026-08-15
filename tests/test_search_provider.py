@@ -22,6 +22,7 @@ from search_assistant.search.provider import (
     SearchProviderError,
     SearchResult,
     search_client_from_settings,
+    search_with_provider_events,
 )
 
 
@@ -266,6 +267,24 @@ def test_composite_search_client_does_not_backfill_when_primary_has_sufficient_r
     results = client.search("industrial AI", limit=8)
 
     assert [result.url for result in results] == ["https://example.com/a", "https://example.com/b", "https://example.com/c"]
+
+
+def test_search_with_provider_events_records_errors_and_fallback_success():
+    fallback_result = SearchResult(
+        title="Fallback result",
+        url="https://example.com/fallback",
+        snippet="Fallback source.",
+        provider="browser-bing",
+        checked_at="2026-07-25T00:00:00Z",
+    )
+    client = CompositeSearchClient([FailingSearchClient(), StaticSearchClient([fallback_result])])
+
+    outcome = search_with_provider_events(client, "industrial AI", limit=3)
+
+    assert [result.url for result in outcome.results] == ["https://example.com/fallback"]
+    assert [event.status for event in outcome.provider_events] == ["error", "success"]
+    assert outcome.provider_events[0].provider == "FailingSearchClient"
+    assert "blocked" in outcome.provider_events[0].error
 
 
 def test_searxng_search_client_extracts_json_results_without_an_api_key():

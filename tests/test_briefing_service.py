@@ -232,6 +232,30 @@ def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path)
     assert [source.url for source in sources] == ["https://example.com/industrial-agent"]
 
 
+def test_daily_briefing_records_candidate_lifecycle_and_provider_trace(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, NoisySearchClient())
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    collection = service._collect_sources_with_trace(
+        subscription,
+        [("technical", "industrial AI agent MES manufacturing")],
+        [],
+        run_id="brief-test",
+    )
+
+    assert [source.url for source in collection.sources] == ["https://example.com/industrial-agent"]
+    statuses = {candidate.status for candidate in collection.source_candidates}
+    assert "accepted" in statuses
+    assert "rejected_generic_reference" in statuses
+    assert "rejected_missing_industrial_anchor" in statuses
+    assert collection.provider_events[0].status == "success"
+    assert store.list_provider_trace_events(topic_id=subscription.id)[0].provider == "NoisySearchClient"
+    persisted_statuses = {candidate.status for candidate in store.list_source_candidates(topic_id=subscription.id)}
+    assert statuses.issubset(persisted_statuses)
+
+
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
