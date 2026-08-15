@@ -1509,9 +1509,10 @@ class DailyBriefingService:
         return generated.model_copy(update={"themes": fallback.themes})
 
     def _fallback_synthesis(self, topic: str, sources: list[CollectedSource]) -> BriefingSynthesis:
-        theme_catalog = CAD_THEMES + THEMES if _is_cad_topic(topic) else THEMES
         themed_sources: dict[str, list[CollectedSource]] = {}
         is_cad = _is_cad_topic(topic)
+        is_industrial = self._requires_industrial_anchor(topic, "")
+        theme_catalog = CAD_THEMES + THEMES if is_cad else (THEMES if is_industrial else ())
         for source in sources:
             haystack = f"{source.title} {source.snippet}".lower()
             matched = False
@@ -1570,7 +1571,7 @@ class DailyBriefingService:
                     continue
                 themes.append(
                     BriefingTheme(
-                        name=name,
+                        name=self._display_generic_evidence_theme_name(topic, name),
                         analysis=self._fallback_theme_analysis(evidence, technology, importance, maturity),
                         what_is_happening=self._evidence_summary(evidence),
                         core_technology=technology,
@@ -1666,6 +1667,21 @@ class DailyBriefingService:
                 "优先建设来源、实体、指标和项目之间的关联库，让后续日报可做连续对比。",
             ],
         )
+
+    @staticmethod
+    def _display_generic_evidence_theme_name(topic: str, generic_name: str) -> str:
+        clean_topic = " ".join(topic.split()).strip(" ：:，,。")
+        if not clean_topic:
+            clean_topic = "本主题"
+        suffixes = {
+            "政策、规模与产业链信号": "政策、规模与产业链信号",
+            "技术底座、数据与开源生态": "技术底座、数据与开源生态",
+            "应用落地与业务转型案例": "应用落地与业务流程线索",
+            "教育传播、公众讨论与弱证据线索": "传播讨论与弱证据线索",
+            "综合产业动态与待核验证据": "待核验证据线索",
+        }
+        suffix = suffixes.get(generic_name, "证据线索")
+        return f"{clean_topic}的{suffix}"
 
     def _generic_evidence_theme_name(self, source: CollectedSource) -> str:
         text = f"{source.title} {source.snippet} {source.platform} {source.provider}".lower()

@@ -613,12 +613,41 @@ def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp
     assert runtime.synthesis_context["briefing_intent"]["primary_intent"] == "industry_trend"
     assert len(briefing.sources) == 5
     assert "保留了 5 条公开线索" in briefing.synthesis.search_content_summary
-    assert "### 政策、规模与产业链信号" in briefing.synthesis.detailed_summary
-    assert "### 技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
-    assert "### 应用落地与业务转型案例" in briefing.synthesis.detailed_summary
-    assert "### 教育传播、公众讨论与弱证据线索" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的政策、规模与产业链信号" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的应用落地与业务流程线索" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的传播讨论与弱证据线索" in briefing.synthesis.detailed_summary
+    assert "### 政策、规模与产业链信号" not in briefing.synthesis.detailed_summary
     assert "相关线索集中讨论" not in briefing.synthesis.detailed_summary
     assert _is_substantive_synthesis(briefing.synthesis) is True
+
+
+def test_generic_intent_topic_fallback_does_not_reuse_industrial_headings(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, RecordingSearchClient())
+    source = CollectedSource(
+        id="src-intent-agent",
+        topic_id="topic-1",
+        user_id="u-1",
+        title="AI 智能体实战：意图识别提升之道",
+        url="https://example.com/intent-agent",
+        snippet="意图识别和槽位抽取是自然语言理解 NLU 的关键部分，会影响 Agent 交互质量。",
+        platform="技术路线",
+        provider="browser-bing",
+        query="意图识别 technical architecture",
+        relevance_score=1.0,
+        importance_score=8.0,
+        retrieved_at="2026-08-15T00:00:00+00:00",
+    )
+
+    synthesis = service._fallback_synthesis("意图识别", [source])
+
+    assert "### 工业智能体与生产协同" not in synthesis.detailed_summary
+    assert "### 综合产业动态与待核验证据" not in synthesis.detailed_summary
+    assert "### 意图识别的待核验证据线索" in synthesis.detailed_summary
+    assert "把自然语言任务、生产约束和企业系统接口连接起来" not in synthesis.detailed_summary
+    assert "意图识别" in synthesis.search_content_summary
 
 
 def test_short_single_block_generated_detail_is_not_substantive():
