@@ -67,6 +67,25 @@ class BudgetedSearchClient:
         ]
 
 
+class AlwaysSlowSearchClient:
+    def __init__(self, delay_seconds: float = 0.2):
+        self.delay_seconds = delay_seconds
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        time.sleep(self.delay_seconds)
+        return [
+            SearchResult(
+                title=f"slow result for {query}",
+                url=f"https://example.com/{query}",
+                snippet="This result should not be retained after the search budget expires.",
+                provider="test",
+                checked_at="2026-07-25T00:00:00+00:00",
+            )
+        ]
+
+
 class NoisySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
@@ -215,6 +234,32 @@ def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(t
 
     assert time.monotonic() - started < 0.15
     assert [source.url for source in sources] == ["https://example.com/fast"]
+
+
+def test_daily_briefing_records_budget_timeout_and_skipped_queries(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    search = AlwaysSlowSearchClient(delay_seconds=0.2)
+    service = DailyBriefingService(
+        store,
+        search,
+        search_budget_seconds=0.02,
+    )
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+    search_plan = [("test", f"slow-{index}") for index in range(8)]
+
+    started = time.monotonic()
+    collection = service._collect_sources_with_trace(subscription, search_plan, [], run_id="brief-budget-test")
+
+    assert time.monotonic() - started < 0.18
+    assert collection.sources == []
+    assert len(search.queries) <= 6
+    statuses = [event.status for event in collection.provider_events]
+    assert "timeout" in statuses
+    assert "skipped" in statuses
+    assert {event.query for event in collection.provider_events} == {query for _platform, query in search_plan}
+    persisted_events = store.list_provider_trace_events(topic_id=subscription.id)
+    assert {event.query for event in persisted_events} == {query for _platform, query in search_plan}
 
 
 def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path):

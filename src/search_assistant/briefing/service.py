@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 import re
+import time
 import uuid
 from typing import Protocol
 from urllib.parse import urlparse
@@ -592,51 +593,115 @@ class DailyBriefingService:
         run_id: str | None = None,
     ) -> BriefingCollectionTrace:
         by_url: dict[str, CollectedSource] = {}
-        query_results: list[tuple[str, str, SearchOutcome]] = []
+        query_results: list[tuple[int, str, str, SearchOutcome]] = []
         source_candidates: list[SourceCandidate] = []
         provider_events: list[ProviderTraceEvent] = []
-        workers = min(6, len(search_plan))
-        executor = ThreadPoolExecutor(max_workers=max(1, workers))
-        futures = [
-            (requested_platform, query, executor.submit(self._search_with_trace, query))
-            for requested_platform, query in search_plan
-        ]
-        try:
-            completed, pending = wait(
-                [future for _, _, future in futures],
-                timeout=self.search_budget_seconds,
+
+        def record_provider_event(event: ProviderTraceEvent) -> None:
+            provider_events.append(event)
+            self.store.record_provider_trace_event(event, run_id=run_id, topic_id=subscription.id)
+
+        def budget_event(query: str, status: str, reason: str, started: float | None = None) -> ProviderTraceEvent:
+            elapsed_ms = None if started is None else round((time.monotonic() - started) * 1000, 3)
+            return ProviderTraceEvent(
+                provider="briefing-search-budget",
+                query=query,
+                status=status,
+                result_count=0,
+                reason=reason,
+                elapsed_ms=elapsed_ms,
+                checked_at=datetime.now(UTC).isoformat(),
             )
-            for requested_platform, query, future in futures:
-                if future not in completed:
+
+        if not search_plan:
+            return BriefingCollectionTrace(sources=[], source_candidates=[], provider_events=[])
+
+        workers = max(1, min(6, len(search_plan)))
+        deadline = time.monotonic() + max(0.0, self.search_budget_seconds)
+        next_index = 0
+        pending: dict[Future[SearchOutcome], tuple[int, str, str, float]] = {}
+        executor = ThreadPoolExecutor(max_workers=workers)
+
+        def submit_next_query() -> bool:
+            nonlocal next_index
+            if next_index >= len(search_plan):
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            requested_platform, query = search_plan[next_index]
+            started = time.monotonic()
+            future = executor.submit(self._search_with_trace, query)
+            pending[future] = (next_index, requested_platform, query, started)
+            next_index += 1
+            return True
+
+        def collect_completed_future(future: Future[SearchOutcome]) -> None:
+            index, requested_platform, query, _started = pending.pop(future)
+            try:
+                outcome = future.result()
+            except Exception as exc:
+                outcome = SearchOutcome(
+                    results=[],
+                    provider_events=[
+                        ProviderTraceEvent(
+                            provider="briefing-search",
+                            query=query,
+                            status="error",
+                            result_count=0,
+                            error=f"{type(exc).__name__}: {exc}"[:240],
+                            checked_at=datetime.now(UTC).isoformat(),
+                        )
+                    ],
+                )
+            query_results.append((index, requested_platform, query, outcome))
+            for event in outcome.provider_events:
+                record_provider_event(event)
+
+        try:
+            while len(pending) < workers and submit_next_query():
+                pass
+            while pending:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    break
+                completed, _pending = wait(
+                    list(pending),
+                    timeout=remaining_seconds,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    break
+                for future in sorted(completed, key=lambda item: pending[item][0]):
+                    collect_completed_future(future)
+                while len(pending) < workers and submit_next_query():
+                    pass
+
+            for future in list(pending):
+                if future.done():
+                    collect_completed_future(future)
                     continue
-                try:
-                    outcome = future.result()
-                except Exception as exc:
-                    outcome = SearchOutcome(
-                        results=[],
-                        provider_events=[
-                            ProviderTraceEvent(
-                                provider="briefing-search",
-                                query=query,
-                                status="error",
-                                result_count=0,
-                                error=f"{type(exc).__name__}: {exc}"[:240],
-                                checked_at=datetime.now(UTC).isoformat(),
-                            )
-                        ],
-                    )
-                query_results.append((requested_platform, query, outcome))
-                for event in outcome.provider_events:
-                    provider_events.append(event)
-                    self.store.record_provider_trace_event(event, run_id=run_id, topic_id=subscription.id)
-            for future in pending:
-                future.cancel()
+                _index, _requested_platform, query, started = pending.pop(future)
+                cancelled = future.cancel()
+                status = "skipped" if cancelled else "timeout"
+                reason = (
+                    "search_budget_expired_before_worker_start"
+                    if cancelled
+                    else f"exceeded_{self.search_budget_seconds:g}s_search_budget"
+                )
+                record_provider_event(budget_event(query, status, reason, started))
+
+            while next_index < len(search_plan):
+                _requested_platform, query = search_plan[next_index]
+                record_provider_event(
+                    budget_event(query, "skipped", "search_budget_exhausted_before_query_start")
+                )
+                next_index += 1
         finally:
             # Do not block the daily briefing on slow public endpoints. Completed
             # results are retained; queued calls are cancelled when possible.
             executor.shutdown(wait=False, cancel_futures=True)
 
-        for requested_platform, query, outcome in query_results:
+        for _index, requested_platform, query, outcome in sorted(query_results, key=lambda item: item[0]):
             for result in outcome.results:
                 normalized_url = self._normalize_url(result.url)
                 title = self._compact_source_text(result.title, 240)
