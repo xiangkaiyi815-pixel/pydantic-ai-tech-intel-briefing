@@ -80,6 +80,52 @@ class BudgetedSearchClient:
         ]
 
 
+class AlwaysSlowSearchClient:
+    def __init__(self, delay_seconds: float = 0.2):
+        self.delay_seconds = delay_seconds
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        time.sleep(self.delay_seconds)
+        return [
+            SearchResult(
+                title=f"slow result for {query}",
+                url=f"https://example.com/{query}",
+                snippet="This result should not be retained after the search budget expires.",
+                provider="test",
+                checked_at="2026-07-25T00:00:00+00:00",
+            )
+        ]
+
+
+class TieredOrderingSearchClient:
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        if "github.com" in query:
+            return [
+                SearchResult(
+                    title="Intent recognition repository",
+                    url="https://github.com/example/intent-recognition",
+                    snippet="Repository with intent recognition architecture and evaluation notes.",
+                    provider="mcp:public:github",
+                    checked_at="2026-08-16T00:00:00+00:00",
+                )
+            ]
+        return [
+            SearchResult(
+                title="General web intent recognition article",
+                url="https://example.com/intent-web",
+                snippet="General public web article about intent recognition.",
+                provider="browser-bing",
+                checked_at="2026-08-16T00:00:00+00:00",
+            )
+        ]
+
+
 class NoisySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
@@ -380,6 +426,56 @@ def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(t
     assert [source.url for source in sources] == ["https://example.com/fast"]
 
 
+def test_daily_briefing_records_budget_timeout_and_skipped_queries(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    search = AlwaysSlowSearchClient(delay_seconds=0.2)
+    service = DailyBriefingService(
+        store,
+        search,
+        search_budget_seconds=0.02,
+    )
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+    search_plan = [("test", f"slow-{index}") for index in range(8)]
+
+    started = time.monotonic()
+    collection = service._collect_sources_with_trace(subscription, search_plan, [], run_id="brief-budget-test")
+
+    assert time.monotonic() - started < 0.18
+    assert collection.sources == []
+    assert len(search.queries) <= 6
+    statuses = [event.status for event in collection.provider_events]
+    assert "timeout" in statuses
+    assert "skipped" in statuses
+    assert {event.query for event in collection.provider_events} == {query for _platform, query in search_plan}
+    persisted_events = store.list_provider_trace_events(topic_id=subscription.id)
+    assert {event.query for event in persisted_events} == {query for _platform, query in search_plan}
+
+
+def test_daily_briefing_runs_fast_source_tier_before_general_web(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    search = TieredOrderingSearchClient()
+    service = DailyBriefingService(
+        store,
+        search,
+        search_budget_seconds=1.0,
+    )
+    subscription = store.upsert_topic("u-1", "c-1", "intent recognition")
+    search_plan = [
+        ("general", "intent recognition architecture general web"),
+        ("technical", "site:github.com intent recognition repository"),
+    ]
+
+    collection = service._collect_sources_with_trace(subscription, search_plan, [], run_id="brief-tier-test")
+
+    assert search.queries[0] == "site:github.com intent recognition repository"
+    called_events = [event for event in collection.provider_events if event.status == "called"]
+    assert [event.tier for event in called_events] == ["tier-1", "tier-3"]
+    assert all(event.budget_share is not None for event in called_events)
+    assert any(source.url == "https://github.com/example/intent-recognition" for source in collection.sources)
+
+
 def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -454,6 +550,28 @@ def test_concept_intent_changes_deterministic_queries_without_dropping_channels(
     assert any(platform == "YouTube" for platform, _ in plan)
     assert "概念边界" in keywords
     assert "典型语境" in keywords
+def test_daily_briefing_records_candidate_lifecycle_and_provider_trace(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, NoisySearchClient())
+    subscription = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    collection = service._collect_sources_with_trace(
+        subscription,
+        [("technical", "industrial AI agent MES manufacturing")],
+        [],
+        run_id="brief-test",
+    )
+
+    assert [source.url for source in collection.sources] == ["https://example.com/industrial-agent"]
+    statuses = {candidate.status for candidate in collection.source_candidates}
+    assert "accepted" in statuses
+    assert "rejected_generic_reference" in statuses
+    assert "rejected_missing_industrial_anchor" in statuses
+    assert any(event.status == "success" for event in collection.provider_events)
+    assert any(event.provider == "NoisySearchClient" for event in store.list_provider_trace_events(topic_id=subscription.id))
+    persisted_statuses = {candidate.status for candidate in store.list_source_candidates(topic_id=subscription.id)}
+    assert statuses.issubset(persisted_statuses)
 
 
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):

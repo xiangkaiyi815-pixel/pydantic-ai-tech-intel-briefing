@@ -137,6 +137,38 @@ def test_cli_doctor_outputs_readiness_json(monkeypatch, tmp_path):
     assert output["checks"][0]["name"] == "model_runtime"
 
 
+def test_cli_source_contracts_and_topic_recipe_commands(monkeypatch, tmp_path):
+    from search_assistant import cli
+
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["source-contracts", "--data-dir", str(tmp_path)]) == 0
+    stream.flush()
+    contracts = json.loads(stream.buffer.getvalue().decode("utf-8"))
+    assert any(contract["slug"] == "bilibili" for contract in contracts)
+
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert (
+        cli.main(
+            [
+                "topic-recipe-set",
+                "industrial AI",
+                '{"web": 3, "bili": 1}',
+                "--data-dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    stream.flush()
+    output = json.loads(stream.buffer.getvalue().decode("utf-8"))
+    weights = {item["slug"]: item["weight"] for item in output["source_recipe"]["sources"]}
+    assert weights["general-web"] == 3.0
+    assert weights["bilibili"] == 1.0
+
+
 def test_cli_feishu_fixture_updates_profile_snapshot(monkeypatch, tmp_path):
     from search_assistant import cli
 

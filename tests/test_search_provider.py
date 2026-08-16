@@ -25,6 +25,7 @@ from search_assistant.search.provider import (
     ToutiaoPublicSearchClient,
     YouTubePublicSearchClient,
     search_client_from_settings,
+    search_with_provider_events,
 )
 
 
@@ -361,6 +362,22 @@ def test_agent_reach_search_client_reports_missing_route_from_doctor():
 
     with pytest.raises(SearchProviderError, match="Agent Reach has no usable route"):
         client.search("Agent Reach", limit=1)
+def test_search_with_provider_events_records_errors_and_fallback_success():
+    fallback_result = SearchResult(
+        title="Fallback result",
+        url="https://example.com/fallback",
+        snippet="Fallback source.",
+        provider="browser-bing",
+        checked_at="2026-07-25T00:00:00Z",
+    )
+    client = CompositeSearchClient([FailingSearchClient(), StaticSearchClient([fallback_result])])
+
+    outcome = search_with_provider_events(client, "industrial AI", limit=3)
+
+    assert [result.url for result in outcome.results] == ["https://example.com/fallback"]
+    assert [event.status for event in outcome.provider_events] == ["error", "success"]
+    assert outcome.provider_events[0].provider == "FailingSearchClient"
+    assert "blocked" in outcome.provider_events[0].error
 
 
 def test_searxng_search_client_extracts_json_results_without_an_api_key():

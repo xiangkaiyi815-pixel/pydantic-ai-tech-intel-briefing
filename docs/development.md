@@ -19,6 +19,7 @@ long time backtracking through the broad Pydantic AI 1.x range.
 $env:PYTHONUTF8 = "1"
 py -3.12 -m pytest -q
 py -3.12 -m pytest -q tests/test_briefing_service.py tests/test_search_provider.py
+py -3.12 -m pytest -q tests/test_source_registry.py tests/test_memory_store.py
 ```
 
 Use a temporary pytest cache when the repository owner differs from the active
@@ -35,7 +36,25 @@ py -3.12 -m pytest -q -o cache_dir=$env:TEMP\pydantic-ai-briefing-pytest
   known noisy-result regressions.
 - Briefing report sections, original URLs, model JSON validation, timeout retry,
   source filtering, and free-form detailed synthesis rendering.
+- Source capability contracts, provider trace events, candidate lifecycle
+  reasons, feedback signal typing, and layered memory persistence.
 - Feishu event parsing, formatting, polling, and local adapter behavior.
+
+## Local Source Observability Checks
+
+After a real `brief-run`, inspect the replay artifacts before changing filters
+or provider settings:
+
+```powershell
+search-assistant source-contracts
+search-assistant provider-trace-list --limit 20
+search-assistant candidate-list --limit 20
+search-assistant memory-layer-list --limit 20
+```
+
+`brief-run` writes both a Markdown report and a JSON sidecar.  The sidecar is
+the stable replay artifact for comparing provider coverage, accepted sources,
+and rejected candidate reasons across PRs.
 
 ## What Tests Do Not Prove
 

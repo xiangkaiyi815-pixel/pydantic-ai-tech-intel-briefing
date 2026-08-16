@@ -26,6 +26,11 @@ from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
 from search_assistant.reports.service import ReportService
 from search_assistant.search.provider import search_client_from_settings
+from search_assistant.search.source_registry import (
+    normalize_source_recipe,
+    source_contracts_as_dicts,
+    source_recipe_summary,
+)
 from search_assistant.skills.service import SkillDraftService
 from search_assistant.config import Settings
 from search_assistant.verification.backfill import VerificationBackfillService
@@ -53,6 +58,22 @@ def main(argv: list[str] | None = None) -> int:
     topic_list_parser.add_argument("--chat-id", default="local-cli")
     _add_data_dir(topic_list_parser)
 
+    source_contracts_parser = subparsers.add_parser("source-contracts")
+    _add_data_dir(source_contracts_parser)
+
+    topic_recipe_show_parser = subparsers.add_parser("topic-recipe-show")
+    topic_recipe_show_parser.add_argument("topic")
+    topic_recipe_show_parser.add_argument("--user-id", default="local-user")
+    topic_recipe_show_parser.add_argument("--chat-id", default="local-cli")
+    _add_data_dir(topic_recipe_show_parser)
+
+    topic_recipe_set_parser = subparsers.add_parser("topic-recipe-set")
+    topic_recipe_set_parser.add_argument("topic")
+    topic_recipe_set_parser.add_argument("recipe_json")
+    topic_recipe_set_parser.add_argument("--user-id", default="local-user")
+    topic_recipe_set_parser.add_argument("--chat-id", default="local-cli")
+    _add_data_dir(topic_recipe_set_parser)
+
     briefing_parser = subparsers.add_parser("brief-run")
     briefing_parser.add_argument("topic")
     briefing_parser.add_argument("--user-id", default="local-user")
@@ -77,6 +98,25 @@ def main(argv: list[str] | None = None) -> int:
 
     report_parser = subparsers.add_parser("report")
     _add_data_dir(report_parser)
+
+    candidate_list_parser = subparsers.add_parser("candidate-list")
+    candidate_list_parser.add_argument("--topic-id", default=None)
+    candidate_list_parser.add_argument("--status", default=None)
+    candidate_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(candidate_list_parser)
+
+    provider_trace_list_parser = subparsers.add_parser("provider-trace-list")
+    provider_trace_list_parser.add_argument("--topic-id", default=None)
+    provider_trace_list_parser.add_argument("--run-id", default=None)
+    provider_trace_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(provider_trace_list_parser)
+
+    memory_layer_list_parser = subparsers.add_parser("memory-layer-list")
+    memory_layer_list_parser.add_argument("--layer", default=None)
+    memory_layer_list_parser.add_argument("--user-id", default=None)
+    memory_layer_list_parser.add_argument("--chat-id", default=None)
+    memory_layer_list_parser.add_argument("--limit", type=_positive_int, default=50)
+    _add_data_dir(memory_layer_list_parser)
 
     evolve_parser = subparsers.add_parser("evolve")
     _add_data_dir(evolve_parser)
@@ -272,6 +312,40 @@ def main(argv: list[str] | None = None) -> int:
         topics = store.list_topics(args.user_id, args.chat_id)
         print(json.dumps([topic.model_dump(mode="json") for topic in topics], ensure_ascii=False, indent=2))
         return 0
+    if args.command == "source-contracts":
+        print(json.dumps(source_contracts_as_dicts(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "topic-recipe-show":
+        subscription = store.upsert_topic(args.user_id, args.chat_id, args.topic)
+        print(
+            json.dumps(
+                {
+                    "topic": subscription.topic,
+                    "topic_id": subscription.id,
+                    "source_recipe": source_recipe_summary(subscription.source_recipe),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "topic-recipe-set":
+        subscription = store.upsert_topic(args.user_id, args.chat_id, args.topic)
+        recipe = normalize_source_recipe(_parse_source_recipe(args.recipe_json))
+        store.set_topic_source_recipe(subscription.id, recipe)
+        refreshed = store.upsert_topic(args.user_id, args.chat_id, args.topic)
+        print(
+            json.dumps(
+                {
+                    "topic": refreshed.topic,
+                    "topic_id": refreshed.id,
+                    "source_recipe": source_recipe_summary(refreshed.source_recipe),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "brief-feedback":
         feedback_id = _briefing_service(store).add_feedback(
             args.topic,
@@ -283,8 +357,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"feedback_id": feedback_id, "topic": args.topic}, ensure_ascii=False, indent=2))
         return 0
     if args.command == "brief-run":
-        briefing, path = _run_briefing(store, args.topic, args.user_id, args.chat_id)
-        print(json.dumps({"path": str(path), "sources": len(briefing.sources), "topic": briefing.topic}, ensure_ascii=False, indent=2))
+        briefing, path, artifact_path = _run_briefing(store, args.topic, args.user_id, args.chat_id)
+        print(
+            json.dumps(
+                {
+                    "path": str(path),
+                    "artifact_path": str(artifact_path),
+                    "sources": len(briefing.sources),
+                    "source_candidates": len(briefing.source_candidates),
+                    "provider_events": len(briefing.provider_events),
+                    "topic": briefing.topic,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "brief-loop":
         result = _run_briefing_loop(
@@ -346,6 +433,23 @@ def main(argv: list[str] | None = None) -> int:
         print(str(path))
         if not markdown:
             return 1
+        return 0
+    if args.command == "candidate-list":
+        candidates = store.list_source_candidates(topic_id=args.topic_id, status=args.status, limit=args.limit)
+        print(json.dumps([candidate.model_dump(mode="json") for candidate in candidates], ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "provider-trace-list":
+        events = store.list_provider_trace_events(topic_id=args.topic_id, run_id=args.run_id, limit=args.limit)
+        print(json.dumps([event.model_dump(mode="json") for event in events], ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "memory-layer-list":
+        items = store.list_layered_memory_items(
+            layer=args.layer,
+            user_id=args.user_id,
+            chat_id=args.chat_id,
+            limit=args.limit,
+        )
+        print(json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False, indent=2))
         return 0
     if args.command == "evolve":
         result = _run_evolution(store, data_dir)
@@ -582,8 +686,13 @@ def _run_briefing(store: MemoryStore, topic: str, user_id: str, chat_id: str):
     output_dir = _store_data_dir(store) / "briefs"
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{briefing.run_date.isoformat()}-{_safe_filename(topic)}.md"
+    artifact_path = output_dir / f"{briefing.run_date.isoformat()}-{_safe_filename(topic)}.json"
     path.write_text(briefing.markdown, encoding="utf-8")
-    return briefing, path
+    artifact_path.write_text(
+        json.dumps(briefing.model_dump(mode="json"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return briefing, path, artifact_path
 
 
 def _run_briefing_loop(
@@ -606,8 +715,17 @@ def _run_briefing_loop(
     runs = 0
     try:
         while max_runs is None or runs < max_runs:
-            briefing, path = _run_briefing(store, topic, user_id, chat_id)
-            results.append({"path": str(path), "sources": len(briefing.sources), "run_date": briefing.run_date.isoformat()})
+            briefing, path, artifact_path = _run_briefing(store, topic, user_id, chat_id)
+            results.append(
+                {
+                    "path": str(path),
+                    "artifact_path": str(artifact_path),
+                    "sources": len(briefing.sources),
+                    "source_candidates": len(briefing.source_candidates),
+                    "provider_events": len(briefing.provider_events),
+                    "run_date": briefing.run_date.isoformat(),
+                }
+            )
             runs += 1
             if max_runs is not None and runs >= max_runs:
                 break
@@ -913,6 +1031,19 @@ def _load_evaluation_questions(source: str | Path) -> list[str]:
             raise ValueError("Evaluation questions JSON must be a list of strings")
         return [item.strip() for item in data if item.strip()]
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _parse_source_recipe(recipe_json: str) -> dict[str, float]:
+    raw = json.loads(recipe_json)
+    if not isinstance(raw, dict):
+        raise ValueError("source recipe must be a JSON object, for example: {\"general-web\": 3, \"bilibili\": 1}")
+    parsed: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            parsed[str(key)] = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"source recipe weight for {key!r} must be a number") from exc
+    return parsed
 
 
 def _feishu_status(store: MemoryStore) -> dict[str, Any]:
