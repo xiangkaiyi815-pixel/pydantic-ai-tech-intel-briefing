@@ -1296,13 +1296,13 @@ class DailyBriefingService:
             entity_name = str(hit.get("entity_name") or "").strip()
             if entity_name:
                 queries.append(("知识图谱补充", f"{topic} {entity_name} implementation evidence"))
-        for candidate in knowledge_context.get("validated_candidates", [])[:2]:
-            if not isinstance(candidate, dict):
-                continue
-            claim_terms = re.findall(r"[A-Za-z][A-Za-z0-9+._/-]{2,}|[\u4e00-\u9fff]{2,}", str(candidate.get("claim", "")))
-            useful_terms = [term for term in claim_terms if _is_meaningful_query(term)][:4]
-            if useful_terms:
-                queries.append(("自进化知识补充", f"{topic} {' '.join(useful_terms)}"))
+        # Validated self-evolution candidates are intentionally NOT turned into raw
+        # search queries here. Directly concatenating claim terms from a previous
+        # topic (e.g. "loop engineering agent harness") into a new topic pollutes the
+        # search plan with out-of-context vocabulary. They remain available as
+        # framing context via knowledge_context["validated_candidates"] during
+        # synthesis, where the model can use them for analogies without affecting
+        # retrieval keywords.
         return queries
 
     def _latest_candidate_layers(self) -> dict[str, str]:

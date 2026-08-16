@@ -669,7 +669,9 @@ def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(t
     assert runtime.synthesis_context is not None
     assert runtime.synthesis_context["knowledge_context"]["validated_candidates"][0]["id"] == candidate.id
     assert any(direction.startswith("知识图谱补充:") for direction in briefing.search_directions)
-    assert any(direction.startswith("自进化知识补充:") for direction in briefing.search_directions)
+    # Validated self-evolution candidates remain available as framing context but are
+    # no longer concatenated into raw search queries to avoid cross-topic pollution.
+    assert not any(direction.startswith("自进化知识补充:") for direction in briefing.search_directions)
     plan_trace = next(event for event in store.list_trace_events() if event["name"] == "plan_queries")
     assert plan_trace["metadata"]["knowledge_context"]["reviewed_graph_hits"] >= 1
     assert plan_trace["metadata"]["knowledge_context"]["validated_candidates"] == 1

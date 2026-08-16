@@ -77,8 +77,8 @@ class SearchAssistantWorkflow:
 
         classification = self._classify(question_text)
         answer_strategy = self._answer_strategy(question_text, classification)
-        memory_context = self.store.list_memory_items(message.user_id, message.chat_id)
-        experience_context = self.store.list_experience_items(message.user_id, message.chat_id)
+        memory_context = self._memory_context(message.user_id, message.chat_id)
+        experience_context = self._experience_context(message.user_id, message.chat_id)
         active_skills = self._active_skill_context(message.user_id, message.chat_id)
         planning_context: dict[str, object] = {
             "question_id": question_id,
@@ -732,6 +732,34 @@ class SearchAssistantWorkflow:
             if len(active_skills) >= max_skills:
                 break
         return active_skills
+
+    def _memory_context(
+        self,
+        user_id: str,
+        chat_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        """Return layered memory items for planning, falling back to legacy tables."""
+        items = self.store.list_layered_memory_items(
+            layer=None, user_id=user_id, chat_id=chat_id, limit=limit
+        )
+        if items:
+            return [item.model_dump(mode="json") for item in items]
+        return self.store.list_memory_items(user_id, chat_id)
+
+    def _experience_context(
+        self,
+        user_id: str,
+        chat_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        """Return run_experience layer items, falling back to legacy experience tables."""
+        items = self.store.list_layered_memory_items(
+            layer="run_experience", user_id=user_id, chat_id=chat_id, limit=limit
+        )
+        if items:
+            return [item.model_dump(mode="json") for item in items]
+        return self.store.list_experience_items(user_id, chat_id)
 
     def _can_manage_skills(self, message: IncomingMessage) -> bool:
         return self.admin_user_ids is None or message.user_id in self.admin_user_ids
