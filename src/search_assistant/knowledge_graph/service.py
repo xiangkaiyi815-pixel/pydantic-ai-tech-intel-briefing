@@ -12,6 +12,18 @@ from search_assistant.knowledge_graph.seeds import default_domain_graphs
 from search_assistant.memory.store import MemoryStore
 
 
+_NEGATED_MENTION_PATTERN = re.compile(
+    r"(?:"
+    r"没有(?:讨论|涉及|提到|覆盖)|"
+    r"未(?:讨论|涉及|提到|覆盖)|"
+    r"不(?:讨论|涉及|覆盖)|"
+    r"无(?:关|涉及|证据)|"
+    r"no evidence for|without|does not discuss|do not discuss|not discuss"
+    r")\s*([^。；;.!?\n]{0,80})",
+    re.IGNORECASE,
+)
+
+
 class DomainKnowledgeGraphService:
     """Manage reviewed domain graphs used as a lightweight GraphRAG index."""
 
@@ -70,6 +82,19 @@ class DomainKnowledgeGraphService:
                     )
                 )
         hits.sort(key=lambda hit: (-hit.score, hit.graph_id, hit.entity_name))
+        return hits[: max(1, limit)]
+
+    def query_relevant(
+        self,
+        query: str,
+        domain_id: str | None = None,
+        limit: int = 10,
+        min_score: float = 5.0,
+    ) -> list[DomainKnowledgeSearchHit]:
+        """Return graph hits strong enough to be used as planning context."""
+
+        candidates = self.query(query, domain_id=domain_id, limit=max(limit * 4, 20))
+        hits = [hit for hit in candidates if hit.score >= min_score]
         return hits[: max(1, limit)]
 
     def export_markdown(self, domain_id: str) -> str:
@@ -147,6 +172,7 @@ class DomainKnowledgeGraphService:
     @staticmethod
     def _score_entity(query: str, entity: DomainKnowledgeEntity) -> tuple[float, list[str]]:
         query_lower = query.lower()
+        positive_query_lower = _positive_query_text(query_lower)
         terms = _terms(query_lower)
         name_lower = entity.name.lower()
         alias_lowers = [alias.lower() for alias in entity.aliases]
@@ -155,15 +181,15 @@ class DomainKnowledgeGraphService:
 
         score = 0.0
         matched_aliases: list[str] = []
-        if query_lower == name_lower:
+        if positive_query_lower and positive_query_lower == name_lower:
             score += 10.0
-        elif query_lower in name_lower or name_lower in query_lower:
+        elif positive_query_lower and (positive_query_lower in name_lower or name_lower in positive_query_lower):
             score += 7.0
         for alias, alias_lower in zip(entity.aliases, alias_lowers, strict=False):
-            if query_lower == alias_lower:
+            if positive_query_lower and positive_query_lower == alias_lower:
                 score += 8.0
                 matched_aliases.append(alias)
-            elif query_lower in alias_lower or alias_lower in query_lower:
+            elif positive_query_lower and (positive_query_lower in alias_lower or alias_lower in positive_query_lower):
                 score += 5.0
                 matched_aliases.append(alias)
         for term in terms:
@@ -184,7 +210,7 @@ class DomainKnowledgeGraphService:
         relations: list[DomainKnowledgeRelation],
         entity_by_id: dict[str, DomainKnowledgeEntity],
     ) -> float:
-        query_lower = query.lower()
+        query_lower = _positive_query_text(query.lower())
         terms = _terms(query_lower)
         bonus = 0.0
         for relation in relations:
@@ -221,7 +247,24 @@ class DomainKnowledgeGraphService:
 
 
 def _terms(value: str) -> list[str]:
-    return [term for term in re.split(r"[\s,，。；;:：/|()（）]+", value) if term]
+    negated_terms: set[str] = set()
+    for match in _NEGATED_MENTION_PATTERN.finditer(value):
+        negated_terms.update(_extract_terms(match.group(1).lower()))
+    terms: list[str] = []
+    for chunk in re.split(r"[\s,，。；;:：/|()（）]+", value):
+        normalized = chunk.strip()
+        if not normalized:
+            continue
+        terms.extend(_extract_terms(normalized))
+    return list(dict.fromkeys(term for term in terms if term and term not in negated_terms))
+
+
+def _positive_query_text(value: str) -> str:
+    return _NEGATED_MENTION_PATTERN.sub(" ", value).strip()
+
+
+def _extract_terms(value: str) -> list[str]:
+    return re.findall(r"[a-zA-Z][a-zA-Z0-9+._-]{1,}|[\u4e00-\u9fff]{2,}", value)
 
 
 def _anchor(value: str) -> str:

@@ -531,6 +531,50 @@ def test_cli_eval_suite_limits_default_questions_with_max_questions(monkeypatch,
     assert len(store.list_answers()) == 1
 
 
+def test_cli_eval_replay_reruns_previous_evaluation_questions(monkeypatch, tmp_path):
+    from search_assistant import cli
+
+    monkeypatch.setenv("SEARCH_ASSISTANT_MODEL_PROVIDER", "fake")
+    monkeypatch.setenv("SEARCH_ASSISTANT_ALLOW_FAKE_RUNTIME", "true")
+    monkeypatch.setattr(cli, "search_client_from_settings", lambda settings: EmptySearchClient())
+    eval_dir = tmp_path / "evaluations"
+    eval_dir.mkdir()
+    report = {
+        "total_questions": 1,
+        "items": [
+            {
+                "index": 1,
+                "question": "What is CXL?",
+                "question_id": "q-old",
+                "answer_excerpt": "old answer",
+                "source_urls": [],
+                "quality_flags": [],
+            }
+        ],
+        "summary": {
+            "flagged_answers": 0,
+            "review_rejected_answers": 0,
+            "result_failed_answers": 0,
+            "process_flagged_answers": 0,
+        },
+    }
+    (eval_dir / "evaluation-report.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["eval-replay", "--data-dir", str(tmp_path)]) == 0
+    stream.flush()
+    output = json.loads(stream.buffer.getvalue().decode("utf-8"))
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    assert output["ok"] is True
+    assert output["replayed"] == 1
+    assert Path(output["replay_report_path"]).exists()
+    assert store.list_gate_records(gate_type="evaluation_replay")[0]["result"] == "passed"
+    assert store.list_project_ledger_entries(entry_type="evaluation_replay")[0]["status"] == "completed"
+
+
 def test_cli_skill_draft_uses_existing_profile_sources(monkeypatch, tmp_path):
     from search_assistant import cli
 

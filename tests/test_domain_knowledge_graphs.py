@@ -41,6 +41,19 @@ def test_query_returns_entity_with_relationship_context(tmp_path):
     assert "MES" in hits[0].entity_name or "MES" in hits[0].summary or "MES" in combined_relations
 
 
+def test_relevant_query_keeps_strong_matches_and_filters_unrelated_terms(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeGraphService(store)
+    service.seed_default_graphs()
+
+    harness_hits = service.query_relevant("harness是什么", limit=3)
+    unrelated_hits = service.query_relevant("盐酸的作用", limit=3)
+
+    assert any(hit.graph_id == "agent-engineering" and hit.entity_id == "harness-engineering" for hit in harness_hits)
+    assert unrelated_hits == []
+
+
 def test_export_markdown_preserves_entities_and_graph_links(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()

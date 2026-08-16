@@ -1,8 +1,21 @@
 from datetime import date
 import json
 import time
-from search_assistant.briefing.service import DailyBriefingService, REPORT_SKILL_PATH, _is_substantive_synthesis
-from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, IncomingMessage
+from search_assistant.briefing.service import (
+    DailyBriefingService,
+    REPORT_SKILL_PATH,
+    _classify_briefing_intent,
+    _is_substantive_synthesis,
+)
+from search_assistant.contracts import (
+    BriefingSynthesis,
+    BriefingTheme,
+    CollectedSource,
+    DomainKnowledgeCandidate,
+    DomainKnowledgeEvidence,
+    IncomingMessage,
+)
+from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
 from search_assistant.workflow.runtime import DeepSeekChatRuntime, FakeAgentRuntime
@@ -98,39 +111,43 @@ class GenericIndustrySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
             SearchResult(
-                title="NAAI发布2024年全球人工智能产业发展报告",
+                title="NAAI 发布全球人工智能产业发展报告",
                 url="https://mp.weixin.qq.com/s/industry-report",
-                snippet="人工智能产业发展报告梳理产业规模、产业链、政策环境和企业投入方向，但没有披露具体系统接口。",
+                snippet="报告覆盖人工智能产业发展规模、产业链、政策环境和投资方向，但没有直接说明系统接口。",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展中的AI数据集和benchmark建设",
+                title="人工智能产业发展中的数据集与基准建设",
                 url="https://example.com/ai-dataset-benchmark",
-                snippet="文章讨论dataset、benchmark、开源模型和评测指标如何支撑人工智能产业发展。",
+                snippet="文章讨论人工智能产业发展所需的数据集、基准、开源模型和评估指标。",
                 provider="browser-bing",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展推动制造业和政务场景落地",
+                title="人工智能产业发展进入制造业与政务工作流",
                 url="https://example.com/ai-application-case",
-                snippet="案例描述人工智能应用进入业务流程，但仍需要核验数据输入、系统接口、人工审批和量化收益。",
+                snippet="案例描述人工智能进入业务流程后仍需要数据输入、系统接口、人工审批和 ROI 验证。",
                 provider="browser-google",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="央视纪录片讨论人工智能产业发展与智能时代",
+                title="公开视频解读人工智能产业发展趋势",
                 url="https://www.bilibili.com/video/av996452521",
-                snippet="公开视频和纪录片解释人工智能发展趋势，适合作为公众传播信号而不是系统实现证据。",
+                snippet="公开视频从科普角度说明人工智能产业发展趋势，属于传播信号而非系统实现证据。",
                 provider="bilibili-public-api",
                 checked_at="2026-08-08T00:00:00+00:00",
             ),
             SearchResult(
-                title="人工智能产业发展大会展示AI产品和生态合作",
+                title="人工智能产业发展大会展示产品与生态合作",
                 url="https://example.com/ai-conference",
-                snippet="大会展示产品动态、生态合作和行业讨论，需要继续查找原始技术文档和客户部署指标。",
+                snippet="大会展示人工智能产品更新、生态合作和产业讨论，仍需补充原始技术文档和部署指标。",
                 provider="browser-baidu",
                 checked_at="2026-08-08T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
 class MarketingSearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
@@ -157,6 +174,36 @@ class MarketingSearchClient:
         ][:limit]
 
 
+class HarnessSearchClient:
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        return [
+            SearchResult(
+                title="Agent harness orchestration and tool execution contract",
+                url="https://example.com/agent-harness-architecture",
+                snippet=(
+                    "A harness coordinates prompts, context assembly, tool permissions, "
+                    "state checkpoints, eval gates, replay logs, and failure recovery for agent systems."
+                ),
+                provider="mcp:public:test",
+                checked_at="2026-08-13T00:00:00+00:00",
+            ),
+            SearchResult(
+                title="Harness evaluation traces for agent workflows",
+                url="https://example.com/agent-harness-evals",
+                snippet=(
+                    "Harness traces record tool calls, source evidence, output validation, "
+                    "and replayable regression tests before a capability is released."
+                ),
+                provider="browser-google",
+                checked_at="2026-08-13T00:00:00+00:00",
+            ),
+        ][:limit]
+
+
 class PlanningRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
@@ -171,13 +218,30 @@ class PlanningRuntime(FakeAgentRuntime):
         ]
 
 
+class KnowledgeContextRuntime(FakeAgentRuntime):
+    def __init__(self):
+        super().__init__()
+        self.planning_context: dict[str, object] | None = None
+        self.synthesis_context: dict[str, object] | None = None
+
+    def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
+        self.planning_context = context
+        return ["agent harness workflow eval replay architecture"]
+
+    def synthesize_briefing(self, topic, sources, context):
+        self.synthesis_context = context
+        return None
+
+
 class SourceLimitRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
         self.synthesis_source_count = 0
+        self.synthesis_context: dict[str, object] | None = None
 
     def synthesize_briefing(self, topic, sources, context):
         self.synthesis_source_count = len(sources)
+        self.synthesis_context = context
         return None
 
 
@@ -262,6 +326,37 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert all(candidate["status"] == "candidate" for candidate in candidates)
     assert all(briefing.id in candidate["source_ids"] for candidate in candidates)
     assert all(candidate["evidence"] for candidate in candidates)
+    validation_gates = store.list_gate_records(gate_type="domain_knowledge_candidate_validation")
+    assert len(validation_gates) == len(candidates)
+    validation_passed = sum(1 for gate in validation_gates if gate["result"] == "passed")
+    validation_failed = sum(1 for gate in validation_gates if gate["result"] == "failed")
+    assert validation_passed + validation_failed == len(candidates)
+    ledger_entries = store.list_project_ledger_entries(entry_type="briefing_run")
+    assert len(ledger_entries) == 1
+    assert ledger_entries[0]["metadata"]["source_count"] == 3
+    assert ledger_entries[0]["metadata"]["validation_gate_passed"] == validation_passed
+    assert ledger_entries[0]["metadata"]["validation_gate_failed"] == validation_failed
+    assert sum(ledger_entries[0]["metadata"]["knowledge_layers"].values()) == len(candidates)
+    assert store.latest_project_ledger_snapshot("pydantic-ai-tech-intel-briefing")["status"] == "active"
+    trace_names = {event["name"] for event in store.list_trace_events()}
+    assert {
+        "plan_queries",
+        "collect_sources",
+        "synthesize_report",
+        "capture_domain_knowledge_candidates",
+        "run",
+    }.issubset(trace_names)
+    checkpoint_steps = {checkpoint["step"] for checkpoint in store.list_run_checkpoints()}
+    assert {
+        "planned",
+        "sources_collected",
+        "synthesized",
+        "candidates_captured",
+        "completed",
+    }.issubset(checkpoint_steps)
+    provider_health = store.list_search_provider_health()
+    assert len(provider_health) == len(search.queries)
+    assert all(row["ok"] for row in provider_health)
 
 
 def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(tmp_path):
@@ -332,6 +427,35 @@ def test_marketing_filter_keeps_technical_public_account_posts():
     )
 
 
+def test_briefing_intent_classifies_common_user_questions():
+    assert _classify_briefing_intent("harness是什么").primary_intent == "concept_explanation"
+    assert _classify_briefing_intent("人工智能产业发展").primary_intent == "industry_trend"
+    assert _classify_briefing_intent("具身智能技术").primary_intent == "technical_tracking"
+    assert _classify_briefing_intent("LangGraph vs Pydantic AI 选型").primary_intent == "comparison_decision"
+
+
+def test_concept_intent_changes_deterministic_queries_without_dropping_channels(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, RecordingSearchClient(), max_queries=20)
+    subscription = store.upsert_topic("u-1", "c-1", "harness是什么")
+
+    plan = service.build_search_plan(subscription, [])
+    deterministic_queries = [query for platform, query in plan if "确定性保障" in platform]
+    keywords = DailyBriefingService._keywords(
+        subscription.topic,
+        [],
+        plan,
+        intent=_classify_briefing_intent(subscription.topic),
+    )
+
+    assert any("definition" in query.lower() for query in deterministic_queries)
+    assert any(platform == "全球网页" for platform, _ in plan)
+    assert any(platform == "YouTube" for platform, _ in plan)
+    assert "概念边界" in keywords
+    assert "典型语境" in keywords
+
+
 def test_case_feedback_changes_follow_up_briefing_direction_and_keeps_original_url(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -366,8 +490,71 @@ def test_daily_briefing_uses_model_planned_technical_queries_and_static_skill(tm
     assert "predictive maintenance time-series anomaly detection evaluation" in search.queries
     assert "LinkedIn industrial AI discussion" not in briefing.keywords
     assert runtime.briefing_context is not None
+    assert runtime.briefing_context["briefing_intent"]["primary_intent"] == "technical_tracking"
     assert "内容搜集报告" in str(runtime.briefing_context["report_skill"])
     assert REPORT_SKILL_PATH.exists()
+
+
+def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = "2026-08-13T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-agent-harness",
+        topic="harness是什么",
+        claim=(
+            "Agent harness 是模型外侧的工程控制层，负责上下文组装、工具权限、状态检查点、"
+            "评测回放和失败恢复。"
+        ),
+        applies_when="Use when researching agent harness architecture and replayable evals.",
+        evidence=[
+            DomainKnowledgeEvidence(
+                title="Agent harness architecture",
+                url="https://example.com/agent-harness-architecture",
+                provider="example",
+                retrieved_at=now,
+            ),
+            DomainKnowledgeEvidence(
+                title="Agent harness replay evaluation",
+                url="https://example.com/agent-harness-evals",
+                provider="example",
+                retrieved_at=now,
+            ),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-harness"],
+        fingerprint="validated-agent-harness-candidate-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+    DomainKnowledgeCandidateService(store).validate(candidate.id)
+    runtime = KnowledgeContextRuntime()
+    service = DailyBriefingService(
+        store,
+        HarnessSearchClient(),
+        runtime=runtime,
+        max_queries=20,
+        results_per_query=2,
+        max_sources=6,
+        model_max_sources=2,
+    )
+
+    briefing = service.run("harness是什么", "u-1", "c-1", run_date=date(2026, 8, 13))
+
+    assert runtime.planning_context is not None
+    planning_context = runtime.planning_context["knowledge_context"]
+    assert any(hit["entity_id"] == "harness-engineering" for hit in planning_context["reviewed_graph_hits"])
+    assert [item["id"] for item in planning_context["validated_candidates"]] == [candidate.id]
+    assert runtime.synthesis_context is not None
+    assert runtime.synthesis_context["knowledge_context"]["validated_candidates"][0]["id"] == candidate.id
+    assert any(direction.startswith("知识图谱补充:") for direction in briefing.search_directions)
+    assert any(direction.startswith("自进化知识补充:") for direction in briefing.search_directions)
+    plan_trace = next(event for event in store.list_trace_events() if event["name"] == "plan_queries")
+    assert plan_trace["metadata"]["knowledge_context"]["reviewed_graph_hits"] >= 1
+    assert plan_trace["metadata"]["knowledge_context"]["validated_candidates"] == 1
 
 
 def test_case_feedback_uses_public_index_context_before_the_next_planning_step(tmp_path):
@@ -422,14 +609,45 @@ def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp
     briefing = service.run("人工智能产业发展", "u-1", "c-1", run_date=date(2026, 8, 8))
 
     assert runtime.synthesis_source_count == 2
+    assert runtime.synthesis_context is not None
+    assert runtime.synthesis_context["briefing_intent"]["primary_intent"] == "industry_trend"
     assert len(briefing.sources) == 5
     assert "保留了 5 条公开线索" in briefing.synthesis.search_content_summary
-    assert "### 政策、规模与产业链信号" in briefing.synthesis.detailed_summary
-    assert "### 技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
-    assert "### 应用落地与业务转型案例" in briefing.synthesis.detailed_summary
-    assert "### 教育传播、公众讨论与弱证据线索" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的政策、规模与产业链信号" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的应用落地与业务流程线索" in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展的传播讨论与弱证据线索" in briefing.synthesis.detailed_summary
+    assert "### 政策、规模与产业链信号" not in briefing.synthesis.detailed_summary
     assert "相关线索集中讨论" not in briefing.synthesis.detailed_summary
     assert _is_substantive_synthesis(briefing.synthesis) is True
+
+
+def test_generic_intent_topic_fallback_does_not_reuse_industrial_headings(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DailyBriefingService(store, RecordingSearchClient())
+    source = CollectedSource(
+        id="src-intent-agent",
+        topic_id="topic-1",
+        user_id="u-1",
+        title="AI 智能体实战：意图识别提升之道",
+        url="https://example.com/intent-agent",
+        snippet="意图识别和槽位抽取是自然语言理解 NLU 的关键部分，会影响 Agent 交互质量。",
+        platform="技术路线",
+        provider="browser-bing",
+        query="意图识别 technical architecture",
+        relevance_score=1.0,
+        importance_score=8.0,
+        retrieved_at="2026-08-15T00:00:00+00:00",
+    )
+
+    synthesis = service._fallback_synthesis("意图识别", [source])
+
+    assert "### 工业智能体与生产协同" not in synthesis.detailed_summary
+    assert "### 综合产业动态与待核验证据" not in synthesis.detailed_summary
+    assert "### 意图识别的待核验证据线索" in synthesis.detailed_summary
+    assert "把自然语言任务、生产约束和企业系统接口连接起来" not in synthesis.detailed_summary
+    assert "意图识别" in synthesis.search_content_summary
 
 
 def test_short_single_block_generated_detail_is_not_substantive():
@@ -478,6 +696,40 @@ def test_daily_briefing_keeps_model_selected_detail_structure_without_injecting_
     assert len(briefing.synthesis.themes) == 1
     assert briefing.synthesis.themes[0].name == "模型给出的受控工单链路"
     assert "### 模型不直接控制设备，而是生成受控的工单候选" in briefing.markdown
+
+
+def test_detailed_summary_compaction_preserves_headings_without_fixed_template_labels():
+    long_first = (
+        "Harness 在这里不是模型本身，而是模型之外的控制层。"
+        "它负责上下文整理、工具调用、状态保存、输出校验和失败恢复。"
+        "Harness 在这里不是模型本身，而是模型之外的控制层。"
+        "如果继续展开，还会涉及观测、回放、权限和部署边界。"
+    )
+    long_second = (
+        "持续交付语境里的 Harness.io 更偏发布流水线、健康检查和回滚。"
+        "它和 AI Agent harness 共享外围控制思想，但对象不是同一个。"
+        "因此报告需要区分语境，不能把所有来源合并成单一架构。"
+    )
+    original = (
+        "### Agent Harness：把不可靠的模型放进确定性执行环境\n"
+        f"{long_first}\n\n{long_first}\n\n"
+        "### Harness.io 作为发布稳定性 harness\n"
+        f"{long_second}\n\n{long_second}"
+    )
+
+    compacted = DailyBriefingService._compact_detailed_summary_body(
+        original,
+        max_paragraph_chars=120,
+        max_paragraphs_per_heading=1,
+    )
+
+    assert "### Agent Harness：把不可靠的模型放进确定性执行环境" in compacted
+    assert "### Harness.io 作为发布稳定性 harness" in compacted
+    assert compacted.count("### ") == 2
+    assert "- 结论：" not in compacted
+    assert "- 依据：" not in compacted
+    assert "- 意义：" not in compacted
+    assert len(compacted) < len(original)
 
 
 def test_cad_topic_filter_rejects_generic_ai_content_and_keeps_engineering_evidence():
@@ -677,7 +929,15 @@ def test_glm_briefing_synthesis_validates_text_json_against_collected_urls():
         return json.dumps(output)
 
     runtime = GLMPydanticAIRuntime(api_key="test-key", agent_runner=runner)
-    synthesis = runtime.synthesize_briefing("industrial AI", [source], {"report_contract": {}, "report_skill": "contract"})
+    synthesis = runtime.synthesize_briefing(
+        "industrial AI",
+        [source],
+        {
+            "report_contract": {},
+            "report_skill": "contract",
+            "knowledge_context": {"reviewed_graph_hits": [{"entity_id": "mes"}]},
+        },
+    )
 
     assert synthesis.themes[0].source_urls == [source.url]
     assert _is_substantive_synthesis(synthesis) is True
@@ -686,6 +946,7 @@ def test_glm_briefing_synthesis_validates_text_json_against_collected_urls():
     assert "detailed_summary" in calls[0][3]
     assert "input form" in calls[0][3]
     assert "industry-wide claim" in calls[0][3]
+    assert json.loads(calls[0][4])["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
 
     retry_calls = []
 
@@ -775,8 +1036,18 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
         agent_runner=runner,
     )
 
-    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": []})
-    synthesis = runtime.synthesize_briefing("industrial AI", [source], {"report_contract": {}, "report_skill": "contract"})
+    knowledge_context = {"reviewed_graph_hits": [{"entity_id": "mes"}]}
+    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": [], "knowledge_context": knowledge_context})
+    synthesis = runtime.synthesize_briefing(
+        "industrial AI",
+        [source],
+        {
+            "report_contract": {},
+            "report_skill": "contract",
+            "knowledge_context": knowledge_context,
+            "search_plan": [("technical", f"query-{index}") for index in range(25)],
+        },
+    )
 
     assert queries == ["industrial AI MES workflow architecture"]
     assert synthesis.themes[0].source_urls == [source.url]
@@ -787,7 +1058,10 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
     assert calls[1]["model"] == "deepseek-v4-flash"
     assert calls[1]["base_url"] == "https://api.deepseek.com"
     assert "Return ONLY one valid JSON object" in str(calls[1]["instructions"])
+    assert json.loads(str(calls[0]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
     assert json.loads(str(calls[1]["prompt"]))["sources"][0]["url"] == source.url
+    assert json.loads(str(calls[1]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
+    assert len(json.loads(str(calls[1]["prompt"]))["search_plan"]) == 20
 
 
 def test_glm_provider_selects_the_pydantic_ai_runtime():

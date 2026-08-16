@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 import re
+import time
 import uuid
 from typing import Protocol
 from urllib.parse import urlparse
@@ -11,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from search_assistant.contracts import BriefingSynthesis, BriefingTheme, CollectedSource, DailyBriefing, TopicSubscription
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
+from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchResult
 
@@ -42,9 +45,241 @@ REPORT_CONTRACT = {
         "原文链接",
     ],
     "detail_sections": "模型按本轮证据自行组织 2 至 5 个分析块，不使用固定技术地图模板。",
+    "readability": {
+        "keep_existing_headings": True,
+        "target_total_chars": "3500-4500",
+        "short_summary_chars": "120-220",
+        "detail_block_paragraphs": "1-2",
+        "detail_paragraph_chars": "160-220",
+        "preserve_original_urls": True,
+        "forbidden_fixed_labels": ["结论：", "依据：", "意义："],
+    },
 }
 
 REPORT_SKILL_PATH = Path(__file__).resolve().parents[3] / "skills" / "content-collection-report" / "SKILL.md"
+
+
+@dataclass(frozen=True)
+class BriefingIntentProfile:
+    primary_intent: str
+    label: str
+    summary: str
+    search_focus: tuple[str, ...]
+    synthesis_focus: tuple[str, ...]
+    keyword_hints: tuple[str, ...]
+    query_templates: tuple[str, ...]
+
+    def model_dump(self) -> dict[str, object]:
+        return {
+            "primary_intent": self.primary_intent,
+            "label": self.label,
+            "summary": self.summary,
+            "search_focus": list(self.search_focus),
+            "synthesis_focus": list(self.synthesis_focus),
+            "keyword_hints": list(self.keyword_hints),
+            "query_templates": list(self.query_templates),
+        }
+
+
+_INTENT_PROFILES: dict[str, BriefingIntentProfile] = {
+    "concept_explanation": BriefingIntentProfile(
+        primary_intent="concept_explanation",
+        label="概念解释",
+        summary="用户更像是在问一个概念、术语或产品是什么，报告应先讲清定义、边界和常见语境。",
+        search_focus=("定义与官方说明", "概念边界", "典型使用场景", "易混淆对象"),
+        synthesis_focus=("先用通俗语言解释概念", "区分不同语境下的含义", "避免直接扩展成产业综述"),
+        keyword_hints=("定义", "概念边界", "典型语境", "易混淆点"),
+        query_templates=(
+            "{topic} definition concept technical context",
+            "{topic} official documentation architecture overview",
+            "{topic} use cases terminology common misconceptions",
+        ),
+    ),
+    "technical_tracking": BriefingIntentProfile(
+        primary_intent="technical_tracking",
+        label="技术追踪",
+        summary="用户更像是在跟踪某项技术，报告应关注实现路线、论文/开源、评测和部署边界。",
+        search_focus=("技术架构", "论文与开源", "评测基准", "部署接口"),
+        synthesis_focus=("提炼实现机制", "说明可验证证据", "指出评测和工程边界"),
+        keyword_hints=("技术架构", "开源项目", "论文", "评测", "部署"),
+        query_templates=(
+            "{topic} technical architecture implementation evaluation",
+            "{topic} open source repository paper dataset benchmark",
+            "{topic} deployment workflow data interface case study",
+        ),
+    ),
+    "industry_trend": BriefingIntentProfile(
+        primary_intent="industry_trend",
+        label="产业趋势",
+        summary="用户更像是在看产业发展，报告应把政策、市场、企业动作和真实落地证据分开讲。",
+        search_focus=("政策与市场", "产业链与生态", "公司/产品动作", "真实落地案例"),
+        synthesis_focus=("区分宏观信号和工程证据", "避免把宣传材料当成落地结论", "给出产业判断边界"),
+        keyword_hints=("政策", "产业链", "市场规模", "企业动作", "落地案例"),
+        query_templates=(
+            "{topic} policy market industry chain report",
+            "{topic} company product release investment adoption",
+            "{topic} case study deployment metrics ecosystem",
+        ),
+    ),
+    "engineering_landing": BriefingIntentProfile(
+        primary_intent="engineering_landing",
+        label="工程落地",
+        summary="用户更像是在找怎么落地，报告应关注架构、接口、数据流、验收指标和失败回滚。",
+        search_focus=("系统架构", "接口与数据流", "部署验证", "回滚与运维"),
+        synthesis_focus=("还原端到端链路", "明确集成点和约束", "优先输出可执行建议"),
+        keyword_hints=("系统架构", "接口", "数据流", "验证", "回滚"),
+        query_templates=(
+            "{topic} architecture integration workflow data interface",
+            "{topic} deployment operations validation rollback",
+            "{topic} case study implementation metrics",
+        ),
+    ),
+    "comparison_decision": BriefingIntentProfile(
+        primary_intent="comparison_decision",
+        label="对比选型",
+        summary="用户更像是在比较方案，报告应给出差异、取舍、适用场景和选型判断。",
+        search_focus=("方案差异", "评测对比", "迁移成本", "适用场景"),
+        synthesis_focus=("按决策维度比较", "说明证据支持和缺口", "给出低风险选择建议"),
+        keyword_hints=("对比", "差异", "适用场景", "选型", "限制"),
+        query_templates=(
+            "{topic} comparison architecture tradeoffs benchmark",
+            "{topic} vs official documentation differences",
+            "{topic} migration decision criteria limitations",
+        ),
+    ),
+}
+
+
+_DEFAULT_BRIEFING_INTENT = _INTENT_PROFILES["technical_tracking"]
+
+
+def _has_intent_marker(text: str, compact_text: str, markers: tuple[str, ...]) -> bool:
+    for marker in markers:
+        normalized_marker = marker.lower()
+        compact_marker = normalized_marker.replace(" ", "")
+        if normalized_marker in text or compact_marker in compact_text:
+            return True
+    return False
+
+
+def _topic_terms(topic: str) -> list[str]:
+    terms = re.findall(r"[A-Za-z][A-Za-z0-9+._/-]{1,}|[\u4e00-\u9fff]{2,}", topic.lower())
+    compact = re.sub(r"\s+", "", topic.lower())
+    if compact and compact not in terms and len(compact) >= 2:
+        terms.insert(0, compact)
+    return list(dict.fromkeys(term for term in terms if _is_meaningful_query(term)))
+
+
+def _classify_briefing_intent(
+    topic: str,
+    feedback: list[dict[str, object]] | None = None,
+) -> BriefingIntentProfile:
+    feedback_text = " ".join(str(item.get("body") or "") for item in (feedback or [])[:3])
+    text = f"{topic} {feedback_text}".lower()
+    compact_text = re.sub(r"\s+", "", text)
+
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "对比",
+            "比较",
+            "区别",
+            "差异",
+            "哪个",
+            "选型",
+            "vs",
+            "versus",
+            "compare",
+            "comparison",
+            "tradeoff",
+            "better",
+            "which",
+        ),
+    ):
+        return _INTENT_PROFILES["comparison_decision"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "是什么",
+            "什么是",
+            "解释",
+            "概念",
+            "入门",
+            "介绍一下",
+            "what is",
+            "define",
+            "definition",
+            "meaning",
+        ),
+    ):
+        return _INTENT_PROFILES["concept_explanation"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "部署",
+            "接入",
+            "落地",
+            "架构",
+            "方案",
+            "工作流",
+            "接口",
+            "集成",
+            "生产",
+            "workflow",
+            "architecture",
+            "deployment",
+            "deploy",
+            "integration",
+            "implementation",
+            "case study",
+        ),
+    ):
+        return _INTENT_PROFILES["engineering_landing"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "产业",
+            "发展",
+            "趋势",
+            "政策",
+            "市场",
+            "投融资",
+            "公司",
+            "生态",
+            "industry",
+            "market",
+            "trend",
+            "policy",
+            "investment",
+            "business",
+            "development",
+        ),
+    ):
+        return _INTENT_PROFILES["industry_trend"]
+    if _has_intent_marker(
+        text,
+        compact_text,
+        (
+            "技术",
+            "论文",
+            "模型",
+            "大模型",
+            "开源",
+            "评测",
+            "benchmark",
+            "paper",
+            "repository",
+            "open source",
+            "model",
+            "dataset",
+        ),
+    ):
+        return _INTENT_PROFILES["technical_tracking"]
+    return _DEFAULT_BRIEFING_INTENT
 
 
 CHANNEL_QUERIES: tuple[tuple[str, str], ...] = (
@@ -485,7 +720,10 @@ def _has_cad_anchor(title: str, snippet: str) -> bool:
     return False
 
 
-def _deterministic_technical_queries(topic: str) -> list[str]:
+def _deterministic_technical_queries(
+    topic: str,
+    intent: BriefingIntentProfile | None = None,
+) -> list[str]:
     if _is_cad_topic(topic):
         return [
             "Text-to-CAD parametric B-Rep generation open source evaluation",
@@ -494,11 +732,27 @@ def _deterministic_technical_queries(topic: str) -> list[str]:
             "CAD copilot sketch constraint solving feature modeling architecture",
             "B-Rep topology validation geometric constraints manufacturability generated CAD",
         ]
-    return [
-        f"{topic} technical architecture implementation evaluation",
-        f"{topic} open source repository paper dataset benchmark",
-        f"{topic} deployment workflow data interface case study",
-    ]
+    profile = intent or _DEFAULT_BRIEFING_INTENT
+    return [template.format(topic=topic) for template in profile.query_templates]
+
+
+def _duration_ms(started: float) -> float:
+    return round((time.monotonic() - started) * 1000, 3)
+
+
+def _count_knowledge_layers(validation_results: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in validation_results:
+        layer = str(item.get("knowledge_layer") or "unreviewed_candidate")
+        counts[layer] = counts.get(layer, 0) + 1
+    return counts
+
+
+def _safe_trace_error(exc: Exception) -> str:
+    text = str(exc)
+    for marker in ("api_key", "API key", "Authorization", "token", "secret", "password"):
+        text = text.replace(marker, "[redacted]")
+    return text[:500]
 
 
 class DailyBriefingService:
@@ -531,43 +785,243 @@ class DailyBriefingService:
         chat_id: str,
         run_date: date | None = None,
     ) -> DailyBriefing:
-        subscription = self.store.upsert_topic(user_id, chat_id, topic)
-        feedback = self.store.list_topic_feedback(subscription.id)
-        search_plan = self.build_search_plan(subscription, feedback)
-        sources = self._collect_sources(subscription, search_plan, feedback)
-        ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[: self.max_sources]
-        synthesis = self._synthesize(
-            subscription.topic,
-            ranked_sources[: self.model_max_sources],
-            search_plan,
-            fallback_sources=ranked_sources,
-        )
-        resolved_date = run_date or self._briefing_date()
-        briefing = DailyBriefing(
-            id=f"brief_{uuid.uuid4().hex}",
-            topic_id=subscription.id,
-            user_id=user_id,
-            chat_id=chat_id,
-            topic=subscription.topic,
-            run_date=resolved_date,
-            search_directions=[f"{platform}: {query}" for platform, query in search_plan],
-            keywords=self._keywords(subscription.topic, feedback, search_plan),
-            sources=ranked_sources,
-            synthesis=synthesis,
-            markdown="",
-            created_at=datetime.now(UTC).isoformat(),
-        )
-        briefing.markdown = self.render_markdown(briefing)
-        self.store.record_daily_briefing(briefing)
-        DomainKnowledgeCandidateService(self.store).capture_briefing(briefing)
-        return briefing
+        run_id = f"brief_run_{uuid.uuid4().hex}"
+        run_started = time.monotonic()
+        try:
+            phase_started = time.monotonic()
+            subscription = self.store.upsert_topic(user_id, chat_id, topic)
+            self._ensure_project_state()
+            feedback = self.store.list_topic_feedback(subscription.id)
+            briefing_intent = _classify_briefing_intent(subscription.topic, feedback)
+            knowledge_context = self._knowledge_context(subscription.topic)
+            search_plan = self.build_search_plan(
+                subscription,
+                feedback,
+                intent=briefing_intent,
+                knowledge_context=knowledge_context,
+            )
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "plan_queries",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
+                    "query_count": len(search_plan),
+                    "feedback_count": len(feedback),
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "planned",
+                payload={
+                    "topic_id": subscription.id,
+                    "briefing_intent": briefing_intent.model_dump(),
+                    "query_count": len(search_plan),
+                    "feedback_count": len(feedback),
+                    "queries": [query for _, query in search_plan[:8]],
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                },
+            )
+
+            phase_started = time.monotonic()
+            sources = self._collect_sources(subscription, search_plan, feedback, run_id=run_id)
+            ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[
+                : self.max_sources
+            ]
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "collect_sources",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "raw_source_count": len(sources),
+                    "ranked_source_count": len(ranked_sources),
+                    "max_sources": self.max_sources,
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "sources_collected",
+                payload={
+                    "raw_source_count": len(sources),
+                    "ranked_source_count": len(ranked_sources),
+                    "source_urls": [source.url for source in ranked_sources[:10]],
+                },
+            )
+
+            phase_started = time.monotonic()
+            synthesis = self._synthesize(
+                subscription.topic,
+                ranked_sources[: self.model_max_sources],
+                search_plan,
+                fallback_sources=ranked_sources,
+                briefing_intent=briefing_intent,
+                knowledge_context=knowledge_context,
+            )
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "synthesize_report",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
+                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
+                    "theme_count": len(synthesis.themes),
+                    "used_runtime": self.runtime is not None,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "synthesized",
+                payload={
+                    "theme_count": len(synthesis.themes),
+                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
+                    "used_runtime": self.runtime is not None,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                },
+            )
+
+            resolved_date = run_date or self._briefing_date()
+            briefing = DailyBriefing(
+                id=f"brief_{uuid.uuid4().hex}",
+                topic_id=subscription.id,
+                user_id=user_id,
+                chat_id=chat_id,
+                topic=subscription.topic,
+                run_date=resolved_date,
+                search_directions=[f"{platform}: {query}" for platform, query in search_plan],
+                keywords=self._keywords(subscription.topic, feedback, search_plan, intent=briefing_intent),
+                sources=ranked_sources,
+                synthesis=synthesis,
+                markdown="",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            briefing.markdown = self.render_markdown(briefing)
+            self.store.record_daily_briefing(briefing)
+
+            phase_started = time.monotonic()
+            candidate_service = DomainKnowledgeCandidateService(self.store)
+            candidate_ids = candidate_service.capture_briefing(briefing)
+            validation_results = [candidate_service.record_validation_gate(candidate_id) for candidate_id in candidate_ids]
+            knowledge_layers = _count_knowledge_layers(validation_results)
+            self._record_trace_event(
+                run_id,
+                "evolution",
+                "capture_domain_knowledge_candidates",
+                phase_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "candidate_count": len(candidate_ids),
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "candidates_captured",
+                payload={
+                    "briefing_id": briefing.id,
+                    "candidate_ids": candidate_ids,
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
+                },
+            )
+            self.store.add_project_ledger_entry(
+                entry_type="briefing_run",
+                subject=subscription.topic,
+                status="completed",
+                summary=f"Generated daily briefing with {len(ranked_sources)} retained sources.",
+                evidence_refs=[
+                    f"briefing:{briefing.id}",
+                    *[source.url for source in ranked_sources[:8]],
+                    *[f"candidate:{candidate_id}" for candidate_id in candidate_ids[:8]],
+                ],
+                risk="Public search coverage can be incomplete or blocked; the report should be read with source URLs.",
+                rollback="Use an isolated --data-dir for tests, or delete the generated briefing/data directory.",
+                metadata={
+                    "run_id": run_id,
+                    "topic_id": subscription.id,
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                    "query_count": len(search_plan),
+                    "source_count": len(ranked_sources),
+                    "candidate_count": len(candidate_ids),
+                    "validation_gate_passed": sum(1 for item in validation_results if item["validated"]),
+                    "validation_gate_failed": sum(1 for item in validation_results if not item["validated"]),
+                    "knowledge_layers": knowledge_layers,
+                    "run_date": briefing.run_date.isoformat(),
+                },
+            )
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "run",
+                run_started,
+                metadata={
+                    "topic": subscription.topic,
+                    "status": "completed",
+                    "intent": briefing_intent.primary_intent,
+                    "intent_label": briefing_intent.label,
+                    "knowledge_context": self._knowledge_context_metadata(knowledge_context),
+                    "query_count": len(search_plan),
+                    "source_count": len(ranked_sources),
+                },
+            )
+            self._record_checkpoint(
+                run_id,
+                subscription.topic,
+                "completed",
+                payload={
+                    "briefing_id": briefing.id,
+                    "source_count": len(ranked_sources),
+                    "candidate_count": len(candidate_ids),
+                },
+            )
+            return briefing
+        except Exception as exc:
+            self._record_trace_event(
+                run_id,
+                "briefing",
+                "run",
+                run_started,
+                status="failed",
+                metadata={"topic": topic},
+                error=_safe_trace_error(exc),
+            )
+            self._record_checkpoint(
+                run_id,
+                topic,
+                "failed",
+                status="failed",
+                payload={"error": _safe_trace_error(exc)},
+            )
+            raise
 
     def build_search_plan(
         self,
         subscription: TopicSubscription,
         feedback: list[dict[str, object]],
+        intent: BriefingIntentProfile | None = None,
+        knowledge_context: dict[str, object] | None = None,
     ) -> list[tuple[str, str]]:
-        plans: list[tuple[str, str]] = []
+        briefing_intent = intent or _classify_briefing_intent(subscription.topic, feedback)
+        knowledge_context = knowledge_context or self._knowledge_context(subscription.topic)
+        generated_plans: list[tuple[str, str]] = []
         if self.runtime is not None:
             try:
                 generated = self.runtime.plan_briefing_queries(
@@ -575,19 +1029,32 @@ class DailyBriefingService:
                     {
                         "feedback": feedback[:5],
                         "channels": [platform for platform, _ in CHANNEL_QUERIES],
+                        "briefing_intent": briefing_intent.model_dump(),
+                        "knowledge_context": knowledge_context,
                         "report_skill": _load_report_skill(),
                     },
                 )
             except Exception:
                 generated = []
-            plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
-        plans.extend(("技术路线（确定性保障）", query) for query in _deterministic_technical_queries(subscription.topic))
-
+            generated_plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
+        deterministic_plans = [
+            ("技术路线（确定性保障）", query)
+            for query in _deterministic_technical_queries(subscription.topic, briefing_intent)
+        ]
+        feedback_plans: list[tuple[str, str]] = []
         for item in feedback[:3]:
             note = " ".join(str(item.get("body") or "").split())
             if note and _is_meaningful_feedback(note):
-                plans.append(("案例反馈", f"{subscription.topic} {note[:160]}"))
-        plans.extend((platform, template.format(topic=subscription.topic)) for platform, template in CHANNEL_QUERIES)
+                feedback_plans.append(("案例反馈", f"{subscription.topic} {note[:160]}"))
+        knowledge_plans = self._knowledge_guided_queries(subscription.topic, knowledge_context)
+        channel_plans = [(platform, template.format(topic=subscription.topic)) for platform, template in CHANNEL_QUERIES]
+        plans = self._compose_search_plan(
+            generated_plans,
+            deterministic_plans,
+            feedback_plans,
+            knowledge_plans,
+            channel_plans,
+        )
         unique: list[tuple[str, str]] = []
         seen: set[str] = set()
         for platform, query in plans:
@@ -598,6 +1065,22 @@ class DailyBriefingService:
             if len(unique) >= self.max_queries:
                 break
         return unique
+
+    def _compose_search_plan(
+        self,
+        generated_plans: list[tuple[str, str]],
+        deterministic_plans: list[tuple[str, str]],
+        feedback_plans: list[tuple[str, str]],
+        knowledge_plans: list[tuple[str, str]],
+        channel_plans: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Compose query plans while reserving room for the original channels."""
+
+        if self.max_queries >= len(channel_plans):
+            non_channel_budget = max(0, self.max_queries - len(channel_plans))
+            high_value = generated_plans[:4] + feedback_plans + knowledge_plans + deterministic_plans + generated_plans[4:]
+            return high_value[:non_channel_budget] + channel_plans
+        return generated_plans + deterministic_plans + feedback_plans + channel_plans + knowledge_plans
 
     def add_feedback(
         self,
@@ -613,6 +1096,118 @@ class DailyBriefingService:
         if case_context:
             enriched_body = "\n".join(part for part in (enriched_body, case_context) if part)
         return self.store.add_topic_feedback(subscription.id, user_id, chat_id, enriched_body, source_url)
+
+    def _knowledge_context(self, topic: str) -> dict[str, object]:
+        """Retrieve reviewed graph and self-evolution context before planning.
+
+        Reviewed graph hits may guide both query planning and synthesis framing.
+        Self-evolution candidates are split by release state: validated candidates
+        can be used as planning context, while weak signals only suggest what to
+        verify next.  Neither category is treated as a current factual source.
+        """
+
+        graph_service = DomainKnowledgeGraphService(self.store)
+        seeded_graphs = 0
+        try:
+            if not graph_service.list_graphs():
+                seeded_graphs = int(graph_service.seed_default_graphs()["seeded_graphs"])
+            graph_hits = graph_service.query_relevant(topic, limit=4, min_score=5.0)
+        except Exception:
+            graph_hits = []
+
+        latest_layers = self._latest_candidate_layers()
+        validated_candidates: list[dict[str, object]] = []
+        weak_signals: list[dict[str, object]] = []
+        topic_terms = set(_topic_terms(topic))
+        for candidate in self.store.list_domain_knowledge_candidates():
+            if str(candidate.get("status")) == "deprecated":
+                continue
+            layer = latest_layers.get(str(candidate.get("id")), "unreviewed_candidate")
+            if not self._candidate_matches_topic(candidate, topic_terms):
+                continue
+            item = {
+                "id": candidate["id"],
+                "topic": candidate["topic"],
+                "claim": str(candidate.get("claim", ""))[:360],
+                "confidence": candidate.get("confidence"),
+                "knowledge_layer": layer,
+                "evidence_url_count": len(
+                    [
+                        evidence
+                        for evidence in candidate.get("evidence", [])
+                        if str(evidence.get("url", "")).startswith(("http://", "https://"))
+                    ]
+                ),
+            }
+            if layer == "validated_knowledge" or str(candidate.get("status")) == "validated":
+                validated_candidates.append(item)
+            elif layer == "weak_signal":
+                weak_signals.append(item)
+
+        return {
+            "policy": (
+                "Use reviewed graph hits and validated self-evolution candidates only as planning and framing context; "
+                "re-open original sources before making current factual claims. Use weak signals only for next research "
+                "directions, not as evidence."
+            ),
+            "seeded_graphs": seeded_graphs,
+            "reviewed_graph_hits": [hit.model_dump(mode="json") for hit in graph_hits],
+            "validated_candidates": validated_candidates[:3],
+            "weak_signals": weak_signals[:3],
+        }
+
+    def _knowledge_guided_queries(
+        self,
+        topic: str,
+        knowledge_context: dict[str, object],
+    ) -> list[tuple[str, str]]:
+        queries: list[tuple[str, str]] = []
+        for hit in knowledge_context.get("reviewed_graph_hits", [])[:3]:
+            if not isinstance(hit, dict):
+                continue
+            entity_name = str(hit.get("entity_name") or "").strip()
+            if entity_name:
+                queries.append(("知识图谱补充", f"{topic} {entity_name} implementation evidence"))
+        for candidate in knowledge_context.get("validated_candidates", [])[:2]:
+            if not isinstance(candidate, dict):
+                continue
+            claim_terms = re.findall(r"[A-Za-z][A-Za-z0-9+._/-]{2,}|[\u4e00-\u9fff]{2,}", str(candidate.get("claim", "")))
+            useful_terms = [term for term in claim_terms if _is_meaningful_query(term)][:4]
+            if useful_terms:
+                queries.append(("自进化知识补充", f"{topic} {' '.join(useful_terms)}"))
+        return queries
+
+    def _latest_candidate_layers(self) -> dict[str, str]:
+        latest: dict[str, str] = {}
+        for gate in self.store.list_gate_records(gate_type="domain_knowledge_candidate_validation"):
+            candidate_id = str(gate["subject_id"])
+            if candidate_id in latest:
+                continue
+            metadata = gate.get("metadata") or {}
+            latest[candidate_id] = str(metadata.get("knowledge_layer") or "unreviewed_candidate")
+        return latest
+
+    @staticmethod
+    def _candidate_matches_topic(candidate: dict[str, object], topic_terms: set[str]) -> bool:
+        if not topic_terms:
+            return False
+        text = " ".join(
+            (
+                str(candidate.get("topic", "")),
+                str(candidate.get("claim", "")),
+                str(candidate.get("applies_when", "")),
+            )
+        ).lower()
+        return any(term.lower() in text for term in topic_terms)
+
+    @staticmethod
+    def _knowledge_context_metadata(knowledge_context: dict[str, object]) -> dict[str, object]:
+        return {
+            "seeded_graphs": knowledge_context.get("seeded_graphs", 0),
+            "reviewed_graph_hits": len(knowledge_context.get("reviewed_graph_hits", [])),
+            "validated_candidates": len(knowledge_context.get("validated_candidates", [])),
+            "weak_signals": len(knowledge_context.get("weak_signals", [])),
+        }
 
     def _inspect_case_source(self, source_url: str | None) -> str:
         if not source_url:
@@ -641,27 +1236,55 @@ class DailyBriefingService:
         subscription: TopicSubscription,
         search_plan: list[tuple[str, str]],
         feedback: list[dict[str, object]],
+        run_id: str | None = None,
     ) -> list[CollectedSource]:
         by_url: dict[str, CollectedSource] = {}
         query_results: list[tuple[str, str, list[SearchResult]]] = []
         workers = min(6, len(search_plan))
         executor = ThreadPoolExecutor(max_workers=max(1, workers))
         futures = [
-            (requested_platform, query, executor.submit(self._search, query))
+            (requested_platform, query, time.monotonic(), executor.submit(self._search, query))
             for requested_platform, query in search_plan
         ]
         try:
             completed, pending = wait(
-                [future for _, _, future in futures],
+                [future for _, _, _, future in futures],
                 timeout=self.search_budget_seconds,
             )
-            for requested_platform, query, future in futures:
+            for requested_platform, query, started, future in futures:
                 if future not in completed:
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        [],
+                        _duration_ms(started),
+                        ok=False,
+                        error="search budget expired before this query completed",
+                    )
                     continue
                 try:
                     results = future.result()
-                except Exception:
+                except Exception as exc:
                     results = []
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        results,
+                        _duration_ms(started),
+                        ok=False,
+                        error=_safe_trace_error(exc),
+                    )
+                else:
+                    self._record_provider_health(
+                        run_id,
+                        requested_platform,
+                        query,
+                        results,
+                        _duration_ms(started),
+                        ok=True,
+                    )
                 query_results.append((requested_platform, query, results))
             for future in pending:
                 future.cancel()
@@ -740,12 +1363,115 @@ class DailyBriefingService:
     def _search(self, query: str) -> list[SearchResult]:
         return self.search_client.search(query, limit=self.results_per_query)
 
+    def _record_trace_event(
+        self,
+        run_id: str,
+        event_type: str,
+        name: str,
+        started: float,
+        status: str = "completed",
+        metadata: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            self.store.add_trace_event(
+                run_id=run_id,
+                event_type=event_type,
+                name=name,
+                status=status,
+                duration_ms=_duration_ms(started),
+                metadata=metadata or {},
+                error=error,
+            )
+        except Exception:
+            # Observability should never make a briefing fail.
+            return
+
+    def _record_checkpoint(
+        self,
+        run_id: str,
+        subject: str,
+        step: str,
+        status: str = "completed",
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            self.store.add_run_checkpoint(
+                run_id=run_id,
+                workflow="daily_briefing",
+                subject=subject,
+                step=step,
+                status=status,
+                payload=payload or {},
+            )
+        except Exception:
+            # Checkpoint metadata should never make a briefing fail.
+            return
+
+    def _ensure_project_state(self) -> None:
+        try:
+            self.store.ensure_project_ledger_snapshot(
+                project_id="pydantic-ai-tech-intel-briefing",
+                objective="Generate source-backed technology intelligence briefings with reviewable self-evolution.",
+                phase="agentops-readiness",
+                status="active",
+                next_decision="Run eval replay, then release domain knowledge only after eval and human review gates pass.",
+                open_blockers=[],
+                constraints={
+                    "knowledge_release": "candidate-only until eval gate and human review pass",
+                    "search": "public source coverage can be incomplete or blocked",
+                    "privacy": "local configuration and secrets must not be persisted in audit logs",
+                },
+                decisions=[
+                    {
+                        "id": "agentops-p1-gates",
+                        "decision": "Record automatic evidence gates, checkpoints, provider health, and release ledger.",
+                    }
+                ],
+                evidence_refs=["README.md", "docs/development.md"],
+                version="1",
+            )
+        except Exception:
+            return
+
+    def _record_provider_health(
+        self,
+        run_id: str | None,
+        requested_platform: str,
+        query: str,
+        results: list[SearchResult],
+        duration_ms: float,
+        ok: bool,
+        error: str | None = None,
+    ) -> None:
+        if run_id is None:
+            return
+        providers = sorted({result.provider for result in results if result.provider})
+        provider_label = ", ".join(providers[:3]) if providers else self.search_client.__class__.__name__
+        if len(providers) > 3:
+            provider_label = f"{provider_label}, +{len(providers) - 3} more"
+        try:
+            self.store.record_search_provider_health(
+                run_id=run_id,
+                requested_platform=requested_platform,
+                provider=provider_label,
+                query=query,
+                ok=ok,
+                result_count=len(results),
+                duration_ms=duration_ms,
+                error=error,
+            )
+        except Exception:
+            return
+
     def _synthesize(
         self,
         topic: str,
         sources: list[CollectedSource],
         search_plan: list[tuple[str, str]],
         fallback_sources: list[CollectedSource] | None = None,
+        briefing_intent: BriefingIntentProfile | None = None,
+        knowledge_context: dict[str, object] | None = None,
     ) -> BriefingSynthesis:
         if self.runtime is not None:
             try:
@@ -756,6 +1482,9 @@ class DailyBriefingService:
                         "report_contract": REPORT_CONTRACT,
                         "report_skill": _load_report_skill(),
                         "search_plan": search_plan,
+                        "readability": REPORT_CONTRACT["readability"],
+                        "briefing_intent": briefing_intent.model_dump() if briefing_intent else None,
+                        "knowledge_context": knowledge_context or {},
                     },
                 )
             except Exception:
@@ -780,9 +1509,10 @@ class DailyBriefingService:
         return generated.model_copy(update={"themes": fallback.themes})
 
     def _fallback_synthesis(self, topic: str, sources: list[CollectedSource]) -> BriefingSynthesis:
-        theme_catalog = CAD_THEMES + THEMES if _is_cad_topic(topic) else THEMES
         themed_sources: dict[str, list[CollectedSource]] = {}
         is_cad = _is_cad_topic(topic)
+        is_industrial = self._requires_industrial_anchor(topic, "")
+        theme_catalog = CAD_THEMES + THEMES if is_cad else (THEMES if is_industrial else ())
         for source in sources:
             haystack = f"{source.title} {source.snippet}".lower()
             matched = False
@@ -841,7 +1571,7 @@ class DailyBriefingService:
                     continue
                 themes.append(
                     BriefingTheme(
-                        name=name,
+                        name=self._display_generic_evidence_theme_name(topic, name),
                         analysis=self._fallback_theme_analysis(evidence, technology, importance, maturity),
                         what_is_happening=self._evidence_summary(evidence),
                         core_technology=technology,
@@ -938,6 +1668,21 @@ class DailyBriefingService:
             ],
         )
 
+    @staticmethod
+    def _display_generic_evidence_theme_name(topic: str, generic_name: str) -> str:
+        clean_topic = " ".join(topic.split()).strip(" ：:，,。")
+        if not clean_topic:
+            clean_topic = "本主题"
+        suffixes = {
+            "政策、规模与产业链信号": "政策、规模与产业链信号",
+            "技术底座、数据与开源生态": "技术底座、数据与开源生态",
+            "应用落地与业务转型案例": "应用落地与业务流程线索",
+            "教育传播、公众讨论与弱证据线索": "传播讨论与弱证据线索",
+            "综合产业动态与待核验证据": "待核验证据线索",
+        }
+        suffix = suffixes.get(generic_name, "证据线索")
+        return f"{clean_topic}的{suffix}"
+
     def _generic_evidence_theme_name(self, source: CollectedSource) -> str:
         text = f"{source.title} {source.snippet} {source.platform} {source.provider}".lower()
         best_name = "综合产业动态与待核验证据"
@@ -1020,6 +1765,7 @@ class DailyBriefingService:
             synthesis.themes,
             key_signal_interpretation=synthesis.key_signal_interpretation,
         )
+        detailed_summary = self._compact_detailed_summary_body(detailed_summary)
         lines.extend(detailed_summary.splitlines())
         lines.extend(
             [
@@ -1039,6 +1785,106 @@ class DailyBriefingService:
         for index, source in enumerate(briefing.sources, start=1):
             lines.append(f"{index}. [{source.title}]({source.url}) | {source.platform} | 重要度 {source.importance_score:.1f}")
         return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _compact_detailed_summary_body(
+        cls,
+        markdown: str,
+        *,
+        max_paragraph_chars: int = 220,
+        max_paragraphs_per_heading: int = 2,
+    ) -> str:
+        """Shorten detailed-summary prose while preserving model-selected headings."""
+        lines = markdown.splitlines()
+        blocks: list[tuple[str, list[str]]] = []
+        current_heading: str | None = None
+        current_body: list[str] = []
+        preamble: list[str] = []
+
+        for line in lines:
+            if line.startswith("### "):
+                if current_heading is not None:
+                    blocks.append((current_heading, current_body))
+                elif current_body:
+                    preamble.extend(current_body)
+                current_heading = line
+                current_body = []
+            else:
+                current_body.append(line)
+        if current_heading is not None:
+            blocks.append((current_heading, current_body))
+        elif current_body:
+            preamble.extend(current_body)
+
+        seen_sentences: set[str] = set()
+        output: list[str] = []
+        if preamble:
+            output.extend(cls._compact_body_lines(preamble, seen_sentences, max_paragraph_chars, 1))
+        for heading, body in blocks:
+            compact_body = cls._compact_body_lines(
+                body,
+                seen_sentences,
+                max_paragraph_chars,
+                max_paragraphs_per_heading,
+            )
+            output.append(heading)
+            output.extend(compact_body or ["本节材料较少，保留为待核验线索。"])
+            output.append("")
+        return "\n".join(output).strip()
+
+    @classmethod
+    def _compact_body_lines(
+        cls,
+        lines: list[str],
+        seen_sentences: set[str],
+        max_paragraph_chars: int,
+        max_paragraphs: int,
+    ) -> list[str]:
+        text = "\n".join(lines).strip()
+        if not text:
+            return []
+        paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+        compact: list[str] = []
+        for paragraph in paragraphs:
+            shortened = cls._compact_paragraph_without_repetition(
+                paragraph,
+                seen_sentences,
+                max_chars=max_paragraph_chars,
+            )
+            if shortened:
+                compact.append(shortened)
+            if len(compact) >= max_paragraphs:
+                break
+        return compact
+
+    @staticmethod
+    def _compact_paragraph_without_repetition(
+        paragraph: str,
+        seen_sentences: set[str],
+        *,
+        max_chars: int,
+    ) -> str:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[。！？；;])", " ".join(paragraph.split()))
+            if sentence.strip()
+        ]
+        if not sentences:
+            sentences = [" ".join(paragraph.split()).strip()]
+        kept: list[str] = []
+        for sentence in sentences:
+            fingerprint = re.sub(r"\W+", "", sentence.lower())[:60]
+            if fingerprint and fingerprint in seen_sentences:
+                continue
+            if fingerprint:
+                seen_sentences.add(fingerprint)
+            if len("".join(kept)) + len(sentence) > max_chars and kept:
+                break
+            kept.append(sentence)
+        text = "".join(kept) or sentences[0]
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip("，,；;。 ") + "…"
+        return text
 
     @staticmethod
     def _normalize_url(url: str) -> str:
@@ -1084,8 +1930,11 @@ class DailyBriefingService:
         topic: str,
         feedback: list[dict[str, object]],
         search_plan: list[tuple[str, str]],
+        intent: BriefingIntentProfile | None = None,
     ) -> list[str]:
         candidates = [topic]
+        if intent is not None:
+            candidates.extend(intent.keyword_hints)
         candidates.extend(
             query
             for platform, query in search_plan
