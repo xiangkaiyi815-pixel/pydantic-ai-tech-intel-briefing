@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -24,6 +25,8 @@ class SourceCapabilityContract:
     allowed_actions: tuple[str, ...] = ("search", "metadata")
     unsupported_actions: tuple[str, ...] = ("login", "private_feed", "write")
     default_budget_share: float = 1.0
+    priority: int = 3
+    timeout_seconds: float = 8.0
     risk_notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,7 +40,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         aliases=("web", "browser", "bing", "baidu", "google", "duckduckgo", "searxng", "brave"),
         url_hosts=(),
         provider_families=("browser-bing", "browser-baidu", "browser-google", "duckduckgo", "searxng", "brave"),
-        default_budget_share=3.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
         risk_notes="Public result pages may rate-limit or return challenge pages; record provider status instead of bypassing.",
     ),
     SourceCapabilityContract(
@@ -46,8 +51,21 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         aliases=("mcp", "github", "arxiv", "hackernews", "stackexchange"),
         url_hosts=("github.com", "arxiv.org", "news.ycombinator.com", "stackoverflow.com", "stackexchange.com"),
         provider_families=("mcp:",),
-        default_budget_share=2.0,
+        default_budget_share=4.0,
+        priority=1,
+        timeout_seconds=8.0,
         risk_notes="Only read-only MCP tools are supported.",
+    ),
+    SourceCapabilityContract(
+        slug="agent-reach",
+        display_name="Agent Reach public backends",
+        aliases=("agent-reach", "v2ex", "rss", "jina", "web-reader"),
+        url_hosts=("v2ex.com",),
+        provider_families=("agent-reach", "mcp:agent-reach"),
+        default_budget_share=3.0,
+        priority=2,
+        timeout_seconds=12.0,
+        risk_notes="Use read-only public backends; do not automate login-gated actions.",
     ),
     SourceCapabilityContract(
         slug="wechat-public-index",
@@ -56,7 +74,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("mp.weixin.qq.com", "weixin.qq.com"),
         provider_families=("browser-baidu", "mcp:domestic-rss"),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
         risk_notes="Use public-index snippets or original public URLs only; do not fetch login-gated account data.",
     ),
     SourceCapabilityContract(
@@ -65,7 +85,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         aliases=("bilibili", "bili", "b站"),
         url_hosts=("bilibili.com",),
         provider_families=("bilibili-public-api", "browser-baidu", "browser-bing", "browser-google"),
-        default_budget_share=1.0,
+        default_budget_share=3.0,
+        priority=2,
+        timeout_seconds=12.0,
     ),
     SourceCapabilityContract(
         slug="zhihu",
@@ -74,7 +96,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("zhihu.com",),
         provider_families=("browser-baidu", "mcp:domestic-rss"),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
     ),
     SourceCapabilityContract(
         slug="toutiao-public-index",
@@ -83,7 +107,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("toutiao.com",),
         provider_families=("browser-baidu", "mcp:domestic-rss"),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
     ),
     SourceCapabilityContract(
         slug="xiaohongshu-public-index",
@@ -92,7 +118,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("xiaohongshu.com", "xhslink.com"),
         provider_families=("browser-baidu",),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
         risk_notes="Do not use logged-in feeds, comments, or private account automation.",
     ),
     SourceCapabilityContract(
@@ -101,7 +129,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         aliases=("youtube", "yt"),
         url_hosts=("youtube.com", "youtu.be"),
         provider_families=("browser-bing", "browser-google", "mcp:public"),
-        default_budget_share=1.0,
+        default_budget_share=3.0,
+        priority=2,
+        timeout_seconds=12.0,
     ),
     SourceCapabilityContract(
         slug="reddit",
@@ -109,7 +139,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         aliases=("reddit",),
         url_hosts=("reddit.com",),
         provider_families=("browser-bing", "browser-google", "mcp:public"),
-        default_budget_share=1.0,
+        default_budget_share=3.0,
+        priority=2,
+        timeout_seconds=12.0,
     ),
     SourceCapabilityContract(
         slug="x-public-index",
@@ -118,7 +150,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("x.com", "twitter.com"),
         provider_families=("browser-bing", "browser-google"),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
     ),
     SourceCapabilityContract(
         slug="linkedin-public-index",
@@ -127,7 +161,9 @@ DEFAULT_SOURCE_CAPABILITY_CONTRACTS: tuple[SourceCapabilityContract, ...] = (
         url_hosts=("linkedin.com",),
         provider_families=("browser-bing", "browser-google"),
         allowed_actions=("public_index_search", "metadata"),
-        default_budget_share=1.0,
+        default_budget_share=2.0,
+        priority=3,
+        timeout_seconds=6.0,
         risk_notes="Do not automate logged-in LinkedIn browsing or profile scraping.",
     ),
 )
@@ -157,6 +193,29 @@ def source_contract_for_url(url: str) -> SourceCapabilityContract | None:
         if any(host == expected or host.endswith(f".{expected}") for expected in contract.url_hosts):
             return contract
     return source_contract_by_slug("general-web")
+
+
+def source_contract_for_query(requested_platform: str, query: str) -> SourceCapabilityContract:
+    for domain in _site_query_domains(query):
+        contract = source_contract_for_url(f"https://{domain}/")
+        if contract is not None and contract.slug != "general-web":
+            return contract
+
+    haystack = f"{requested_platform} {query}".lower()
+    tokens = set(re.findall(r"[a-z0-9]+", haystack))
+    for contract in DEFAULT_SOURCE_CAPABILITY_CONTRACTS:
+        if _normalize_slug(contract.slug) in haystack:
+            return contract
+        for alias in contract.aliases:
+            normalized_alias = alias.lower().strip()
+            if not normalized_alias:
+                continue
+            if len(normalized_alias) < 3:
+                if normalized_alias in tokens:
+                    return contract
+            elif normalized_alias in haystack:
+                return contract
+    return source_contract_by_slug("general-web") or DEFAULT_SOURCE_CAPABILITY_CONTRACTS[0]
 
 
 def source_slug_for_provider(provider: str) -> str:
@@ -204,10 +263,21 @@ def source_recipe_summary(recipe: dict[str, float] | None = None) -> dict[str, A
                 "requires_login": contract.requires_login,
                 "allowed_actions": list(contract.allowed_actions),
                 "unsupported_actions": list(contract.unsupported_actions),
+                "priority": contract.priority,
+                "timeout_seconds": contract.timeout_seconds,
             }
             for contract in DEFAULT_SOURCE_CAPABILITY_CONTRACTS
         ],
     }
+
+
+def _site_query_domains(query: str) -> list[str]:
+    domains: list[str] = []
+    for match in re.finditer(r"\bsite:([a-z0-9.-]+)", query, flags=re.IGNORECASE):
+        domain = _normalize_host(match.group(1))
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
 
 
 def _normalize_slug(value: str) -> str:

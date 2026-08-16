@@ -86,6 +86,33 @@ class AlwaysSlowSearchClient:
         ]
 
 
+class TieredOrderingSearchClient:
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        self.queries.append(query)
+        if "github.com" in query:
+            return [
+                SearchResult(
+                    title="Intent recognition repository",
+                    url="https://github.com/example/intent-recognition",
+                    snippet="Repository with intent recognition architecture and evaluation notes.",
+                    provider="mcp:public:github",
+                    checked_at="2026-08-16T00:00:00+00:00",
+                )
+            ]
+        return [
+            SearchResult(
+                title="General web intent recognition article",
+                url="https://example.com/intent-web",
+                snippet="General public web article about intent recognition.",
+                provider="browser-bing",
+                checked_at="2026-08-16T00:00:00+00:00",
+            )
+        ]
+
+
 class NoisySearchClient:
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         return [
@@ -262,6 +289,30 @@ def test_daily_briefing_records_budget_timeout_and_skipped_queries(tmp_path):
     assert {event.query for event in persisted_events} == {query for _platform, query in search_plan}
 
 
+def test_daily_briefing_runs_fast_source_tier_before_general_web(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    search = TieredOrderingSearchClient()
+    service = DailyBriefingService(
+        store,
+        search,
+        search_budget_seconds=1.0,
+    )
+    subscription = store.upsert_topic("u-1", "c-1", "intent recognition")
+    search_plan = [
+        ("general", "intent recognition architecture general web"),
+        ("technical", "site:github.com intent recognition repository"),
+    ]
+
+    collection = service._collect_sources_with_trace(subscription, search_plan, [], run_id="brief-tier-test")
+
+    assert search.queries[0] == "site:github.com intent recognition repository"
+    called_events = [event for event in collection.provider_events if event.status == "called"]
+    assert [event.tier for event in called_events] == ["tier-1", "tier-3"]
+    assert all(event.budget_share is not None for event in called_events)
+    assert any(source.url == "https://github.com/example/intent-recognition" for source in collection.sources)
+
+
 def test_daily_briefing_filters_generic_reference_pages_before_ranking(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -295,8 +346,8 @@ def test_daily_briefing_records_candidate_lifecycle_and_provider_trace(tmp_path)
     assert "accepted" in statuses
     assert "rejected_generic_reference" in statuses
     assert "rejected_missing_industrial_anchor" in statuses
-    assert collection.provider_events[0].status == "success"
-    assert store.list_provider_trace_events(topic_id=subscription.id)[0].provider == "NoisySearchClient"
+    assert any(event.status == "success" for event in collection.provider_events)
+    assert any(event.provider == "NoisySearchClient" for event in store.list_provider_trace_events(topic_id=subscription.id))
     persisted_statuses = {candidate.status for candidate in store.list_source_candidates(topic_id=subscription.id)}
     assert statuses.issubset(persisted_statuses)
 

@@ -242,6 +242,8 @@ def test_records_source_candidates_provider_trace_feedback_signals_and_layered_m
         query="industrial AI",
         status="success",
         result_count=1,
+        tier="tier-3",
+        budget_share=0.2,
         checked_at="2026-07-25T00:00:00Z",
     )
 
@@ -267,6 +269,9 @@ def test_records_source_candidates_provider_trace_feedback_signals_and_layered_m
 
     assert refreshed.source_recipe == {"general-web": 3.0, "bilibili": 1.0}
     assert store.list_source_candidates(topic_id=topic.id)[0].status == "accepted"
-    assert store.list_provider_trace_events(topic_id=topic.id)[0].provider == "browser-bing"
+    stored_event = store.list_provider_trace_events(topic_id=topic.id)[0]
+    assert stored_event.provider == "browser-bing"
+    assert stored_event.tier == "tier-3"
+    assert stored_event.budget_share == 0.2
     assert store.list_topic_feedback_signals(topic.id)[0].metadata["feedback_id"] == "feedback-1"
     assert store.list_layered_memory_items("preference", "u-1", "c-1")[0].id == memory_id

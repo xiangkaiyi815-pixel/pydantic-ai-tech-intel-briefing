@@ -224,6 +224,8 @@ class MemoryStore:
                     reason TEXT,
                     error TEXT,
                     elapsed_ms REAL,
+                    tier TEXT,
+                    budget_share REAL,
                     checked_at TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -263,6 +265,8 @@ class MemoryStore:
             self._ensure_column(connection, "skill_drafts", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
             self._ensure_column(connection, "skill_drafts", "chat_id", "TEXT NOT NULL DEFAULT 'legacy'")
             self._ensure_column(connection, "topic_subscriptions", "source_recipe_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(connection, "provider_trace_events", "tier", "TEXT")
+            self._ensure_column(connection, "provider_trace_events", "budget_share", "REAL")
 
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -1025,9 +1029,9 @@ class MemoryStore:
                 """
                 INSERT INTO provider_trace_events (
                     id, run_id, topic_id, provider, query_text, status, result_count,
-                    reason, error, elapsed_ms, checked_at, created_at
+                    reason, error, elapsed_ms, tier, budget_share, checked_at, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -1040,6 +1044,8 @@ class MemoryStore:
                     event.reason,
                     event.error,
                     event.elapsed_ms,
+                    event.tier,
+                    event.budget_share,
                     event.checked_at,
                     _now_iso(),
                 ),
@@ -1076,6 +1082,8 @@ class MemoryStore:
                 reason=row["reason"],
                 error=row["error"],
                 elapsed_ms=float(row["elapsed_ms"]) if row["elapsed_ms"] is not None else None,
+                tier=row["tier"],
+                budget_share=float(row["budget_share"]) if row["budget_share"] is not None else None,
                 checked_at=str(row["checked_at"]),
             )
             for row in rows

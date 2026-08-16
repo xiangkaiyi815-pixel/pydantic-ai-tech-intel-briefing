@@ -22,7 +22,11 @@ from search_assistant.contracts import (
 )
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchOutcome, SearchResult, search_with_provider_events
-from search_assistant.search.source_registry import normalize_source_recipe, source_recipe_summary
+from search_assistant.search.source_registry import (
+    normalize_source_recipe,
+    source_contract_for_query,
+    source_recipe_summary,
+)
 
 
 class BriefingRuntime(Protocol):
@@ -43,6 +47,21 @@ class BriefingCollectionTrace:
     sources: list[CollectedSource]
     source_candidates: list[SourceCandidate]
     provider_events: list[ProviderTraceEvent]
+
+
+@dataclass(frozen=True)
+class BriefingSearchTask:
+    index: int
+    requested_platform: str
+    query: str
+    source_slug: str
+    priority: int
+    timeout_seconds: float
+    budget_share: float
+
+    @property
+    def tier(self) -> str:
+        return f"tier-{self.priority}"
 
 
 REPORT_CONTRACT = {
@@ -596,110 +615,159 @@ class DailyBriefingService:
         query_results: list[tuple[int, str, str, SearchOutcome]] = []
         source_candidates: list[SourceCandidate] = []
         provider_events: list[ProviderTraceEvent] = []
+        search_tasks = self._budgeted_search_tasks(subscription, search_plan)
+        tier_budgets = self._tier_budget_seconds(search_tasks)
 
         def record_provider_event(event: ProviderTraceEvent) -> None:
             provider_events.append(event)
             self.store.record_provider_trace_event(event, run_id=run_id, topic_id=subscription.id)
 
-        def budget_event(query: str, status: str, reason: str, started: float | None = None) -> ProviderTraceEvent:
+        def annotate_event(event: ProviderTraceEvent, task: BriefingSearchTask) -> ProviderTraceEvent:
+            return event.model_copy(update={"tier": task.tier, "budget_share": task.budget_share})
+
+        def budget_event(
+            task: BriefingSearchTask,
+            status: str,
+            reason: str,
+            started: float | None = None,
+        ) -> ProviderTraceEvent:
             elapsed_ms = None if started is None else round((time.monotonic() - started) * 1000, 3)
             return ProviderTraceEvent(
                 provider="briefing-search-budget",
-                query=query,
+                query=task.query,
                 status=status,
                 result_count=0,
                 reason=reason,
                 elapsed_ms=elapsed_ms,
+                tier=task.tier,
+                budget_share=task.budget_share,
                 checked_at=datetime.now(UTC).isoformat(),
             )
 
-        if not search_plan:
+        if not search_tasks:
             return BriefingCollectionTrace(sources=[], source_candidates=[], provider_events=[])
 
-        workers = max(1, min(6, len(search_plan)))
-        deadline = time.monotonic() + max(0.0, self.search_budget_seconds)
-        next_index = 0
-        pending: dict[Future[SearchOutcome], tuple[int, str, str, float]] = {}
-        executor = ThreadPoolExecutor(max_workers=workers)
+        def run_tier(tier_tasks: list[BriefingSearchTask], tier_budget_seconds: float) -> None:
+            if tier_budget_seconds <= 0:
+                for task in tier_tasks:
+                    record_provider_event(budget_event(task, "skipped", "tier_budget_is_zero"))
+                return
 
-        def submit_next_query() -> bool:
-            nonlocal next_index
-            if next_index >= len(search_plan):
-                return False
-            if time.monotonic() >= deadline:
-                return False
-            requested_platform, query = search_plan[next_index]
-            started = time.monotonic()
-            future = executor.submit(self._search_with_trace, query)
-            pending[future] = (next_index, requested_platform, query, started)
-            next_index += 1
-            return True
+            workers = max(1, min(6, len(tier_tasks)))
+            deadline = time.monotonic() + tier_budget_seconds
+            next_position = 0
+            pending: dict[Future[SearchOutcome], tuple[BriefingSearchTask, float]] = {}
+            executor = ThreadPoolExecutor(max_workers=workers)
 
-        def collect_completed_future(future: Future[SearchOutcome]) -> None:
-            index, requested_platform, query, _started = pending.pop(future)
+            def submit_next_task() -> bool:
+                nonlocal next_position
+                if next_position >= len(tier_tasks):
+                    return False
+                if time.monotonic() >= deadline:
+                    return False
+                task = tier_tasks[next_position]
+                started = time.monotonic()
+                future = executor.submit(self._search_with_trace, task.query)
+                pending[future] = (task, started)
+                next_position += 1
+                record_provider_event(budget_event(task, "called", "tier_query_started", started))
+                return True
+
+            def collect_completed_future(future: Future[SearchOutcome]) -> None:
+                task, _started = pending.pop(future)
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = SearchOutcome(
+                        results=[],
+                        provider_events=[
+                            ProviderTraceEvent(
+                                provider="briefing-search",
+                                query=task.query,
+                                status="error",
+                                result_count=0,
+                                error=f"{type(exc).__name__}: {exc}"[:240],
+                                checked_at=datetime.now(UTC).isoformat(),
+                            )
+                        ],
+                    )
+                query_results.append((task.index, task.requested_platform, task.query, outcome))
+                for event in outcome.provider_events:
+                    record_provider_event(annotate_event(event, task))
+
+            def expire_overdue_queries() -> None:
+                now = time.monotonic()
+                for future, (task, started) in list(pending.items()):
+                    if future.done():
+                        continue
+                    if now - started < task.timeout_seconds:
+                        continue
+                    pending.pop(future)
+                    cancelled = future.cancel()
+                    status = "skipped" if cancelled else "timeout"
+                    reason = (
+                        "query_timeout_before_worker_start"
+                        if cancelled
+                        else f"exceeded_{task.timeout_seconds:g}s_query_timeout"
+                    )
+                    record_provider_event(budget_event(task, status, reason, started))
+
             try:
-                outcome = future.result()
-            except Exception as exc:
-                outcome = SearchOutcome(
-                    results=[],
-                    provider_events=[
-                        ProviderTraceEvent(
-                            provider="briefing-search",
-                            query=query,
-                            status="error",
-                            result_count=0,
-                            error=f"{type(exc).__name__}: {exc}"[:240],
-                            checked_at=datetime.now(UTC).isoformat(),
-                        )
-                    ],
-                )
-            query_results.append((index, requested_platform, query, outcome))
-            for event in outcome.provider_events:
-                record_provider_event(event)
-
-        try:
-            while len(pending) < workers and submit_next_query():
-                pass
-            while pending:
-                remaining_seconds = deadline - time.monotonic()
-                if remaining_seconds <= 0:
-                    break
-                completed, _pending = wait(
-                    list(pending),
-                    timeout=remaining_seconds,
-                    return_when=FIRST_COMPLETED,
-                )
-                if not completed:
-                    break
-                for future in sorted(completed, key=lambda item: pending[item][0]):
-                    collect_completed_future(future)
-                while len(pending) < workers and submit_next_query():
+                while len(pending) < workers and submit_next_task():
                     pass
+                while pending or next_position < len(tier_tasks):
+                    expire_overdue_queries()
+                    while len(pending) < workers and submit_next_task():
+                        pass
+                    if not pending:
+                        break
+                    remaining_tier_seconds = deadline - time.monotonic()
+                    if remaining_tier_seconds <= 0:
+                        break
+                    remaining_query_seconds = min(
+                        max(0.001, task.timeout_seconds - (time.monotonic() - started))
+                        for task, started in pending.values()
+                    )
+                    completed, _pending = wait(
+                        list(pending),
+                        timeout=min(remaining_tier_seconds, remaining_query_seconds),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not completed:
+                        continue
+                    completed_in_order = sorted(
+                        (future for future in completed if future in pending),
+                        key=lambda item: pending[item][0].index,
+                    )
+                    for future in completed_in_order:
+                        collect_completed_future(future)
 
-            for future in list(pending):
-                if future.done():
-                    collect_completed_future(future)
-                    continue
-                _index, _requested_platform, query, started = pending.pop(future)
-                cancelled = future.cancel()
-                status = "skipped" if cancelled else "timeout"
-                reason = (
-                    "search_budget_expired_before_worker_start"
-                    if cancelled
-                    else f"exceeded_{self.search_budget_seconds:g}s_search_budget"
-                )
-                record_provider_event(budget_event(query, status, reason, started))
+                for future in list(pending):
+                    if future.done():
+                        collect_completed_future(future)
+                        continue
+                    task, started = pending.pop(future)
+                    cancelled = future.cancel()
+                    status = "skipped" if cancelled else "timeout"
+                    reason = (
+                        "tier_budget_expired_before_worker_start"
+                        if cancelled
+                        else f"exceeded_{tier_budget_seconds:g}s_tier_budget"
+                    )
+                    record_provider_event(budget_event(task, status, reason, started))
 
-            while next_index < len(search_plan):
-                _requested_platform, query = search_plan[next_index]
-                record_provider_event(
-                    budget_event(query, "skipped", "search_budget_exhausted_before_query_start")
-                )
-                next_index += 1
-        finally:
-            # Do not block the daily briefing on slow public endpoints. Completed
-            # results are retained; queued calls are cancelled when possible.
-            executor.shutdown(wait=False, cancel_futures=True)
+                while next_position < len(tier_tasks):
+                    task = tier_tasks[next_position]
+                    record_provider_event(budget_event(task, "skipped", "tier_budget_exhausted_before_query_start"))
+                    next_position += 1
+            finally:
+                # Do not block the daily briefing on slow public endpoints. Completed
+                # results are retained; queued calls are cancelled when possible.
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        for priority in sorted({task.priority for task in search_tasks}):
+            tier_tasks = [task for task in search_tasks if task.priority == priority]
+            run_tier(tier_tasks, tier_budgets.get(priority, 0.0))
 
         for _index, requested_platform, query, outcome in sorted(query_results, key=lambda item: item[0]):
             for result in outcome.results:
@@ -837,6 +905,47 @@ class DailyBriefingService:
             source_candidates=source_candidates,
             provider_events=provider_events,
         )
+
+    @staticmethod
+    def _budgeted_search_tasks(
+        subscription: TopicSubscription,
+        search_plan: list[tuple[str, str]],
+    ) -> list[BriefingSearchTask]:
+        recipe = normalize_source_recipe(subscription.source_recipe)
+        total_weight = sum(recipe.values()) or 1.0
+        tasks: list[BriefingSearchTask] = []
+        for index, (requested_platform, query) in enumerate(search_plan):
+            contract = source_contract_for_query(requested_platform, query)
+            weight = recipe.get(contract.slug, contract.default_budget_share)
+            tasks.append(
+                BriefingSearchTask(
+                    index=index,
+                    requested_platform=requested_platform,
+                    query=query,
+                    source_slug=contract.slug,
+                    priority=max(1, int(contract.priority)),
+                    timeout_seconds=max(0.1, float(contract.timeout_seconds)),
+                    budget_share=round(weight / total_weight, 4),
+                )
+            )
+        return sorted(tasks, key=lambda task: (task.priority, task.index))
+
+    def _tier_budget_seconds(self, tasks: list[BriefingSearchTask]) -> dict[int, float]:
+        if not tasks:
+            return {}
+        present_shares_by_priority: dict[int, dict[str, float]] = {}
+        for task in tasks:
+            present_shares_by_priority.setdefault(task.priority, {})[task.source_slug] = task.budget_share
+        tier_weights = {
+            priority: sum(shares.values())
+            for priority, shares in present_shares_by_priority.items()
+        }
+        total_present_weight = sum(tier_weights.values()) or 1.0
+        budget = max(0.0, self.search_budget_seconds)
+        return {
+            priority: budget * weight / total_present_weight
+            for priority, weight in tier_weights.items()
+        }
 
     def _search(self, query: str) -> list[SearchResult]:
         return self.search_client.search(query, limit=self.results_per_query)

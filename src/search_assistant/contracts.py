@@ -80,6 +80,8 @@ class ProviderTraceEvent(BaseModel):
     reason: str | None = None
     error: str | None = None
     elapsed_ms: float | None = None
+    tier: str | None = None
+    budget_share: float | None = None
     checked_at: str
 
 
