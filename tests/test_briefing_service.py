@@ -194,6 +194,11 @@ def test_daily_briefing_searches_public_social_channels_and_renders_required_con
     assert "https://www.example.com/agent-mes" in briefing.markdown
     assert "https://www.bilibili.com/video/BV1test" in briefing.markdown
     assert store.latest_daily_briefing(briefing.topic_id).id == briefing.id
+    candidates = store.list_domain_knowledge_candidates()
+    assert candidates
+    assert all(candidate["status"] == "candidate" for candidate in candidates)
+    assert all(briefing.id in candidate["source_ids"] for candidate in candidates)
+    assert all(candidate["evidence"] for candidate in candidates)
 
 
 def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(tmp_path):
@@ -342,6 +347,33 @@ def test_cad_topic_filter_rejects_generic_ai_content_and_keeps_engineering_evide
         "https://example.com/text-to-cad",
         "Text-to-CAD parametric B-Rep generation",
         "The system produces editable CAD features and validates geometric constraints.",
+    )
+
+
+def test_report_source_filter_keeps_exact_chinese_topic_phrase_without_overmatching_fragments():
+    topic = "人工智能产业发展"
+    query = "site:bilibili.com 人工智能产业发展"
+
+    assert DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://www.bilibili.com/video/av116578230279494",
+        "【政策研究】中国 人工智能产业发展 调查",
+        "围绕人工智能产业发展讨论政策、产业链与应用落地。",
+    )
+    assert DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://www.bilibili.com/video/av114070036480806",
+        "人工智能创新加速我国产业转型升级",
+        "公开视频讨论人工智能技术快速发展、产业链和应用落地。",
+    )
+    assert not DailyBriefingService._is_report_source_candidate(
+        topic,
+        query,
+        "https://example.com/ren-gong",
+        "人工 的意思",
+        "人工是一个汉语词汇解释页面。",
     )
 
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from search_assistant.contracts import AnswerPackage, SearchRecord
 from search_assistant.contracts import IncomingMessage
+from search_assistant.evolution.service import EvolutionDiagnosisService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
 from search_assistant.reports.service import ReportService
@@ -34,6 +35,7 @@ class EvaluationService:
         self.output_dir = Path(output_dir)
         self.report_output_dir = Path(report_output_dir)
         self.profile_service = ProfileService(store)
+        self.diagnosis_service = EvolutionDiagnosisService()
 
     def run(self, questions: list[str] | None = None, max_questions: int | None = None) -> dict[str, Any]:
         selected_questions = [question.strip() for question in (questions or DEFAULT_EVALUATION_QUESTIONS)]
@@ -56,8 +58,22 @@ class EvaluationService:
             package = self.workflow.answer(message)
             self.profile_service.update_from_answer(package)
             item = _evaluation_item(index, question, package)
+            trajectory = self.store.latest_trajectory_for_question(package.question_id)
+            if trajectory is None:
+                raise RuntimeError(f"trajectory was not recorded for {package.question_id}")
+            item.update(_structured_trajectory_verification(item))
+            item["trajectory_id"] = trajectory["id"]
+            item["diagnosis"] = self.diagnosis_service.diagnose(item, str(trajectory["id"]))
+            item["trajectory_evaluation_id"] = self.store.add_trajectory_evaluation(
+                trajectory_id=str(trajectory["id"]),
+                question_id=package.question_id,
+                result_verification=item["result_verification"],
+                process_verification=item["process_verification"],
+                quality_verification=item["quality_verification"],
+                diagnosis=item["diagnosis"],
+            )
             items.append(item)
-            if item["quality_flags"]:
+            if item["diagnosis"]["root_causes"]:
                 self.store.add_experience_item(
                     title="Evaluation quality issue",
                     body=_evaluation_quality_experience_body(item),
@@ -82,6 +98,13 @@ class EvaluationService:
                 "calibrated_answers": sum(1 for item in items if item["calibration_ran"]),
                 "review_rejected_answers": sum(1 for item in items if not item["review_approved"]),
                 "flagged_answers": sum(1 for item in items if item["quality_flags"]),
+                "trajectory_evaluations": len(items),
+                "result_failed_answers": sum(
+                    1 for item in items if not item["result_verification"]["passed"]
+                ),
+                "process_flagged_answers": sum(
+                    1 for item in items if not item["process_verification"]["passed"]
+                ),
             },
         }
         evaluation_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -122,6 +145,53 @@ def _evaluation_item(index: int, question: str, package: AnswerPackage) -> dict[
     item["uncertainty_assessment"] = _uncertainty_assessment(package, item)
     item["quality_flags"] = _quality_flags(package, item)
     return item
+
+
+def _structured_trajectory_verification(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result_flags: list[str] = []
+    if not str(item.get("answer_excerpt", "")).strip():
+        result_flags.append("empty_answer")
+    if "blocked_answer" in item["quality_flags"]:
+        result_flags.append("task_blocked")
+
+    process_flags: list[str] = []
+    classification = str(item["classification"])
+    search_record = item.get("search_record_structured") or {}
+    search_required = classification in {"research", "hard", "high_stakes"}
+    search_executed = bool(search_record.get("executed"))
+    if search_required and not search_executed:
+        process_flags.append("required_search_not_executed")
+    if search_executed and item["source_count"] == 0:
+        process_flags.append("search_returned_no_sources")
+    calibration_required = search_required or item["unverified_claims"] > 0
+    if calibration_required and not item["calibration_ran"]:
+        process_flags.append("missing_calibration")
+    if not item["review_ran"]:
+        process_flags.append("review_not_run")
+
+    quality_flags = list(item["quality_flags"])
+    return {
+        "result_verification": {
+            "passed": not result_flags,
+            "flags": result_flags,
+            "answer_present": bool(str(item.get("answer_excerpt", "")).strip()),
+        },
+        "process_verification": {
+            "passed": not process_flags,
+            "flags": process_flags,
+            "search_required": search_required,
+            "search_executed": search_executed,
+            "calibration_required": calibration_required,
+            "calibration_ran": item["calibration_ran"],
+            "review_ran": item["review_ran"],
+        },
+        "quality_verification": {
+            "passed": not quality_flags,
+            "flags": quality_flags,
+            "confidence": item["confidence"],
+            "uncertainty_assessment": item["uncertainty_assessment"],
+        },
+    }
 
 
 def _answer_without_search_record(answer_text: str) -> str:
@@ -545,12 +615,16 @@ def _evaluation_quality_experience_body(item: dict[str, Any]) -> str:
             f"question_id={item['question_id']}",
             f"classification={item['classification']}",
             f"confidence={item['confidence']}",
+            f"trajectory_id={item.get('trajectory_id', '')}",
+            f"result_flags={', '.join(item.get('result_verification', {}).get('flags', []))}",
+            f"process_flags={', '.join(item.get('process_verification', {}).get('flags', []))}",
             f"quality_flags={', '.join(item['quality_flags'])}",
             f"source_count={item['source_count']}",
             f"source_urls={json.dumps(source_urls, ensure_ascii=False)}",
             f"review_approved={item['review_approved']}",
             f"review_issues={'; '.join(review_issues)}",
             f"unverified_claim_samples={json.dumps(unverified_samples, ensure_ascii=False)}",
+            f"recommended_update_carrier={item.get('diagnosis', {}).get('recommended_update_carrier', 'none')}",
             "future_rule=Use evaluation failures as self-evolution input for search planning, answer style, calibration, and skill drafts.",
         ]
     )

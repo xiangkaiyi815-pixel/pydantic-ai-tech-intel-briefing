@@ -34,8 +34,9 @@ names and never a secret value.
 | `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. |
 | `SEARCH_ASSISTANT_MCP_SEARCH_CONFIG` | checked-in default when unset | MCP server and read-only search bindings. |
 | `MCP_SEARCH_TIMEOUT_SECONDS` | `18` | MCP request timeout. |
-| `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search. |
-| `BAIDU_SEARCH_BASE_URL` | `https://m.baidu.com/s` | Baidu public-index base URL. |
+| `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search; `duckduckgo` can also be included. |
+| `BROWSER_SEARCH_BASE_URL` | `https://cn.bing.com/search` | Bing public-result endpoint. |
+| `BAIDU_SEARCH_BASE_URL` | `https://www.baidu.com/baidu` | Baidu public-index base URL; the client can fall back to other public Baidu endpoints when one is challenged. |
 | `BILIBILI_SEARCH_BASE_URL` | public Bilibili endpoint | No-login Bilibili search endpoint. |
 | `RSSHUB_BASE_URL` | `http://127.0.0.1:1200` | Local optional RSSHub instance. |
 | `SEARCH_ASSISTANT_DOMESTIC_RSS_CONFIG` | unset | Optional operator-owned RSS source catalog. |

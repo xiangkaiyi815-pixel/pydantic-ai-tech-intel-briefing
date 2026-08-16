@@ -24,7 +24,9 @@ def test_settings_loads_defaults_for_local_mode(tmp_path):
     assert settings.briefing_max_queries == 28
     assert settings.bilibili_search_base_url == "https://api.bilibili.com/x/web-interface/search/type"
     assert settings.duckduckgo_timeout_seconds == 12.0
-    assert settings.baidu_search_base_url == "https://m.baidu.com/s"
+    assert settings.browser_search_engines == ["bing", "baidu", "google"]
+    assert settings.browser_search_base_url == "https://cn.bing.com/search"
+    assert settings.baidu_search_base_url == "https://www.baidu.com/baidu"
 
 
 def test_settings_loads_domestic_rss_configuration(tmp_path):
