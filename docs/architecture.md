@@ -54,7 +54,19 @@ flowchart TD
 `MemoryStore` uses SQLite. Key tables include topic subscriptions, topic
 feedback, collected sources, daily briefings, interactions, answers, claim
 evidence, profiles, reports, runtime sessions, skill drafts, immutable
-trajectories, trajectory evaluations, and domain knowledge candidates.
+trajectories, trajectory evaluations, domain knowledge candidates, reviewed
+domain knowledge graphs, and candidate-to-graph links.
+
+Domain knowledge graphs are stored as graph headers, entity nodes, and typed
+relation edges. They intentionally keep natural-language summaries next to
+entity-relation triples: the triples support GraphRAG-style navigation and
+entity disambiguation, while the summaries preserve the semantic nuance that
+would be lost by reducing every domain claim to a bare triple.
+
+Self-evolution output remains a reviewable candidate first. Search-derived
+domain knowledge candidates are linked to the best matching reviewed graph
+entity through immutable bridge records, but they are not promoted into graph
+facts until a human or later review workflow validates the evidence.
 
 The database is scoped by user and chat where applicable. The default location
 is `.local-data/assistant.sqlite3`; use `--data-dir` for isolated test or
