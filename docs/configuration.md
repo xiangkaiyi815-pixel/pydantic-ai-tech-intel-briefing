@@ -47,6 +47,30 @@ names and never a secret value.
 | `BRAVE_SEARCH_API_KEY` | unset | Required only when the Brave provider is selected. |
 | `SEARXNG_BASE_URL` | `http://localhost:8080/search` | Self-hosted SearXNG JSON endpoint. |
 
+### Optional Agent Reach Install
+
+Agent Reach is an optional CLI capability router. Do not commit a local virtual
+environment or a populated `.env.local` file to make it available on another
+machine. Install the checked-in extra instead:
+
+```powershell
+python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
+agent-reach doctor --json
+```
+
+When the project virtual environment is activated, the default
+`AGENT_REACH_COMMAND=agent-reach` works because the CLI entry point is on the
+virtual environment `PATH`. If the application is started by a scheduler or
+service without activating the virtual environment, set `AGENT_REACH_COMMAND`
+to the absolute path of that environment's `agent-reach` executable in local
+or deployment-only configuration.
+
+The Python extra installs the Agent Reach CLI and its Python dependencies. Some
+platform backends still require external tools, browser login state, cookies,
+or API configuration; use the `agent-reach doctor --json` output and the
+upstream Agent Reach install guide before enabling those routes with
+`agent-reach install --system`.
+
 ## Daily Briefing Settings
 
 | Variable | Default | Purpose |

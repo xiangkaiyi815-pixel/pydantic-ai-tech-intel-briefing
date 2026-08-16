@@ -73,6 +73,14 @@ python -m pip install -c constraints-dev.txt -e ".[dev]"
 Copy-Item .env.example .env.local
 ```
 
+To test the optional Agent Reach retrieval path on another development
+machine, install the reproducible extra into the same virtual environment:
+
+```powershell
+python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
+agent-reach doctor --json
+```
+
 Set a model provider and its credentials only in `.env.local`, your shell, or
 your deployment secret manager. Never commit a populated `.env.local` file.
 See [docs/configuration.md](docs/configuration.md) for variable definitions and
@@ -115,8 +123,10 @@ pool when the local network can reach its HTML endpoint. Machines that have
 set `SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach` to route retrieval through
 `agent-reach doctor --json` and its selected read-only backends, or set
 `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` to try Agent Reach first inside the
-default `hybrid` provider and then fall back to MCP/browser search. Platform
-capability is deliberately explicit:
+default `hybrid` provider and then fall back to MCP/browser search. Use
+`python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"` to make
+that CLI available from the project virtual environment on a fresh checkout.
+Platform capability is deliberately explicit:
 
 | Source family | Access mode | Notes |
 | --- | --- | --- |

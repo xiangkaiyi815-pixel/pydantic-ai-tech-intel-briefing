@@ -21,6 +21,9 @@ dev = [
   "pytest==9.0.2",
   "httpx==0.28.1",
 ]
+agent-reach = [
+  "agent-reach @ https://github.com/Panniantong/agent-reach/archive/main.zip",
+]
 
 [project.urls]
 Homepage = "https://github.com/redmaplewww/pydantic-ai-tech-intel-briefing"
