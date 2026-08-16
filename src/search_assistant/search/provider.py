@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -184,6 +185,278 @@ class CompositeSearchClient:
                 if len(merged) >= min(limit, self.primary_sufficient_results):
                     return merged
         return merged
+
+
+AgentReachCommandRunner = Callable[[list[str], float], str]
+
+
+class AgentReachSearchClient:
+    """Delegates retrieval to the installed Agent Reach capability router.
+
+    Agent Reach is intentionally a CLI capability layer rather than a Python
+    search SDK.  This adapter therefore first runs ``agent-reach doctor
+    --json`` and then calls the read-only command selected by Agent Reach's
+    public routing contract, such as ``mcporter`` for Exa search, ``bili`` for
+    Bilibili, ``yt-dlp`` for YouTube, and ``opencli`` for login-state
+    platforms.
+    """
+
+    def __init__(
+        self,
+        command: str = "agent-reach",
+        timeout_seconds: float = 30.0,
+        doctor_cache_seconds: float = 300.0,
+        command_runner: AgentReachCommandRunner | None = None,
+        require_available: bool = True,
+    ):
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.doctor_cache_seconds = doctor_cache_seconds
+        self.command_runner = command_runner or self._run_subprocess
+        self.require_available = require_available
+        self._doctor_cache: dict[str, Any] | None = None
+        self._doctor_checked_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        if limit <= 0:
+            return []
+
+        doctor = self._doctor()
+        commands = self._commands_for_query(query, limit, doctor)
+        if not commands:
+            message = _agent_reach_unavailable_message(query, doctor)
+            if self.require_available:
+                raise SearchProviderError(message)
+            return []
+
+        checked_at = datetime.now(UTC).isoformat()
+        merged: list[SearchResult] = []
+        seen: set[str] = set()
+        scoped_domains = _site_domains(query)
+        errors: list[str] = []
+        for command, provider in commands:
+            try:
+                raw_output = self.command_runner(command, self.timeout_seconds)
+            except Exception as exc:
+                errors.append(f"{provider}: {exc}")
+                continue
+            for result in _agent_reach_output_to_search_results(raw_output, provider, checked_at):
+                if scoped_domains and not _matches_scoped_domains(result.url, scoped_domains):
+                    continue
+                key = _dedupe_key(result.url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(result)
+                if len(merged) >= limit:
+                    return merged
+
+        if not merged and self.require_available and errors:
+            raise SearchProviderError("Agent Reach commands returned no usable URLs: " + "; ".join(errors[:3]))
+        return merged
+
+    def health(self) -> dict[str, object]:
+        doctor = self._doctor()
+        active = {
+            channel: result.get("active_backend")
+            for channel, result in doctor.items()
+            if isinstance(result, dict) and result.get("active_backend")
+        }
+        return {"command": self.command, "active_backends": active}
+
+    def _doctor(self) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._doctor_cache is not None and now - self._doctor_checked_at <= self.doctor_cache_seconds:
+            return self._doctor_cache
+
+        try:
+            raw_output = self.command_runner([self.command, "doctor", "--json"], self.timeout_seconds)
+        except FileNotFoundError as exc:
+            raise SearchProviderError(
+                "Agent Reach CLI was not found. Install it from "
+                "https://github.com/Panniantong/Agent-Reach and keep "
+                "SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach only on machines that have it."
+            ) from exc
+        except Exception as exc:
+            raise SearchProviderError(f"Agent Reach doctor failed: {exc}") from exc
+
+        try:
+            parsed = json.loads(raw_output)
+        except json.JSONDecodeError as exc:
+            raise SearchProviderError("Agent Reach doctor did not return valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise SearchProviderError("Agent Reach doctor JSON must be an object")
+
+        self._doctor_cache = parsed
+        self._doctor_checked_at = now
+        return parsed
+
+    def _commands_for_query(
+        self,
+        query: str,
+        limit: int,
+        doctor: Mapping[str, Any],
+    ) -> list[tuple[list[str], str]]:
+        commands: list[tuple[list[str], str]] = []
+        clean_query = _query_without_site_directives(query) or query
+        scoped_domains = _site_domains(query)
+
+        for channel in _agent_reach_channels_for_domains(scoped_domains):
+            commands.extend(self._commands_for_channel(channel, clean_query, limit, doctor))
+
+        if not scoped_domains or not commands:
+            commands.extend(self._commands_for_channel("exa_search", query, limit, doctor))
+        elif _agent_reach_channel_available(doctor, "exa_search"):
+            # Keep Exa as the final Agent Reach fallback for scoped public
+            # searches.  The original site: directive remains in the query so
+            # the downstream URL-domain guard can still enforce scope.
+            commands.extend(self._commands_for_channel("exa_search", query, limit, doctor))
+
+        unique: list[tuple[list[str], str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for command, provider in commands:
+            key = tuple(command)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((command, provider))
+        return unique
+
+    def _commands_for_channel(
+        self,
+        channel: str,
+        query: str,
+        limit: int,
+        doctor: Mapping[str, Any],
+    ) -> list[tuple[list[str], str]]:
+        if not _agent_reach_channel_available(doctor, channel):
+            return []
+
+        active_backend = _agent_reach_active_backend(doctor, channel).lower()
+        limit_text = str(max(1, limit))
+
+        if channel == "exa_search":
+            return [
+                (
+                    ["mcporter", "call", "exa.web_search_exa", f"query={query}", f"numResults={limit_text}"],
+                    "agent-reach:exa_search:mcporter",
+                )
+            ]
+        if channel == "github":
+            return [
+                (
+                    ["gh", "search", "repos", query, "--limit", limit_text, "--json", "fullName,description,url"],
+                    "agent-reach:github:gh",
+                )
+            ]
+        if channel == "youtube":
+            return [
+                (
+                    ["yt-dlp", "--dump-json", f"ytsearch{limit_text}:{query}"],
+                    "agent-reach:youtube:yt-dlp",
+                )
+            ]
+        if channel == "bilibili":
+            if "bili-cli" in active_backend:
+                return [
+                    (
+                        ["bili", "search", query, "--type", "video", "-n", limit_text],
+                        "agent-reach:bilibili:bili-cli",
+                    )
+                ]
+            if "opencli" in active_backend:
+                return [
+                    (
+                        ["opencli", "bilibili", "search", query, "-f", "yaml"],
+                        "agent-reach:bilibili:opencli",
+                    )
+                ]
+            return [
+                (
+                    ["curl", "-s", "-A", _AGENT_REACH_BROWSER_UA, _agent_reach_bilibili_search_api_url(query)],
+                    "agent-reach:bilibili:search-api",
+                )
+            ]
+        if channel == "twitter":
+            if "opencli" in active_backend:
+                return [
+                    (
+                        ["opencli", "twitter", "search", query, "-f", "yaml"],
+                        "agent-reach:twitter:opencli",
+                    )
+                ]
+            return [
+                (
+                    ["twitter", "search", query, "-n", limit_text],
+                    "agent-reach:twitter:twitter-cli",
+                )
+            ]
+        if channel == "reddit":
+            if "rdt" in active_backend:
+                return [
+                    (
+                        ["rdt", "search", query, "--limit", limit_text],
+                        "agent-reach:reddit:rdt-cli",
+                    )
+                ]
+            return [
+                (
+                    ["opencli", "reddit", "search", query, "-f", "yaml"],
+                    "agent-reach:reddit:opencli",
+                )
+            ]
+        if channel == "xiaohongshu":
+            if "xiaohongshu-mcp" in active_backend:
+                return [
+                    (
+                        [
+                            "mcporter",
+                            "call",
+                            "xiaohongshu.search_feeds",
+                            f"keyword={query}",
+                            "--timeout",
+                            "120000",
+                        ],
+                        "agent-reach:xiaohongshu:mcp",
+                    )
+                ]
+            if "xhs-cli" in active_backend or active_backend == "xhs":
+                return [(["xhs", "search", query], "agent-reach:xiaohongshu:xhs-cli")]
+            return [
+                (
+                    ["opencli", "xiaohongshu", "search", query, "-f", "yaml"],
+                    "agent-reach:xiaohongshu:opencli",
+                )
+            ]
+        if channel in {"facebook", "instagram"}:
+            return [
+                (
+                    ["opencli", channel, "search", query, "-f", "yaml"],
+                    f"agent-reach:{channel}:opencli",
+                )
+            ]
+        if channel == "linkedin":
+            # Agent Reach currently exposes LinkedIn primarily through MCP or
+            # Jina Reader for known pages.  For query-style retrieval, route
+            # through Agent Reach's Exa search while preserving site scope.
+            return self._commands_for_channel("exa_search", f"site:linkedin.com {query}", limit, doctor)
+        return []
+
+    @staticmethod
+    def _run_subprocess(command: list[str], timeout_seconds: float) -> str:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0:
+            output = (completed.stderr or completed.stdout or "").strip()
+            raise SearchProviderError(output or f"Command exited with status {completed.returncode}")
+        return completed.stdout
 
 
 class BrowserSearchClient:
@@ -1325,13 +1598,21 @@ class FakeSearchClient:
 
 def search_client_from_settings(settings: Settings) -> SearchClient:
     provider = settings.search_provider.lower()
+    if provider == "agent-reach":
+        return _agent_reach_search_client_from_settings(settings)
     if provider == "browser":
         return _browser_search_client_from_settings(settings)
     if provider == "mcp":
         return _mcp_search_client_from_settings(settings)
     if provider == "hybrid":
+        clients: list[SearchClient] = []
+        if settings.agent_reach_enabled:
+            clients.append(_agent_reach_search_client_from_settings(settings, require_available=False))
+        clients.extend(
+            [_mcp_search_client_from_settings(settings), _browser_search_client_from_settings(settings)]
+        )
         return CompositeSearchClient(
-            [_mcp_search_client_from_settings(settings), _browser_search_client_from_settings(settings)],
+            clients,
             # Public MCP sources provide structured technical evidence, but a
             # small number of results is not enough to represent global and
             # Chinese web coverage. Merge the browser pass before ranking.
@@ -1354,6 +1635,18 @@ def search_client_from_settings(settings: Settings) -> SearchClient:
     if provider == "fake":
         raise RuntimeError("Fake search provider is disabled. Set SEARCH_ASSISTANT_ALLOW_FAKE_RUNTIME=true only for tests.")
     raise RuntimeError(f"Unsupported search provider: {settings.search_provider}")
+
+
+def _agent_reach_search_client_from_settings(
+    settings: Settings,
+    require_available: bool = True,
+) -> AgentReachSearchClient:
+    return AgentReachSearchClient(
+        command=settings.agent_reach_command,
+        timeout_seconds=settings.agent_reach_timeout_seconds,
+        doctor_cache_seconds=settings.agent_reach_doctor_cache_seconds,
+        require_available=require_available,
+    )
 
 
 def _browser_search_client_from_settings(settings: Settings) -> BrowserSearchClient:
@@ -1441,6 +1734,240 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
         else:
             raise RuntimeError(f"Unsupported browser search engine: {engine}")
     return engines
+
+
+_AGENT_REACH_BROWSER_UA = "Mozilla/5.0 agent-reach/search-assistant"
+
+_AGENT_REACH_DOMAIN_CHANNELS: dict[str, str] = {
+    "github.com": "github",
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "bilibili.com": "bilibili",
+    "b23.tv": "bilibili",
+    "reddit.com": "reddit",
+    "x.com": "twitter",
+    "twitter.com": "twitter",
+    "xiaohongshu.com": "xiaohongshu",
+    "xhslink.com": "xiaohongshu",
+    "facebook.com": "facebook",
+    "instagram.com": "instagram",
+    "linkedin.com": "linkedin",
+}
+
+
+def _agent_reach_channels_for_domains(scoped_domains: tuple[str, ...]) -> list[str]:
+    channels: list[str] = []
+    for domain in scoped_domains:
+        normalized = _normalize_domain(domain)
+        for configured_domain, channel in _AGENT_REACH_DOMAIN_CHANNELS.items():
+            if normalized == configured_domain or normalized.endswith(f".{configured_domain}"):
+                _append_unique(channels, channel)
+                break
+    return channels
+
+
+def _agent_reach_channel_available(doctor: Mapping[str, Any], channel: str) -> bool:
+    raw_result = doctor.get(channel)
+    if not isinstance(raw_result, dict):
+        return False
+    # Agent Reach may report warn when it deliberately avoids a live platform
+    # read (for example Exa registered in mcporter or OpenCLI present but not
+    # probed).  That is still a real Agent Reach route worth trying.
+    return str(raw_result.get("status", "")).lower() in {"ok", "warn"}
+
+
+def _agent_reach_active_backend(doctor: Mapping[str, Any], channel: str) -> str:
+    raw_result = doctor.get(channel)
+    if not isinstance(raw_result, dict):
+        return ""
+    return str(raw_result.get("active_backend") or "")
+
+
+def _agent_reach_unavailable_message(query: str, doctor: Mapping[str, Any]) -> str:
+    channels = _agent_reach_channels_for_domains(_site_domains(query)) or ["exa_search"]
+    statuses: list[str] = []
+    for channel in channels:
+        result = doctor.get(channel)
+        if isinstance(result, dict):
+            status = result.get("status", "unknown")
+            message = str(result.get("message") or "").splitlines()[0]
+            statuses.append(f"{channel}={status}: {message}")
+        else:
+            statuses.append(f"{channel}=missing")
+    return "Agent Reach has no usable route for this query. " + "; ".join(statuses)
+
+
+def _agent_reach_bilibili_search_api_url(query: str) -> str:
+    return (
+        "https://api.bilibili.com/x/web-interface/search/all/v2?"
+        + urllib.parse.urlencode({"keyword": query, "page": "1"})
+    )
+
+
+def _agent_reach_output_to_search_results(raw_output: str, provider: str, checked_at: str) -> list[SearchResult]:
+    parsed = _json_loads_maybe(raw_output)
+    results: list[SearchResult] = []
+    if parsed is not None:
+        results.extend(_agent_reach_json_to_search_results(parsed, provider, checked_at))
+    if not results:
+        results.extend(_agent_reach_text_to_search_results(raw_output, provider, checked_at))
+    return _dedupe_search_results(results)
+
+
+def _agent_reach_json_to_search_results(value: Any, provider: str, checked_at: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    if isinstance(value, list):
+        for item in value:
+            results.extend(_agent_reach_json_to_search_results(item, provider, checked_at))
+        return results
+
+    if isinstance(value, dict):
+        title = _first_non_empty_string(
+            value,
+            (
+                "title",
+                "name",
+                "fullName",
+                "full_name",
+                "repo",
+                "repository",
+                "author",
+                "username",
+            ),
+        )
+        url = _first_non_empty_string(
+            value,
+            (
+                "url",
+                "html_url",
+                "htmlUrl",
+                "link",
+                "external_url",
+                "externalUrl",
+                "webpage_url",
+                "webpageUrl",
+                "arcurl",
+                "short_link",
+            ),
+        )
+        snippet = _first_non_empty_string(
+            value,
+            (
+                "snippet",
+                "description",
+                "desc",
+                "content",
+                "text",
+                "summary",
+                "body",
+                "dynamic",
+            ),
+        )
+        if url and url.startswith(("http://", "https://")):
+            results.append(
+                SearchResult(
+                    title=_clean_text(title or _title_from_url(url)),
+                    url=html.unescape(url),
+                    snippet=_clean_text(snippet),
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+
+        for raw_child in value.values():
+            if isinstance(raw_child, str):
+                child_json = _json_loads_maybe(raw_child)
+                if child_json is not None:
+                    results.extend(_agent_reach_json_to_search_results(child_json, provider, checked_at))
+                else:
+                    results.extend(_agent_reach_text_to_search_results(raw_child, provider, checked_at))
+            elif isinstance(raw_child, (dict, list)):
+                results.extend(_agent_reach_json_to_search_results(raw_child, provider, checked_at))
+        return results
+
+    if isinstance(value, str):
+        nested = _json_loads_maybe(value)
+        if nested is not None:
+            return _agent_reach_json_to_search_results(nested, provider, checked_at)
+        return _agent_reach_text_to_search_results(value, provider, checked_at)
+
+    return results
+
+
+def _agent_reach_text_to_search_results(raw_output: str, provider: str, checked_at: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for raw_line in raw_output.splitlines():
+        line = _clean_text(raw_line)
+        if not line:
+            continue
+        for url in _urls_from_text(line):
+            title = _title_from_text_line(line, url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=line,
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+        for bvid in re.findall(r"\bBV[0-9A-Za-z]{8,}\b", line):
+            url = f"https://www.bilibili.com/video/{bvid}"
+            results.append(
+                SearchResult(
+                    title=_title_from_text_line(line, bvid),
+                    url=url,
+                    snippet=line,
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+    return results
+
+
+def _json_loads_maybe(value: str) -> Any | None:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def _first_non_empty_string(values: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, int | float):
+            return str(value)
+    return ""
+
+
+def _urls_from_text(value: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s\]\)\"'<>，。；、]+", value):
+        url = html.unescape(match.group(0)).rstrip(".,;:!?)】》")
+        if url.startswith(("http://", "https://")):
+            urls.append(url)
+    return urls
+
+
+def _title_from_text_line(line: str, marker: str) -> str:
+    before_marker = line.split(marker, 1)[0].strip(" -|:：[]()")
+    if before_marker:
+        return _clean_text(before_marker)[-120:]
+    if marker.startswith("http"):
+        return _title_from_url(marker)
+    return marker
+
+
+def _title_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = _normalize_domain(parsed.hostname or "source")
+    path = urllib.parse.unquote(parsed.path.strip("/").split("/")[-1] if parsed.path else "")
+    return _clean_text(path or host)
 
 
 def _browser_engine_name(engine: SearchClient) -> str:

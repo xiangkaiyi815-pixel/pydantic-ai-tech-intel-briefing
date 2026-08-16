@@ -107,11 +107,17 @@ contract is in [skills/content-collection-report/SKILL.md](skills/content-collec
 
 The default `hybrid` provider combines read-only MCP tools with Bing, Baidu,
 and Google public-result pages. DuckDuckGo can be added to the browser engine
-pool when the local network can reach its HTML endpoint. Platform capability is
-deliberately explicit:
+pool when the local network can reach its HTML endpoint. Machines that have
+[Agent Reach](https://github.com/Panniantong/Agent-Reach) installed can also
+set `SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach` to route retrieval through
+`agent-reach doctor --json` and its selected read-only backends, or set
+`SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` to try Agent Reach first inside the
+default `hybrid` provider and then fall back to MCP/browser search. Platform
+capability is deliberately explicit:
 
 | Source family | Access mode | Notes |
 | --- | --- | --- |
+| Agent Reach | Optional CLI capability router | Runs `agent-reach doctor --json`, then calls selected read-only tools such as `mcporter`, `bili`, `yt-dlp`, `gh`, or `opencli`; unavailable local routes do not count as coverage. |
 | GitHub, arXiv, Hacker News, Stack Exchange | Read-only MCP | URL-bearing public results |
 | General web | Public engine results | Bing, Baidu, Google; optional DuckDuckGo; markup and anti-bot behavior can vary |
 | Bilibili | Public video-search API | No login state; retries with browser headers when public API returns transient anti-bot errors |

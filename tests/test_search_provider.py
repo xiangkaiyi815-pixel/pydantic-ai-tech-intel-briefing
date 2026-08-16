@@ -8,6 +8,7 @@ import pytest
 
 from search_assistant.config import Settings
 from search_assistant.search.provider import (
+    AgentReachSearchClient,
     BaiduBrowserSearchClient,
     BilibiliPublicSearchClient,
     BingBrowserSearchClient,
@@ -268,6 +269,98 @@ def test_composite_search_client_does_not_backfill_when_primary_has_sufficient_r
     results = client.search("industrial AI", limit=8)
 
     assert [result.url for result in results] == ["https://example.com/a", "https://example.com/b", "https://example.com/c"]
+
+
+def test_agent_reach_search_client_runs_doctor_then_exa_route():
+    calls = []
+
+    def runner(command, timeout):
+        calls.append(command)
+        if command == ["agent-reach", "doctor", "--json"]:
+            return json.dumps(
+                {
+                    "exa_search": {
+                        "status": "warn",
+                        "message": "Exa is configured but not live-probed.",
+                        "active_backend": None,
+                    }
+                }
+            )
+        assert command == [
+            "mcporter",
+            "call",
+            "exa.web_search_exa",
+            "query=Agent Reach",
+            "numResults=2",
+        ]
+        return json.dumps(
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            [
+                                {
+                                    "title": "Agent Reach repository",
+                                    "url": "https://github.com/Panniantong/Agent-Reach",
+                                    "snippet": "CLI capability router for agents.",
+                                }
+                            ]
+                        ),
+                    }
+                ]
+            }
+        )
+
+    client = AgentReachSearchClient(command_runner=runner)
+
+    results = client.search("Agent Reach", limit=2)
+
+    assert [call[0] for call in calls] == ["agent-reach", "mcporter"]
+    assert results[0].title == "Agent Reach repository"
+    assert results[0].url == "https://github.com/Panniantong/Agent-Reach"
+    assert results[0].provider == "agent-reach:exa_search:mcporter"
+
+
+def test_agent_reach_search_client_uses_bilibili_backend_for_scoped_query():
+    calls = []
+
+    def runner(command, timeout):
+        calls.append(command)
+        if command == ["agent-reach", "doctor", "--json"]:
+            return json.dumps(
+                {
+                    "bilibili": {
+                        "status": "ok",
+                        "message": "bili-cli is available.",
+                        "active_backend": "bili-cli",
+                    },
+                    "exa_search": {"status": "off", "message": "not configured", "active_backend": None},
+                }
+            )
+        assert command == ["bili", "search", "AI 教程", "--type", "video", "-n", "1"]
+        return "AI 教程入门 BV1test123"
+
+    client = AgentReachSearchClient(command_runner=runner)
+
+    results = client.search("site:bilibili.com AI 教程", limit=1)
+
+    assert [call[0] for call in calls] == ["agent-reach", "bili"]
+    assert results[0].url == "https://www.bilibili.com/video/BV1test123"
+    assert results[0].provider == "agent-reach:bilibili:bili-cli"
+
+
+def test_agent_reach_search_client_reports_missing_route_from_doctor():
+    client = AgentReachSearchClient(
+        command_runner=lambda command, timeout: json.dumps(
+            {
+                "exa_search": {"status": "off", "message": "mcporter missing", "active_backend": None},
+            }
+        )
+    )
+
+    with pytest.raises(SearchProviderError, match="Agent Reach has no usable route"):
+        client.search("Agent Reach", limit=1)
 
 
 def test_searxng_search_client_extracts_json_results_without_an_api_key():
@@ -1395,6 +1488,42 @@ def test_search_client_from_settings_uses_hybrid_search_by_default_without_api_k
     }
     baidu = next(engine for engine in client.clients[1].engines if isinstance(engine, BaiduBrowserSearchClient))
     assert baidu.base_url == "https://www.baidu.com/baidu"
+
+
+def test_search_client_from_settings_allows_agent_reach_provider(tmp_path):
+    settings = Settings.from_env(
+        {
+            "SEARCH_ASSISTANT_DATA_DIR": str(tmp_path),
+            "SEARCH_ASSISTANT_SEARCH_PROVIDER": "agent-reach",
+            "AGENT_REACH_COMMAND": "agent-reach-custom",
+            "AGENT_REACH_TIMEOUT_SECONDS": "11",
+            "AGENT_REACH_DOCTOR_CACHE_SECONDS": "22",
+        }
+    )
+
+    client = search_client_from_settings(settings)
+
+    assert isinstance(client, AgentReachSearchClient)
+    assert client.command == "agent-reach-custom"
+    assert client.timeout_seconds == 11.0
+    assert client.doctor_cache_seconds == 22.0
+
+
+def test_search_client_from_settings_can_prepend_agent_reach_to_hybrid(tmp_path):
+    settings = Settings.from_env(
+        {
+            "SEARCH_ASSISTANT_DATA_DIR": str(tmp_path),
+            "SEARCH_ASSISTANT_AGENT_REACH_ENABLED": "true",
+        }
+    )
+
+    client = search_client_from_settings(settings)
+
+    assert isinstance(client, CompositeSearchClient)
+    assert isinstance(client.clients[0], AgentReachSearchClient)
+    assert isinstance(client.clients[1], McpSearchClient)
+    assert isinstance(client.clients[2], BrowserSearchClient)
+    assert client.clients[0].require_available is False
 
 
 def test_search_client_from_settings_allows_browser_engine_selection(tmp_path):

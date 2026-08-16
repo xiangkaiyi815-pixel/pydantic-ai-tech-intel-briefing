@@ -31,9 +31,13 @@ names and never a secret value.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. |
+| `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `agent-reach`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. Use `agent-reach` only on machines with the Agent Reach CLI installed. |
 | `SEARCH_ASSISTANT_MCP_SEARCH_CONFIG` | checked-in default when unset | MCP server and read-only search bindings. |
 | `MCP_SEARCH_TIMEOUT_SECONDS` | `18` | MCP request timeout. |
+| `SEARCH_ASSISTANT_AGENT_REACH_ENABLED` | `false` | When `true` and the provider is `hybrid`, try Agent Reach first and fall back to MCP/browser search if the local Agent Reach route is unavailable. |
+| `AGENT_REACH_COMMAND` | `agent-reach` | Agent Reach CLI executable or absolute path. |
+| `AGENT_REACH_TIMEOUT_SECONDS` | `30` | Per Agent Reach routed command timeout. |
+| `AGENT_REACH_DOCTOR_CACHE_SECONDS` | `300` | Cache window for `agent-reach doctor --json` results. |
 | `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search; `duckduckgo` can also be included. |
 | `BROWSER_SEARCH_BASE_URL` | `https://cn.bing.com/search` | Bing public-result endpoint. |
 | `BAIDU_SEARCH_BASE_URL` | `https://www.baidu.com/baidu` | Baidu public-index base URL; the client can fall back to other public Baidu endpoints when one is challenged. |
