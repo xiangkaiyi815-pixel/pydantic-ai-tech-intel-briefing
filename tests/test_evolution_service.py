@@ -1,4 +1,5 @@
 from datetime import date
+import json
 import sqlite3
 
 import pytest
@@ -8,6 +9,8 @@ from search_assistant.contracts import (
     BriefingTheme,
     CollectedSource,
     DailyBriefing,
+    DomainKnowledgeCandidate,
+    DomainKnowledgeEvidence,
 )
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
@@ -33,6 +36,16 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     assert candidates[0]["confidence"] == "medium"
     assert len(candidates[0]["evidence"]) == 2
     assert candidates[0]["source_ids"][0] == briefing.id
+    graph_links = store.list_domain_candidate_graph_links(first_ids[0])
+    assert len(graph_links) == 1
+    assert graph_links[0]["graph_id"] == "industrial-ai"
+    assert graph_links[0]["entity_id"] in {"mes", "controlled-work-order-orchestration"}
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="candidate graph links are immutable"):
+            connection.execute(
+                "UPDATE domain_knowledge_candidate_graph_links SET note = 'changed' WHERE candidate_id = ?",
+                (first_ids[0],),
+            )
 
     validation = service.validate(first_ids[0])
     service.deprecate(first_ids[0], "superseded by a later evidence review")
@@ -63,6 +76,45 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "candidate"
 
 
+def test_evolve_command_backfills_existing_candidate_graph_links(tmp_path, capsys):
+    from search_assistant import cli
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = "2026-08-06T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-medical-imaging",
+        topic="医学影像大模型",
+        claim="DICOM/PACS data boundaries shape how medical imaging foundation models enter clinical workflows.",
+        applies_when="Use when researching medical imaging AI deployment and validation.",
+        evidence=[
+            DomainKnowledgeEvidence(
+                title="Medical imaging model deployment",
+                url="https://example.com/medical-imaging-model",
+                provider="example",
+                retrieved_at=now,
+            )
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-medical-imaging"],
+        fingerprint="medical-imaging-candidate-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+
+    assert cli.main(["evolve", "--data-dir", str(tmp_path)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["domain_knowledge_candidate_graph_links"] == {"created": 1, "total": 1}
+    links = store.list_domain_candidate_graph_links(candidate.id)
+    assert len(links) == 1
+    assert links[0]["graph_id"] == "medical-imaging-ai"
+    assert links[0]["entity_id"] in {"dicom-pacs", "multimodal-medical-imaging-model"}
+
+
 def test_learning_report_surfaces_trajectory_and_domain_candidate_status(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -75,6 +127,7 @@ def test_learning_report_surfaces_trajectory_and_domain_candidate_status(tmp_pat
     assert "## Domain Knowledge Candidates" in report
     assert "[candidate; confidence medium] industrial AI" in report
     assert "evidence: 2" in report
+    assert "graph links: 1" in report
 
 
 def _briefing(source_count: int) -> DailyBriefing:
@@ -112,7 +165,10 @@ def _briefing(source_count: int) -> DailyBriefing:
             themes=[
                 BriefingTheme(
                     name="Review-gated execution",
-                    analysis="Industrial AI workflows keep a human review gate before production execution.",
+                    analysis=(
+                        "Industrial AI workflows keep a human review gate before writing work orders "
+                        "to MES / Manufacturing Execution System production execution."
+                    ),
                     source_urls=[source.url for source in sources],
                 )
             ],

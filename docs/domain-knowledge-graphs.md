@@ -66,6 +66,28 @@ python -m search_assistant.cli knowledge-graph-export agent-engineering --data-d
 By default the export is written to `.local-data/knowledge-graphs/<domain>.md`,
 which remains outside source control.
 
+## Self-evolution compatibility
+
+The self-evolution loop writes search-derived lessons as
+`domain_knowledge_candidates`. These records are intentionally reviewable
+candidates, not accepted graph facts. When a briefing or `evolve` run produces a
+candidate, the project now searches the reviewed domain graphs and stores an
+immutable candidate-to-entity link when there is a matching graph node.
+
+This gives the project a safer growth path:
+
+1. public-source evidence is preserved in the normal briefing store;
+2. the candidate captures the possible reusable lesson;
+3. the graph link shows which reviewed domain entity it may refine;
+4. a human or later validation workflow can decide whether to update the graph
+   seed itself.
+
+Running `evolve` also backfills links for older candidates:
+
+```powershell
+python -m search_assistant.cli evolve --data-dir .local-data
+```
+
 ## Update policy
 
 The checked-in graph seeds are a reviewed starting point, not a live claim of

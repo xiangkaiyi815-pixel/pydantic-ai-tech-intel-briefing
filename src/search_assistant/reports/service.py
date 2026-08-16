@@ -107,10 +107,15 @@ class ReportService:
         candidates = self.store.list_domain_knowledge_candidates()
         if not candidates:
             return ["- No search-derived domain knowledge candidates recorded yet."]
+        links_by_candidate: dict[str, int] = {}
+        for link in self.store.list_domain_candidate_graph_links():
+            candidate_id = str(link["candidate_id"])
+            links_by_candidate[candidate_id] = links_by_candidate.get(candidate_id, 0) + 1
         return [
             (
                 f"- [{item['status']}; confidence {item['confidence']}] {item['topic']}: "
-                f"{item['claim']} (evidence: {len(item['evidence'])})"
+                f"{item['claim']} (evidence: {len(item['evidence'])}; "
+                f"graph links: {links_by_candidate.get(str(item['id']), 0)})"
             )
             for item in candidates
         ]
