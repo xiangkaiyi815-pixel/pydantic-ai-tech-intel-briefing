@@ -21,6 +21,13 @@ from search_assistant.contracts import (
     TopicSubscription,
 )
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
+from search_assistant.knowledge_graph.embedding import (
+    EmbeddingProvider,
+    build_embedding_provider,
+    cosine_similarity,
+    _embedding_cache_key,
+)
+from search_assistant.knowledge_graph.extractor import extend_graph_from_briefing
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchOutcome, SearchResult, search_with_provider_events
@@ -849,6 +856,7 @@ class DailyBriefingService:
         model_max_sources: int = 12,
         search_budget_seconds: float = 90.0,
         timezone_name: str = "Asia/Shanghai",
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         self.store = store
         self.search_client = search_client
@@ -859,6 +867,7 @@ class DailyBriefingService:
         self.model_max_sources = model_max_sources
         self.search_budget_seconds = search_budget_seconds
         self.timezone_name = timezone_name
+        self.embedding_provider = embedding_provider or build_embedding_provider()
 
     def run(
         self,
@@ -1001,10 +1010,16 @@ class DailyBriefingService:
             self.store.record_daily_briefing(briefing)
 
             phase_started = time.monotonic()
-            candidate_service = DomainKnowledgeCandidateService(self.store)
+            candidate_service = DomainKnowledgeCandidateService(
+                self.store, embedding_provider=self.embedding_provider
+            )
             candidate_ids = candidate_service.capture_briefing(briefing)
             validation_results = [candidate_service.record_validation_gate(candidate_id) for candidate_id in candidate_ids]
             knowledge_layers = _count_knowledge_layers(validation_results)
+            try:
+                graph_extension = extend_graph_from_briefing(self.store, briefing)
+            except Exception:
+                graph_extension = {"graph_id": None, "added_entities": 0, "added_relations": 0}
             self._record_trace_event(
                 run_id,
                 "evolution",
@@ -1080,6 +1095,7 @@ class DailyBriefingService:
                     "briefing_id": briefing.id,
                     "source_count": len(ranked_sources),
                     "candidate_count": len(candidate_ids),
+                    "graph_extension": graph_extension,
                 },
             )
             return briefing
@@ -1228,13 +1244,22 @@ class DailyBriefingService:
     def _knowledge_context(self, topic: str) -> dict[str, object]:
         """Retrieve reviewed graph and self-evolution context before planning.
 
-        Reviewed graph hits may guide both query planning and synthesis framing.
-        Self-evolution candidates are split by release state: validated candidates
-        can be used as planning context, while weak signals only suggest what to
-        verify next.  Neither category is treated as a current factual source.
+        Context is routed by memory type:
+
+        - **Semantic** memory: reviewed graph hits (``reviewed_graph_hits``).
+        - **Episodic** memory: recent trajectory logs that mention the topic
+          (``episodic_trajectories``), so prior runs of the same topic can
+          inform the plan without being treated as current facts.
+        - **Procedural** memory: layered ``domain_knowledge``/``run_experience``
+          items (``procedural_rules``), i.e. distilled workflow guidance.
+
+        Self-evolution candidates are split by release state: validated
+        candidates can be used as planning context, while weak signals only
+        suggest what to verify next.  None of these categories is treated as a
+        current factual source.
         """
 
-        graph_service = DomainKnowledgeGraphService(self.store)
+        graph_service = DomainKnowledgeGraphService(self.store, embedding_provider=self.embedding_provider)
         seeded_graphs = 0
         try:
             if not graph_service.list_graphs():
@@ -1251,7 +1276,7 @@ class DailyBriefingService:
             if str(candidate.get("status")) == "deprecated":
                 continue
             layer = latest_layers.get(str(candidate.get("id")), "unreviewed_candidate")
-            if not self._candidate_matches_topic(candidate, topic_terms):
+            if not self._candidate_matches_topic(candidate, topic, topic_terms):
                 continue
             item = {
                 "id": candidate["id"],
@@ -1274,15 +1299,106 @@ class DailyBriefingService:
 
         return {
             "policy": (
-                "Use reviewed graph hits and validated self-evolution candidates only as planning and framing context; "
-                "re-open original sources before making current factual claims. Use weak signals only for next research "
-                "directions, not as evidence."
+                "Use reviewed graph hits, episodic trajectories and validated self-evolution candidates only as "
+                "planning and framing context; re-open original sources before making current factual claims. "
+                "Use weak signals only for next research directions, not as evidence."
             ),
             "seeded_graphs": seeded_graphs,
             "reviewed_graph_hits": [hit.model_dump(mode="json") for hit in graph_hits],
+            "episodic_trajectories": self._episodic_trajectories(topic, topic_terms),
+            "procedural_rules": self._procedural_rules(topic, topic_terms),
             "validated_candidates": validated_candidates[:3],
             "weak_signals": weak_signals[:3],
         }
+
+    def _episodic_trajectories(
+        self,
+        topic: str,
+        topic_terms: set[str],
+        limit: int = 3,
+    ) -> list[dict[str, object]]:
+        """Return recent trajectory logs that mention the topic (episodic memory).
+
+        Each returned item is a compact summary of a past run on this topic:
+        when it happened and what the trajectory tried.  It is planning context
+        only and must not be quoted as a current fact.
+        """
+        try:
+            logs = self.store.list_trajectory_logs()
+        except Exception:
+            return []
+        episodic: list[dict[str, object]] = []
+        for log in reversed(logs):
+            payload = log.get("payload") or {}
+            text = " ".join(
+                str(value)
+                for value in (
+                    payload.get("question"),
+                    payload.get("query"),
+                    payload.get("answer"),
+                    payload.get("summary"),
+                    payload.get("topic"),
+                )
+                if value
+            ).lower()
+            if not text:
+                continue
+            matched = [term for term in topic_terms if term.lower() in text]
+            if not matched:
+                continue
+            episodic.append(
+                {
+                    "trajectory_id": str(log.get("id") or ""),
+                    "question_id": str(log.get("question_id") or ""),
+                    "source": str(log.get("source") or ""),
+                    "created_at": str(log.get("created_at") or ""),
+                    "matched_terms": matched[:4],
+                    "summary": text[:240],
+                }
+            )
+            if len(episodic) >= limit:
+                break
+        return episodic
+
+    def _procedural_rules(
+        self,
+        topic: str,
+        topic_terms: set[str],
+        limit: int = 3,
+    ) -> list[dict[str, object]]:
+        """Return layered procedural memory items relevant to the topic.
+
+        ``run_experience`` items capture distilled workflow guidance from past
+        runs (e.g. which search strategy worked); ``domain_knowledge`` items are
+        reviewed domain facts.  Only active items are returned.
+        """
+        try:
+            items = self.store.list_layered_memory_items(limit=500)
+        except Exception:
+            return []
+        rules: list[dict[str, object]] = []
+        for item in items:
+            if item.status != "active":
+                continue
+            if item.layer not in ("run_experience", "domain_knowledge"):
+                continue
+            text = " ".join((item.content, str(item.metadata.get("topic") or ""))).lower()
+            matched = [term for term in topic_terms if term.lower() in text]
+            if not matched:
+                continue
+            rules.append(
+                {
+                    "layer": item.layer,
+                    "kind": item.kind,
+                    "content": item.content[:360],
+                    "confidence": item.confidence,
+                    "source_id": item.source_id,
+                    "matched_terms": matched[:4],
+                }
+            )
+            if len(rules) >= limit:
+                break
+        return rules
 
     def _knowledge_guided_queries(
         self,
@@ -1315,24 +1431,70 @@ class DailyBriefingService:
             latest[candidate_id] = str(metadata.get("knowledge_layer") or "unreviewed_candidate")
         return latest
 
-    @staticmethod
-    def _candidate_matches_topic(candidate: dict[str, object], topic_terms: set[str]) -> bool:
+    def _candidate_matches_topic(self, candidate: dict[str, object], topic: str, topic_terms: set[str]) -> bool:
+        """Decide whether a self-evolution candidate belongs to the current topic.
+
+        Semantic matching (embedding cosine similarity on the topic fields) is
+        tried first so cross-lingual or paraphrased topics can still match.
+        The literal fallback only inspects the candidate ``topic`` field and
+        requires at least two overlapping terms, avoiding the previous
+        topic+claim+applies_when haystack that matched nearly every candidate
+        through generic AI vocabulary in claims.
+        """
+        if self._candidate_topic_semantic_match(topic, str(candidate.get("topic", ""))):
+            return True
         if not topic_terms:
             return False
-        text = " ".join(
-            (
-                str(candidate.get("topic", "")),
-                str(candidate.get("claim", "")),
-                str(candidate.get("applies_when", "")),
-            )
-        ).lower()
-        return any(term.lower() in text for term in topic_terms)
+        candidate_topic = str(candidate.get("topic", "")).lower()
+        if not candidate_topic:
+            return False
+        matched = [term for term in topic_terms if term.lower() in candidate_topic]
+        return len(matched) >= 2
+
+    def _candidate_topic_semantic_match(self, topic: str, candidate_topic: str) -> bool:
+        """Return True when the candidate topic is semantically close to the query topic."""
+        if not topic.strip() or not candidate_topic.strip():
+            return False
+        provider = self.embedding_provider
+        if provider is None or provider.__class__.__name__ == "NullEmbeddingProvider":
+            return False
+        query_vector = self._embedding_cached(topic.strip())
+        candidate_vector = self._embedding_cached(candidate_topic.strip())
+        if not query_vector or not candidate_vector:
+            return False
+        return cosine_similarity(query_vector, candidate_vector) >= 0.78
+
+    def _embedding_cached(self, text: str) -> list[float] | None:
+        """Return an embedding vector for ``text``, using the SQLite cache."""
+        provider = self.embedding_provider
+        if provider is None or provider.__class__.__name__ == "NullEmbeddingProvider":
+            return None
+        cache_key = _embedding_cache_key(text)
+        cached = self.store.get_entity_embedding(cache_key)
+        if cached:
+            return cached
+        try:
+            vectors = provider.embed([text])
+        except Exception:
+            return None
+        if not vectors or not vectors[0]:
+            return None
+        vector = vectors[0]
+        self.store.upsert_entity_embedding(
+            cache_key,
+            provider.__class__.__name__,
+            getattr(provider, "model", "unknown"),
+            vector,
+        )
+        return vector
 
     @staticmethod
     def _knowledge_context_metadata(knowledge_context: dict[str, object]) -> dict[str, object]:
         return {
             "seeded_graphs": knowledge_context.get("seeded_graphs", 0),
             "reviewed_graph_hits": len(knowledge_context.get("reviewed_graph_hits", [])),
+            "episodic_trajectories": len(knowledge_context.get("episodic_trajectories", [])),
+            "procedural_rules": len(knowledge_context.get("procedural_rules", [])),
             "validated_candidates": len(knowledge_context.get("validated_candidates", [])),
             "weak_signals": len(knowledge_context.get("weak_signals", [])),
         }

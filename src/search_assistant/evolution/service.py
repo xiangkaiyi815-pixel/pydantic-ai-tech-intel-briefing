@@ -11,6 +11,7 @@ from search_assistant.contracts import (
     DomainKnowledgeCandidate,
     DomainKnowledgeEvidence,
 )
+from search_assistant.knowledge_graph.embedding import EmbeddingProvider, build_embedding_provider
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 
@@ -61,9 +62,17 @@ class EvolutionDiagnosisService:
 class DomainKnowledgeCandidateService:
     """Turn briefing evidence into deduplicated, reviewable knowledge candidates."""
 
-    def __init__(self, store: MemoryStore, graph_service: DomainKnowledgeGraphService | None = None):
+    def __init__(
+        self,
+        store: MemoryStore,
+        graph_service: DomainKnowledgeGraphService | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         self.store = store
-        self.graph_service = graph_service or DomainKnowledgeGraphService(store)
+        self.embedding_provider = embedding_provider or build_embedding_provider()
+        self.graph_service = graph_service or DomainKnowledgeGraphService(
+            store, embedding_provider=self.embedding_provider
+        )
 
     def capture_briefing(self, briefing: DailyBriefing) -> list[str]:
         if not briefing.sources:

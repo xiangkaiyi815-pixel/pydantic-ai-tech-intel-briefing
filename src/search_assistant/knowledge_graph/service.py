@@ -8,6 +8,7 @@ from search_assistant.contracts import (
     DomainKnowledgeRelation,
     DomainKnowledgeSearchHit,
 )
+from search_assistant.knowledge_graph.bm25 import BM25Index, rrf_rank
 from search_assistant.knowledge_graph.embedding import (
     EmbeddingProvider,
     build_embedding_provider,
@@ -37,9 +38,12 @@ class DomainKnowledgeGraphService:
         self,
         store: MemoryStore,
         embedding_provider: EmbeddingProvider | None = None,
+        hybrid_retrieval: bool = True,
     ):
         self.store = store
         self.embedding_provider = embedding_provider or build_embedding_provider()
+        self.hybrid_retrieval = hybrid_retrieval
+        self._bm25_cache: dict[str, BM25Index] = {}
 
     def seed_default_graphs(self, domain_ids: list[str] | None = None) -> dict[str, object]:
         requested = {domain_id.strip() for domain_id in domain_ids or [] if domain_id.strip()}
@@ -67,7 +71,9 @@ class DomainKnowledgeGraphService:
         hits: list[DomainKnowledgeSearchHit] = []
         for graph in graphs:
             entity_by_id = {entity.id: entity for entity in graph.entities}
-            for entity in graph.entities:
+            bm25_scores = self._bm25_scores_for_graph(graph.id, normalized) if self.hybrid_retrieval else None
+            bm25_max = max(bm25_scores) if bm25_scores else 0.0
+            for index, entity in enumerate(graph.entities):
                 score, matched_aliases = self._score_entity(normalized, entity)
                 relation_bonus = self._relation_bonus(normalized, entity, graph.relations, entity_by_id)
                 score += relation_bonus
@@ -78,6 +84,12 @@ class DomainKnowledgeGraphService:
                     semantic_similarity = self._semantic_similarity(query_embedding, entity)
                     if semantic_similarity >= 0.72:
                         score += semantic_similarity * 3.0
+                # Sparse (BM25) bonus: helps when query terms are spread across the
+                # entity text without forming a strong literal phrase.  The bonus is
+                # capped so strong literal matches keep their dominance.
+                if bm25_scores is not None and bm25_max > 0:
+                    normalized_bm25 = bm25_scores[index] / bm25_max
+                    score += min(2.0, normalized_bm25 * 2.0)
                 if score <= 0:
                     continue
                 hits.append(
@@ -187,6 +199,24 @@ class DomainKnowledgeGraphService:
             for row in self.store.list_domain_knowledge_graphs()
             if (graph := self.store.get_domain_knowledge_graph(str(row["id"]))) is not None
         ]
+
+    def _bm25_scores_for_graph(self, graph_id: str, query: str) -> list[float]:
+        """Return BM25 scores of every entity in a graph for a query.
+
+        The index is built lazily per graph id and cached in memory so repeated
+        queries do not re-tokenize the entity corpus every time.
+        """
+        index = self._bm25_cache.get(graph_id)
+        if index is None:
+            graph = self.store.get_domain_knowledge_graph(graph_id)
+            if graph is None:
+                return []
+            documents = [
+                " ".join([entity.name, *entity.aliases, entity.summary]) for entity in graph.entities
+            ]
+            index = BM25Index(documents)
+            self._bm25_cache[graph_id] = index
+        return index.score_all(query)
 
     @staticmethod
     def _score_entity(query: str, entity: DomainKnowledgeEntity) -> tuple[float, list[str]]:

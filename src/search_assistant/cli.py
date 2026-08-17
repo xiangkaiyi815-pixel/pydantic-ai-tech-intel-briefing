@@ -21,6 +21,7 @@ from search_assistant.evolution.service import (
 )
 from search_assistant.feishu.client import FakeFeishuClient, FeishuHttpClient
 from search_assistant.feishu.events import parse_feishu_event
+from search_assistant.knowledge_graph.embedding import embedding_provider_from_settings
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
@@ -487,19 +488,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-graph-seed":
-        result = DomainKnowledgeGraphService(store).seed_default_graphs(args.domain)
+        result = _graph_service(store).seed_default_graphs(args.domain)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-graph-list":
-        result = DomainKnowledgeGraphService(store).list_graphs()
+        result = _graph_service(store).list_graphs()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-graph-query":
-        hits = DomainKnowledgeGraphService(store).query(args.query, domain_id=args.domain, limit=args.limit)
+        hits = _graph_service(store).query(args.query, domain_id=args.domain, limit=args.limit)
         print(json.dumps([hit.model_dump(mode="json") for hit in hits], ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-graph-export":
-        markdown = DomainKnowledgeGraphService(store).export_markdown(args.domain)
+        markdown = _graph_service(store).export_markdown(args.domain)
         output_path = Path(args.output) if args.output else data_dir / "knowledge-graphs" / f"{args.domain}.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(markdown, encoding="utf-8")
@@ -516,15 +517,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "knowledge-candidate-list":
-        result = DomainKnowledgeCandidateService(store).list_candidates(status=args.status, layer=args.layer)
+        result = _candidate_service(store).list_candidates(status=args.status, layer=args.layer)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "knowledge-candidate-validate":
-        result = DomainKnowledgeCandidateService(store).validate(args.candidate_id)
+        result = _candidate_service(store).validate(args.candidate_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["validated"] else 1
     if args.command == "knowledge-candidate-approve":
-        result = DomainKnowledgeCandidateService(store).approve(
+        result = _candidate_service(store).approve(
             args.candidate_id,
             reviewer=args.reviewer,
             reason=args.reason,
@@ -534,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["approved"] else 1
     if args.command == "knowledge-candidate-deprecate":
-        DomainKnowledgeCandidateService(store).deprecate(args.candidate_id, args.reason)
+        _candidate_service(store).deprecate(args.candidate_id, args.reason)
         print(json.dumps({"deprecated": True, "candidate_id": args.candidate_id}, ensure_ascii=False, indent=2))
         return 0
     if args.command == "ledger-record":
@@ -666,6 +667,22 @@ def _store(data_dir: Path) -> MemoryStore:
     return store
 
 
+def _candidate_service(store: MemoryStore) -> DomainKnowledgeCandidateService:
+    settings = Settings.from_env()
+    return DomainKnowledgeCandidateService(
+        store,
+        embedding_provider=embedding_provider_from_settings(settings),
+    )
+
+
+def _graph_service(store: MemoryStore) -> DomainKnowledgeGraphService:
+    settings = Settings.from_env()
+    return DomainKnowledgeGraphService(
+        store,
+        embedding_provider=embedding_provider_from_settings(settings),
+    )
+
+
 def _briefing_service(store: MemoryStore) -> DailyBriefingService:
     settings = Settings.from_env()
     return DailyBriefingService(
@@ -678,6 +695,7 @@ def _briefing_service(store: MemoryStore) -> DailyBriefingService:
         model_max_sources=settings.briefing_model_max_sources,
         search_budget_seconds=settings.briefing_search_budget_seconds,
         timezone_name=settings.briefing_timezone,
+        embedding_provider=embedding_provider_from_settings(settings),
     )
 
 
@@ -1335,7 +1353,7 @@ def _skill_draft_by_path(store: MemoryStore, active_path: str) -> dict[str, Any]
 def _run_evolution(store: MemoryStore, data_dir: Path) -> dict[str, object]:
     markdown = ReportService(store, output_dir=data_dir / "reports").generate_markdown()
     report_path = data_dir / "reports" / "learning-report.md"
-    link_result = DomainKnowledgeCandidateService(store).link_candidates_to_knowledge_graphs()
+    link_result = _candidate_service(store).link_candidates_to_knowledge_graphs()
     candidates = store.list_domain_knowledge_candidates()
     candidate_status_counts = {
         status: sum(1 for item in candidates if item["status"] == status)
