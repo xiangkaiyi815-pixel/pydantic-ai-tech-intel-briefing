@@ -31,16 +31,45 @@ names and never a secret value.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. |
+| `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `agent-reach`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. Use `agent-reach` only on machines with the Agent Reach CLI installed. |
 | `SEARCH_ASSISTANT_MCP_SEARCH_CONFIG` | checked-in default when unset | MCP server and read-only search bindings. |
 | `MCP_SEARCH_TIMEOUT_SECONDS` | `18` | MCP request timeout. |
-| `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search. |
-| `BAIDU_SEARCH_BASE_URL` | `https://m.baidu.com/s` | Baidu public-index base URL. |
+| `SEARCH_ASSISTANT_AGENT_REACH_ENABLED` | `false` | When `true` and the provider is `hybrid`, try Agent Reach first and fall back to MCP/browser search if the local Agent Reach route is unavailable. |
+| `AGENT_REACH_COMMAND` | `agent-reach` | Agent Reach CLI executable or absolute path. |
+| `AGENT_REACH_TIMEOUT_SECONDS` | `30` | Per Agent Reach routed command timeout. |
+| `AGENT_REACH_DOCTOR_CACHE_SECONDS` | `300` | Cache window for `agent-reach doctor --json` results. |
+| `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search; `duckduckgo` can also be included. |
+| `BROWSER_SEARCH_BASE_URL` | `https://cn.bing.com/search` | Bing public-result endpoint. |
+| `BAIDU_SEARCH_BASE_URL` | `https://www.baidu.com/baidu` | Baidu public-index base URL; the client can fall back to other public Baidu endpoints when one is challenged. |
 | `BILIBILI_SEARCH_BASE_URL` | public Bilibili endpoint | No-login Bilibili search endpoint. |
 | `RSSHUB_BASE_URL` | `http://127.0.0.1:1200` | Local optional RSSHub instance. |
 | `SEARCH_ASSISTANT_DOMESTIC_RSS_CONFIG` | unset | Optional operator-owned RSS source catalog. |
 | `BRAVE_SEARCH_API_KEY` | unset | Required only when the Brave provider is selected. |
 | `SEARXNG_BASE_URL` | `http://localhost:8080/search` | Self-hosted SearXNG JSON endpoint. |
+
+### Optional Agent Reach Install
+
+Agent Reach is an optional CLI capability router. Do not commit a local virtual
+environment or a populated `.env.local` file to make it available on another
+machine. Install the checked-in extra instead:
+
+```powershell
+python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
+agent-reach doctor --json
+```
+
+When the project virtual environment is activated, the default
+`AGENT_REACH_COMMAND=agent-reach` works because the CLI entry point is on the
+virtual environment `PATH`. If the application is started by a scheduler or
+service without activating the virtual environment, set `AGENT_REACH_COMMAND`
+to the absolute path of that environment's `agent-reach` executable in local
+or deployment-only configuration.
+
+The Python extra installs the Agent Reach CLI and its Python dependencies. Some
+platform backends still require external tools, browser login state, cookies,
+or API configuration; use the `agent-reach doctor --json` output and the
+upstream Agent Reach install guide before enabling those routes with
+`agent-reach install --system`.
 
 ## Daily Briefing Settings
 
@@ -65,6 +94,17 @@ an isolated fixture before sending a real message.
 python -m search_assistant.cli feishu-doctor
 python -m search_assistant.cli feishu-fixture tests/fixtures/feishu_message_event.json
 ```
+
+## Knowledge Graph Semantic Matching
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEARCH_ASSISTANT_EMBEDDING_ENABLED` | `true` | When `true`, enable semantic matching for English-to-Chinese knowledge-graph queries. |
+| `OPENAI_API_KEY` | unset | Primary OpenAI-compatible embedding API key. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Primary OpenAI-compatible embedding endpoint. |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name. |
+
+If `OPENAI_API_KEY` is empty, the provider falls back to `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` so a DeepSeek-compatible or third-party OpenAI-compatible endpoint can be reused. If no key is available, semantic matching is disabled and the graph uses literal matching only.
 
 ## MCP Configuration
 

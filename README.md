@@ -17,6 +17,9 @@ turning their daily report into a list of headlines.
 - Supports public-index or no-login discovery for selected Chinese platforms.
 - Stores topics, feedback, retained sources, reports, and learning evidence in
   SQLite.
+- Seeds reviewed domain knowledge graphs for Agent engineering, industrial AI,
+  and medical-imaging AI so retrieved evidence can be mapped onto explicit
+  entity-relation structures instead of flat text notes.
 - Produces a Chinese `content collection report` with search directions,
   keywords, a concise technical brief, free-form detailed analysis, next
   research directions, implementation suggestions, and original URLs.
@@ -34,9 +37,9 @@ turning their daily report into a list of headlines.
    detailed summaries choose their own evidence-led structure rather than
    filling a fixed theme form.
 4. **Fail closed on weak evidence.** Search-page dumps, login pages, generic
-   references, and known CAD medical false positives are filtered before
-   ranking. A synthesis timeout retries with a smaller high-ranked evidence
-   set instead of silently inventing material.
+   references, marketing-funnel posts, and known CAD medical false positives are
+   filtered before ranking. A synthesis timeout retries with a smaller
+   high-ranked evidence set instead of silently inventing material.
 5. **Local control.** Secrets stay in ignored local configuration or deployment
    secret stores. The checked-in configuration contains no credentials.
 
@@ -66,8 +69,16 @@ Python 3.12 on Windows.
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+python -m pip install -c constraints-dev.txt -e ".[dev]"
 Copy-Item .env.example .env.local
+```
+
+To test the optional Agent Reach retrieval path on another development
+machine, install the reproducible extra into the same virtual environment:
+
+```powershell
+python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
+agent-reach doctor --json
 ```
 
 Set a model provider and its credentials only in `.env.local`, your shell, or
@@ -106,17 +117,29 @@ contract is in [skills/content-collection-report/SKILL.md](skills/content-collec
 ## Search Coverage
 
 The default `hybrid` provider combines read-only MCP tools with Bing, Baidu,
-and Google public-result pages. Platform capability is deliberately explicit:
+and Google public-result pages. DuckDuckGo can be added to the browser engine
+pool when the local network can reach its HTML endpoint. Machines that have
+[Agent Reach](https://github.com/Panniantong/Agent-Reach) installed can also
+set `SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach` to route retrieval through
+`agent-reach doctor --json` and its selected read-only backends, or set
+`SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` to try Agent Reach first inside the
+default `hybrid` provider and then fall back to MCP/browser search. Use
+`python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"` to make
+that CLI available from the project virtual environment on a fresh checkout.
+Platform capability is deliberately explicit:
 
 | Source family | Access mode | Notes |
 | --- | --- | --- |
+| Agent Reach | Optional CLI capability router | Runs `agent-reach doctor --json`, then calls selected read-only tools such as `mcporter`, `bili`, `yt-dlp`, `gh`, or `opencli`; unavailable local routes do not count as coverage. |
 | GitHub, arXiv, Hacker News, Stack Exchange | Read-only MCP | URL-bearing public results |
-| General web | Public engine results | Bing, Baidu, Google; markup and anti-bot behavior can vary |
-| Bilibili | Public video-search API | No login state |
+| General web | Public engine results | Bing, Baidu, Google; optional DuckDuckGo; markup and anti-bot behavior can vary |
+| Bilibili | Public video-search API | No login state; retries with browser headers when public API returns transient anti-bot errors |
 | Weibo, Zhihu, 36Kr, Juejin | Optional local RSSHub MCP | Public feeds only |
-| WeChat, Toutiao, Xiaohongshu | Baidu public-index discovery | Original target URLs only; no detail-page fetching |
+| WeChat, Xiaohongshu | Baidu-first public-index discovery with endpoint and public-engine fallback | Original target URLs only; no detail-page fetching |
+| Toutiao | Public search page plus Baidu/public-engine fallback | Original `toutiao.com` URLs only; no detail-page fetching |
 | Douyin and Kuaishou | Disabled RSSHub subscription slots | Require public account identifiers and route validation |
-| LinkedIn, X, Reddit, YouTube | Public-result discovery | No private, internal, or login-gated material |
+| LinkedIn, X, Reddit | Public-result discovery | No private, internal, or login-gated material |
+| YouTube | Public search page plus public-result discovery | Original watch URLs only; no private or login-gated material |
 
 Configured coverage is not proof that a platform produced useful results for a
 particular topic. The report retains only sources that pass its relevance and
@@ -132,12 +155,38 @@ python -m search_assistant.cli topic-add "industrial AI"
 python -m search_assistant.cli brief-feedback "industrial AI" "focus on controlled MES agents" --url "https://example.com/case"
 python -m search_assistant.cli brief-run "industrial AI"
 python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 86400
+python -m search_assistant.cli knowledge-graph-seed
+python -m search_assistant.cli knowledge-graph-query "MES 工单 写回" --domain industrial-ai
+python -m search_assistant.cli knowledge-graph-export agent-engineering
+python -m search_assistant.cli agentops-report
+python -m search_assistant.cli provider-health
+python -m search_assistant.cli trace-list
+python -m search_assistant.cli ledger-list
+python -m search_assistant.cli ledger-state
+python -m search_assistant.cli gate-list
+python -m search_assistant.cli checkpoint-list
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
+python -m search_assistant.cli eval-replay
+python -m search_assistant.cli knowledge-candidate-list --layer weak_signal
 ```
 
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
 Feishu guidance are in [docs/operations.md](docs/operations.md).
+
+The agent-ops commands expose append-only project ledger entries, project-state
+snapshots, self-evolution gate records, trace spans, run checkpoints, and
+search-provider health records from the local SQLite store. These are intended to
+make daily briefing runs and self-evolution changes reviewable before they are
+promoted. `knowledge-candidate-approve` requires a passing `eval-suite` report by
+default; `eval-replay` reruns the questions from an existing evaluation report to
+surface behavior drift before releasing new knowledge.
+
+Knowledge candidates are layered by the latest validation gate metadata:
+`validated_knowledge` can move toward human-reviewed release, `weak_signal`
+keeps single-source or low-confidence clues for follow-up search, and
+`rejected_noise` is retained only as an audit trail. This prevents weak but
+useful leads from being deleted while keeping them out of trusted knowledge.
 
 ## Development And Verification
 
@@ -156,6 +205,7 @@ and regression cases for noisy search results. See
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Platform coverage and boundaries](docs/platform-coverage.md)
+- [Domain knowledge graphs](docs/domain-knowledge-graphs.md)
 - [Operations and scheduling](docs/operations.md)
 - [Development guide](docs/development.md)
 - [Security policy](SECURITY.md)

@@ -12,6 +12,9 @@ from search_assistant.config import Settings
 from search_assistant.contracts import BriefingSynthesis, CollectedSource
 
 
+BRIEFING_MODEL_SEARCH_PLAN_LIMIT = 20
+
+
 _UNSUPPORTED_SCOPE_PATTERNS = (
     re.compile(r"(?:行业|领域|市场|严肃的).{0,30}(?:已经|已).{0,20}(?:放弃|淘汰)"),
     re.compile(r"(?<!没有)(?<!未)(?:放弃了|放弃|淘汰)"),
@@ -97,6 +100,7 @@ class DeepSeekChatRuntime:
         model: str = "deepseek-v4-flash",
         base_url: str = "https://api.deepseek.com",
         timeout_seconds: float = 60.0,
+        briefing_planning_timeout_seconds: float | None = None,
         agent_runner: AgentRunner | None = None,
     ):
         if not api_key:
@@ -105,6 +109,10 @@ class DeepSeekChatRuntime:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.briefing_planning_timeout_seconds = min(
+            briefing_planning_timeout_seconds or timeout_seconds,
+            timeout_seconds,
+        )
         self.agent_runner = agent_runner or _agent_framework_runner
 
     def plan_search_queries(self, question: str, context: dict[str, object]) -> list[str]:
@@ -133,8 +141,44 @@ class DeepSeekChatRuntime:
         return _parse_search_query_plan(content)
 
     def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
-        """Legacy answer runtimes keep daily briefing planning deterministic."""
-        return []
+        instructions = (
+            "You are a Chinese technology-intelligence retrieval planner. Generate 4 to 8 complete "
+            "technical search queries for the topic, covering different technical routes, system architecture, "
+            "data and workflow, evaluation metrics, deployment cases, and primary/open-source material. "
+            "Queries may mix Chinese and English when useful. Do not include platform names, site: filters, "
+            "title fragments, conversational filler, or quoted user feedback. User feedback is only evidence "
+            "for inferring a technical direction. If knowledge_context is present, use reviewed graph hits and "
+            "validated candidates to add focused follow-up queries, but never treat weak signals as facts. "
+            "Return only a JSON array of strings."
+        )
+        content = self.agent_runner(
+            self.model,
+            self.api_key,
+            self.base_url,
+            instructions,
+            json.dumps(
+                {
+                    "topic": topic,
+                    "feedback": context.get("feedback", [])[:3],
+                    "planning_contract": {
+                        "goal": "retrieve technology evidence for a Chinese frontier-intelligence briefing",
+                        "requirements": [
+                            "technical route and architecture",
+                            "data and workflow",
+                            "metrics or deployment evidence",
+                            "primary or open-source material",
+                        ],
+                    },
+                    "briefing_intent": context.get("briefing_intent"),
+                    "knowledge_context": context.get("knowledge_context", {}),
+                },
+                ensure_ascii=False,
+            ),
+            0.2,
+            700,
+            self.briefing_planning_timeout_seconds,
+        )
+        return _parse_search_query_plan(content)
 
     def generate_answer(self, question: str, context: dict[str, object]) -> str:
         instructions = (
@@ -297,8 +341,158 @@ class DeepSeekChatRuntime:
         sources: list[CollectedSource],
         context: dict[str, object],
     ) -> BriefingSynthesis | None:
-        """Old answer runtimes intentionally use the deterministic briefing fallback."""
-        return None
+        instructions = (
+            "You are a Chinese technology-intelligence analyst. Your job is to extract the implementation value "
+            "hidden in supplied public sources, not to describe the search or paraphrase titles. Use only supplied "
+            "sources for factual claims. A source title alone is not evidence of an architecture; say what is unknown "
+            "when the material is thin. Do not turn a few project examples into an industry-wide claim such as "
+            "'the field has abandoned X' or a prediction of broad adoption. Attribute observations to the supplied "
+            "materials and distinguish evidence from cross-source inference. Write substantive Chinese and never reveal "
+            "hidden reasoning or confidence scores. "
+            "Return ONLY one valid JSON object with exactly these keys: search_content_summary, short_summary, "
+            "detailed_summary, themes, key_signal_interpretation, analysis_judgment, next_search_directions, "
+            "landing_suggestions. "
+            "If briefing_intent is present, keep the required report headings unchanged but adapt the emphasis: "
+            "concept_explanation defines the concept and boundaries first; technical_tracking focuses on "
+            "models, papers, repositories, benchmarks, and deployment limits; industry_trend separates policy, "
+            "market, ecosystem, and implementation evidence; engineering_landing follows architecture, "
+            "interfaces, data flow, validation, rollout, and rollback; comparison_decision compares tradeoffs, "
+            "decision criteria, limitations, and suitable scenarios. "
+            "If knowledge_context is present, use reviewed_graph_hits and validated_candidates only to frame the "
+            "analysis and decide what gaps to verify; never cite them as current evidence. Use weak_signals only in "
+            "next_search_directions. Current factual claims must still come from sources. "
+            "short_summary must be a 120-220 Chinese-character executive technical brief: state what this batch is "
+            "actually building and name the evidenced implementation path, such as the input form, representation or "
+            "model, transformation/tool chain, integration point, and validation/control mechanism. It must contrast "
+            "the important technical difference or limitation; never use empty phrases such as 'the materials focus on' "
+            "or 'worth watching'. "
+            "detailed_summary must be a 450-900 Chinese-character Markdown analysis with 2-5 self-chosen level-3 "
+            "headings. Organize the sections around the evidence that matters in this batch; for example, a new geometry "
+            "representation, a system architecture, an integration bottleneck, or an evaluation gap. Do NOT use the "
+            "headings '本轮技术主题地图', '核心技术提炼', or '重点线索解读'. Do NOT force every section through the same "
+            "checklist. In each useful section, keep existing-style subheadings natural and write 1-2 short paragraphs "
+            "that explain the mechanism, evidence basis, and boundary or impact. Do not use fixed labels such as "
+            "'结论：', '依据：', or '意义：'. Avoid repeating the same definition across sections. "
+            "themes are 1-5 lightweight evidence anchors with exactly name, analysis, source_urls. analysis must be a "
+            "specific Chinese technical conclusion of at least 45 characters. Every theme needs one or more exact input "
+            "URLs in source_urls. Do not create URLs. next_search_directions and landing_suggestions must each contain "
+            "at least two concise Chinese items."
+        )
+        source_payload = [
+            {
+                "title": source.title,
+                "url": source.url,
+                "snippet": " ".join(source.snippet.split())[:450],
+                "platform": source.platform,
+                "provider": source.provider,
+                "query": source.query,
+                "importance_score": source.importance_score,
+            }
+            for source in sources
+        ]
+        request_payload = {
+            "topic": topic,
+            "report_contract": context.get("report_contract"),
+            "report_skill": context.get("report_skill"),
+            "readability": context.get("readability"),
+            "briefing_intent": context.get("briefing_intent"),
+            "knowledge_context": context.get("knowledge_context", {}),
+            "search_plan": context.get("search_plan", [])[:BRIEFING_MODEL_SEARCH_PLAN_LIMIT],
+            "sources": source_payload,
+        }
+        try:
+            content = self.agent_runner(
+                self.model,
+                self.api_key,
+                self.base_url,
+                instructions,
+                json.dumps(request_payload, ensure_ascii=False),
+                0.2,
+                2400,
+                self.timeout_seconds,
+            )
+        except TimeoutError:
+            # A long source payload can exhaust a provider window even when
+            # the search itself succeeded. Retry with the highest-ranked
+            # evidence instead of silently switching to a static report.
+            compact_payload = [
+                {**source, "snippet": str(source["snippet"])[:240]}
+                for source in source_payload[:6]
+            ]
+            retry_payload = {**request_payload, "sources": compact_payload}
+            content = self.agent_runner(
+                self.model,
+                self.api_key,
+                self.base_url,
+                instructions,
+                json.dumps(retry_payload, ensure_ascii=False),
+                0.1,
+                1800,
+                min(self.timeout_seconds, 75.0),
+            )
+        synthesis = _parse_briefing_synthesis(content, {source.url for source in sources})
+        if not self._needs_scope_revision(synthesis):
+            return synthesis
+
+        try:
+            revision = self._revise_briefing_scope(synthesis, source_payload, {source.url for source in sources})
+        except Exception:
+            # A scope repair must not hide an otherwise usable synthesis when
+            # the model service is transiently unavailable.
+            return synthesis
+        return revision
+
+    @staticmethod
+    def _needs_scope_revision(synthesis: BriefingSynthesis) -> bool:
+        text = "\n".join(
+            (
+                synthesis.search_content_summary,
+                synthesis.short_summary,
+                synthesis.detailed_summary,
+                synthesis.key_signal_interpretation,
+                synthesis.analysis_judgment,
+                *(theme.analysis for theme in synthesis.themes),
+            )
+        )
+        scope_markers = ("本轮", "本批", "当前材料", "现有材料", "现有证据", "来源", "项目", "所讨论")
+        sentences = [sentence.strip() for sentence in re.split(r"[。！？；;\n]+", text) if sentence.strip()]
+        return any(
+            any(pattern.search(sentence) for pattern in _UNSUPPORTED_SCOPE_PATTERNS)
+            and not any(marker in sentence for marker in scope_markers)
+            for sentence in sentences
+        )
+
+    def _revise_briefing_scope(
+        self,
+        draft: BriefingSynthesis,
+        source_payload: list[dict[str, object]],
+        allowed_source_urls: set[str],
+    ) -> BriefingSynthesis:
+        instructions = (
+            "You are a Chinese technical editor performing an evidence-scope repair. Return ONLY one valid JSON "
+            "object in the exact same schema as the supplied draft. Keep its concrete technical mechanisms and its "
+            "free-form detailed_summary structure. Rewrite only claims that exceed the supplied materials: replace "
+            "industry-wide, inevitable, or absolute claims with scoped wording such as '本轮材料显示' or '现有证据尚未证明'. "
+            "Do not make the summary generic, do not add facts or URLs, do not restore a fixed technical-map template, "
+            "and preserve every cited source URL exactly."
+        )
+        content = self.agent_runner(
+            self.model,
+            self.api_key,
+            self.base_url,
+            instructions,
+            json.dumps(
+                {
+                    "draft": draft.model_dump(mode="json"),
+                    "sources": source_payload,
+                },
+                ensure_ascii=False,
+            ),
+            0.0,
+            2400,
+            self.timeout_seconds,
+        )
+        return _parse_briefing_synthesis(content, allowed_source_urls)
 
     def _run_agent(self, instructions: str, payload: dict[str, object], temperature: float) -> str:
         return self._run_agent_with_max_tokens(instructions, payload, temperature=temperature, max_tokens=1600)
@@ -458,6 +652,7 @@ def runtime_from_settings(settings: Settings) -> AgentRuntime:
             model=settings.deepseek_model,
             base_url=settings.deepseek_base_url,
             timeout_seconds=settings.deepseek_timeout_seconds,
+            briefing_planning_timeout_seconds=settings.briefing_planning_timeout_seconds,
         )
     if provider == "glm":
         return GLMPydanticAIRuntime(
@@ -541,153 +736,6 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
         )
         self.briefing_planning_timeout_seconds = min(briefing_planning_timeout_seconds, timeout_seconds)
 
-    def synthesize_briefing(
-        self,
-        topic: str,
-        sources: list[CollectedSource],
-        context: dict[str, object],
-    ) -> BriefingSynthesis:
-        instructions = (
-            "You are a Chinese technology-intelligence analyst. Your job is to extract the implementation value "
-            "hidden in supplied public sources, not to describe the search or paraphrase titles. Use only supplied "
-            "sources for factual claims. A source title alone is not evidence of an architecture; say what is unknown "
-            "when the material is thin. Do not turn a few project examples into an industry-wide claim such as "
-            "'the field has abandoned X' or a prediction of broad adoption. Attribute observations to the supplied "
-            "materials and distinguish evidence from cross-source inference. Write substantive Chinese and never reveal "
-            "hidden reasoning or confidence scores. "
-            "Return ONLY one valid JSON object with exactly these keys: search_content_summary, short_summary, "
-            "detailed_summary, themes, key_signal_interpretation, analysis_judgment, next_search_directions, "
-            "landing_suggestions. "
-            "short_summary must be a 120-260 Chinese-character executive technical brief: state what this batch is "
-            "actually building and name the evidenced implementation path, such as the input form, representation or "
-            "model, transformation/tool chain, integration point, and validation/control mechanism. It must contrast "
-            "the important technical difference or limitation; never use empty phrases such as 'the materials focus on' "
-            "or 'worth watching'. "
-            "detailed_summary must be a 600-1400 Chinese-character Markdown analysis with 2-5 self-chosen level-3 "
-            "headings. Organize the sections around the evidence that matters in this batch; for example, a new geometry "
-            "representation, a system architecture, an integration bottleneck, or an evaluation gap. Do NOT use the "
-            "headings '本轮技术主题地图', '核心技术提炼', or '重点线索解读'. Do NOT force every section through the same "
-            "checklist. In each useful section, explain concrete mechanisms: representation/model, input-to-output "
-            "transformation, software or data interfaces, deterministic checks, observed constraint, and why the design "
-            "changes engineering practice, but cover only dimensions supported by the sources. "
-            "themes are 1-5 lightweight evidence anchors with exactly name, analysis, source_urls. analysis must be a "
-            "specific Chinese technical conclusion of at least 45 characters. Every theme needs one or more exact input "
-            "URLs in source_urls. Do not create URLs. next_search_directions and landing_suggestions must each contain "
-            "at least two concise Chinese items."
-        )
-        source_payload = [
-            {
-                "title": source.title,
-                "url": source.url,
-                "snippet": " ".join(source.snippet.split())[:450],
-                "platform": source.platform,
-                "provider": source.provider,
-                "query": source.query,
-                "importance_score": source.importance_score,
-            }
-            for source in sources
-        ]
-        request_payload = {
-            "topic": topic,
-            "report_contract": context.get("report_contract"),
-            "report_skill": context.get("report_skill"),
-            "search_plan": context.get("search_plan", [])[:12],
-            "sources": source_payload,
-        }
-        try:
-            content = self.agent_runner(
-                self.model,
-                self.api_key,
-                self.base_url,
-                instructions,
-                json.dumps(request_payload, ensure_ascii=False),
-                0.2,
-                2400,
-                self.timeout_seconds,
-            )
-        except TimeoutError:
-            # A long source payload can exhaust a provider window even when
-            # the search itself succeeded. Retry with the highest-ranked
-            # evidence instead of silently switching to a static report.
-            compact_payload = [
-                {**source, "snippet": str(source["snippet"])[:240]}
-                for source in source_payload[:6]
-            ]
-            retry_payload = {**request_payload, "sources": compact_payload}
-            content = self.agent_runner(
-                self.model,
-                self.api_key,
-                self.base_url,
-                instructions,
-                json.dumps(retry_payload, ensure_ascii=False),
-                0.1,
-                1800,
-                min(self.timeout_seconds, 75.0),
-            )
-        synthesis = _parse_briefing_synthesis(content, {source.url for source in sources})
-        if not self._needs_scope_revision(synthesis):
-            return synthesis
-
-        try:
-            revision = self._revise_briefing_scope(synthesis, source_payload, {source.url for source in sources})
-        except Exception:
-            # A scope repair must not hide an otherwise usable synthesis when
-            # the model service is transiently unavailable.
-            return synthesis
-        return revision
-
-    @staticmethod
-    def _needs_scope_revision(synthesis: BriefingSynthesis) -> bool:
-        text = "\n".join(
-            (
-                synthesis.search_content_summary,
-                synthesis.short_summary,
-                synthesis.detailed_summary,
-                synthesis.key_signal_interpretation,
-                synthesis.analysis_judgment,
-                *(theme.analysis for theme in synthesis.themes),
-            )
-        )
-        scope_markers = ("本轮", "本批", "当前材料", "现有材料", "现有证据", "来源", "项目", "所讨论")
-        sentences = [sentence.strip() for sentence in re.split(r"[。！？；;\n]+", text) if sentence.strip()]
-        return any(
-            any(pattern.search(sentence) for pattern in _UNSUPPORTED_SCOPE_PATTERNS)
-            and not any(marker in sentence for marker in scope_markers)
-            for sentence in sentences
-        )
-
-    def _revise_briefing_scope(
-        self,
-        draft: BriefingSynthesis,
-        source_payload: list[dict[str, object]],
-        allowed_source_urls: set[str],
-    ) -> BriefingSynthesis:
-        instructions = (
-            "You are a Chinese technical editor performing an evidence-scope repair. Return ONLY one valid JSON "
-            "object in the exact same schema as the supplied draft. Keep its concrete technical mechanisms and its "
-            "free-form detailed_summary structure. Rewrite only claims that exceed the supplied materials: replace "
-            "industry-wide, inevitable, or absolute claims with scoped wording such as '本轮材料显示' or '现有证据尚未证明'. "
-            "Do not make the summary generic, do not add facts or URLs, do not restore a fixed technical-map template, "
-            "and preserve every cited source URL exactly."
-        )
-        content = self.agent_runner(
-            self.model,
-            self.api_key,
-            self.base_url,
-            instructions,
-            json.dumps(
-                {
-                    "draft": draft.model_dump(mode="json"),
-                    "sources": source_payload,
-                },
-                ensure_ascii=False,
-            ),
-            0.0,
-            2400,
-            self.timeout_seconds,
-        )
-        return _parse_briefing_synthesis(content, allowed_source_urls)
-
     def _synthesize_briefing_with_typed_output(
         self,
         topic: str,
@@ -709,11 +757,21 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
             " detailed_summary 使用 2 至 5 个自行命名的三级 Markdown 标题，围绕本轮真实出现的架构、表示法、"
             "接口、确定性校验、评估缺口或工程取舍展开。禁止使用“本轮技术主题地图”“核心技术提炼”“重点线索解读”作为标题。"
             "拒绝标题串烧和泛泛表述；短总结需要给出跨来源共同的实现路径与关键差异。"
+            "在不改变自选小标题的前提下压缩正文：每个小标题下写 1-2 个短段落，不使用“结论：”“依据：”“意义：”等固定字段。"
+            "如果 briefing_intent 存在，保留报告固定小标题，只调整关注点：概念解释先讲定义和边界；技术追踪优先模型、"
+            "论文、开源、评测和部署限制；产业趋势区分政策、市场、生态和真实落地证据；工程落地关注架构、接口、"
+            "数据流、验证、上线和回滚；对比选型给出取舍、限制和适用场景。"
         )
         instructions += (
             " themes 仅用于可追溯的证据锚点，返回 1 至 5 个，每个主题包含名称、至少 45 字的技术判断和一个或多个输入 URL。"
             "不要因为证据不完整而编造实现细节，应明确下一步需要核验的原始材料。"
         )
+        instructions += (
+            " If knowledge_context is present, use reviewed_graph_hits and validated_candidates only as planning "
+            "and framing context, never as current factual evidence. Use weak_signals only for next research "
+            "directions. Current factual claims must still come from the supplied sources."
+        )
+
         async def run_once() -> BriefingSynthesis:
             import httpx
 
@@ -737,6 +795,9 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
                                 "topic": topic,
                                 "report_contract": context.get("report_contract"),
                                 "report_skill": context.get("report_skill"),
+                                "readability": context.get("readability"),
+                                "briefing_intent": context.get("briefing_intent"),
+                                "knowledge_context": context.get("knowledge_context", {}),
                                 "sources": [source.model_dump(mode="json") for source in sources],
                             },
                             ensure_ascii=False,
@@ -752,42 +813,6 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
                 return result.output
 
         return _run_async_from_sync(run_once)
-
-    def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
-        instructions = (
-            "You are a Chinese technology-intelligence retrieval planner. Generate 4 to 8 complete "
-            "technical search queries for the topic, covering different technical routes, system architecture, "
-            "data and workflow, evaluation metrics, deployment cases, and primary/open-source material. "
-            "Queries may mix Chinese and English when useful. Do not include platform names, site: filters, "
-            "title fragments, conversational filler, or quoted user feedback. User feedback is only evidence "
-            "for inferring a technical direction. Return only a JSON array of strings."
-        )
-        content = self.agent_runner(
-            self.model,
-            self.api_key,
-            self.base_url,
-            instructions,
-            json.dumps(
-                {
-                    "topic": topic,
-                    "feedback": context.get("feedback", [])[:3],
-                    "planning_contract": {
-                        "goal": "retrieve technology evidence for a Chinese frontier-intelligence briefing",
-                        "requirements": [
-                            "technical route and architecture",
-                            "data and workflow",
-                            "metrics or deployment evidence",
-                            "primary or open-source material",
-                        ],
-                    },
-                },
-                ensure_ascii=False,
-            ),
-            temperature=0.2,
-            max_tokens=700,
-            timeout_seconds=self.briefing_planning_timeout_seconds,
-        )
-        return _parse_search_query_plan(content)
 
     def _pydantic_ai_runner(
         self,
