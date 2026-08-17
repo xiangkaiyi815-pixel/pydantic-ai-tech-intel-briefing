@@ -120,6 +120,9 @@ class Settings(BaseModel):
     admin_user_ids: list[str] = Field(default_factory=list)
 
     # Knowledge-graph semantic matching
+    # These fields use an OpenAI-compatible embedding API.  If OPENAI_API_KEY is
+    # not set, the provider falls back to DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL so
+    # DeepSeek-compatible endpoints or third-party proxies can be reused.
     embedding_enabled: bool = True
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
@@ -211,8 +214,10 @@ class Settings(BaseModel):
             "briefing_timezone": source.get("BRIEFING_TIMEZONE", "Asia/Shanghai"),
             "admin_user_ids": _to_list(source.get("SEARCH_ASSISTANT_ADMIN_USER_IDS"), []),
             "embedding_enabled": _to_bool(source.get("SEARCH_ASSISTANT_EMBEDDING_ENABLED"), default=True),
-            "openai_api_key": source.get("OPENAI_API_KEY") or None,
-            "openai_base_url": source.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            "openai_api_key": source.get("OPENAI_API_KEY") or source.get("DEEPSEEK_API_KEY") or None,
+            "openai_base_url": source.get("OPENAI_BASE_URL")
+            or source.get("DEEPSEEK_BASE_URL")
+            or "https://api.openai.com/v1",
             "openai_embedding_model": source.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
         }
         return cls(**values)

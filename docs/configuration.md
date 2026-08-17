@@ -95,6 +95,17 @@ python -m search_assistant.cli feishu-doctor
 python -m search_assistant.cli feishu-fixture tests/fixtures/feishu_message_event.json
 ```
 
+## Knowledge Graph Semantic Matching
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEARCH_ASSISTANT_EMBEDDING_ENABLED` | `true` | When `true`, enable semantic matching for English-to-Chinese knowledge-graph queries. |
+| `OPENAI_API_KEY` | unset | Primary OpenAI-compatible embedding API key. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Primary OpenAI-compatible embedding endpoint. |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name. |
+
+If `OPENAI_API_KEY` is empty, the provider falls back to `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` so a DeepSeek-compatible or third-party OpenAI-compatible endpoint can be reused. If no key is available, semantic matching is disabled and the graph uses literal matching only.
+
 ## MCP Configuration
 
 `configs/public-sources.mcp.json` starts two local stdio servers:

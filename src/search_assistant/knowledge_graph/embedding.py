@@ -79,8 +79,10 @@ def build_embedding_provider(
     Args:
         enabled: Whether semantic matching is enabled. Defaults to True unless
             ``SEARCH_ASSISTANT_EMBEDDING_ENABLED`` is set to ``false``/``0``/``no``.
-        api_key: OpenAI-compatible API key. Falls back to ``OPENAI_API_KEY``.
-        base_url: OpenAI-compatible base URL. Falls back to ``OPENAI_BASE_URL``.
+        api_key: OpenAI-compatible API key. Falls back to ``OPENAI_API_KEY``,
+            then ``DEEPSEEK_API_KEY``.
+        base_url: OpenAI-compatible base URL. Falls back to ``OPENAI_BASE_URL``,
+            then ``DEEPSEEK_BASE_URL``.
         model: Embedding model name. Falls back to ``OPENAI_EMBEDDING_MODEL``
             then ``text-embedding-3-small``.
     """
@@ -91,12 +93,12 @@ def build_embedding_provider(
     if not enabled:
         return NullEmbeddingProvider()
 
-    key = api_key or os.getenv("OPENAI_API_KEY")
+    key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
     if not key:
         return NullEmbeddingProvider()
 
     return OpenAIEmbeddingProvider(
         api_key=key,
-        base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+        base_url=base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("DEEPSEEK_BASE_URL"),
         model=model or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
     )

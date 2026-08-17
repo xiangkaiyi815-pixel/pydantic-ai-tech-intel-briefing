@@ -99,6 +99,23 @@ def test_build_embedding_provider_returns_openai_with_api_key(monkeypatch):
     assert provider.model == "text-embedding-3-small"
 
 
+def test_build_embedding_provider_falls_back_to_deepseek_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    provider = build_embedding_provider()
+    assert isinstance(provider, OpenAIEmbeddingProvider)
+
+
+def test_build_embedding_provider_prefers_openai_over_deepseek(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    provider = build_embedding_provider()
+    assert isinstance(provider, OpenAIEmbeddingProvider)
+
+
 def test_service_uses_semantic_match_for_english_query_and_chinese_entity(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
