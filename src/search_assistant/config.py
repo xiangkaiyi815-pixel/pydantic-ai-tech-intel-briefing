@@ -119,6 +119,12 @@ class Settings(BaseModel):
     briefing_timezone: str = "Asia/Shanghai"
     admin_user_ids: list[str] = Field(default_factory=list)
 
+    # Knowledge-graph semantic matching
+    embedding_enabled: bool = True
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_embedding_model: str = "text-embedding-3-small"
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         source: Mapping[str, str]
@@ -204,5 +210,9 @@ class Settings(BaseModel):
             "briefing_model_max_sources": _to_int(source.get("BRIEFING_MODEL_MAX_SOURCES"), 12),
             "briefing_timezone": source.get("BRIEFING_TIMEZONE", "Asia/Shanghai"),
             "admin_user_ids": _to_list(source.get("SEARCH_ASSISTANT_ADMIN_USER_IDS"), []),
+            "embedding_enabled": _to_bool(source.get("SEARCH_ASSISTANT_EMBEDDING_ENABLED"), default=True),
+            "openai_api_key": source.get("OPENAI_API_KEY") or None,
+            "openai_base_url": source.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            "openai_embedding_model": source.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
         }
         return cls(**values)

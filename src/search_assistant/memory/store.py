@@ -540,6 +540,14 @@ class MemoryStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS entity_embeddings (
+                    content_hash TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS topic_feedback_signals (
                     id TEXT PRIMARY KEY,
                     topic_id TEXT NOT NULL,
@@ -2111,6 +2119,44 @@ class MemoryStore:
                 (topic_id,),
             ).fetchone()
         return DailyBriefing.model_validate_json(row["package_json"]) if row is not None else None
+
+    def get_entity_embedding(self, content_hash: str) -> list[float] | None:
+        """Return a cached embedding vector by content hash, or None if not cached."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT embedding_json FROM entity_embeddings WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["embedding_json"])
+
+    def upsert_entity_embedding(
+        self,
+        content_hash: str,
+        provider: str,
+        model: str,
+        embedding: list[float],
+    ) -> None:
+        """Cache an embedding vector for later reuse."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO entity_embeddings (content_hash, provider, model, embedding_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(content_hash) DO UPDATE SET
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    embedding_json = excluded.embedding_json,
+                    created_at = datetime('now')
+                """,
+                (
+                    content_hash,
+                    provider,
+                    model,
+                    json.dumps(embedding),
+                ),
+            )
 
     def upsert_domain_knowledge_graph(self, graph: DomainKnowledgeGraph) -> dict[str, object]:
         now = _now_iso()

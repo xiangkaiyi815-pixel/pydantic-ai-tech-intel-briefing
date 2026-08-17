@@ -8,6 +8,12 @@ from search_assistant.contracts import (
     DomainKnowledgeRelation,
     DomainKnowledgeSearchHit,
 )
+from search_assistant.knowledge_graph.embedding import (
+    EmbeddingProvider,
+    build_embedding_provider,
+    cosine_similarity,
+    _embedding_cache_key,
+)
 from search_assistant.knowledge_graph.seeds import default_domain_graphs
 from search_assistant.memory.store import MemoryStore
 
@@ -27,8 +33,13 @@ _NEGATED_MENTION_PATTERN = re.compile(
 class DomainKnowledgeGraphService:
     """Manage reviewed domain graphs used as a lightweight GraphRAG index."""
 
-    def __init__(self, store: MemoryStore):
+    def __init__(
+        self,
+        store: MemoryStore,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         self.store = store
+        self.embedding_provider = embedding_provider or build_embedding_provider()
 
     def seed_default_graphs(self, domain_ids: list[str] | None = None) -> dict[str, object]:
         requested = {domain_id.strip() for domain_id in domain_ids or [] if domain_id.strip()}
@@ -52,6 +63,7 @@ class DomainKnowledgeGraphService:
         if not normalized:
             raise ValueError("query must not be empty")
         graphs = self._load_graphs(domain_id)
+        query_embedding = self._query_embedding(normalized)
         hits: list[DomainKnowledgeSearchHit] = []
         for graph in graphs:
             entity_by_id = {entity.id: entity for entity in graph.entities}
@@ -59,6 +71,13 @@ class DomainKnowledgeGraphService:
                 score, matched_aliases = self._score_entity(normalized, entity)
                 relation_bonus = self._relation_bonus(normalized, entity, graph.relations, entity_by_id)
                 score += relation_bonus
+                # Cross-lingual semantic boost: if the literal match is weak but the
+                # query is semantically close to the entity, give it a small bonus.
+                # Strong literal matches already dominate, so only boost weak ones.
+                if score < 7.0 and query_embedding is not None:
+                    semantic_similarity = self._semantic_similarity(query_embedding, entity)
+                    if semantic_similarity >= 0.72:
+                        score += semantic_similarity * 3.0
                 if score <= 0:
                     continue
                 hits.append(
@@ -244,6 +263,62 @@ class DomainKnowledgeGraphService:
             target_name = target.name if target else relation.target_entity_id
             formatted.append(f"{source_name} --{relation.relation_type}--> {target_name}: {relation.description}")
         return formatted
+
+    def _query_embedding(self, query: str) -> list[float] | None:
+        """Return the query embedding, using the SQLite cache when available.
+
+        Returns ``None`` when no provider is configured or the provider fails,
+        allowing the caller to fall back to literal matching only.
+        """
+        provider = self.embedding_provider
+        if provider.__class__.__name__ == "NullEmbeddingProvider":
+            return None
+        cache_key = _embedding_cache_key(query)
+        cached = self.store.get_entity_embedding(cache_key)
+        if cached:
+            return cached
+        try:
+            vectors = provider.embed([query])
+        except Exception:
+            return None
+        if not vectors or not vectors[0]:
+            return None
+        vector = vectors[0]
+        self.store.upsert_entity_embedding(
+            cache_key,
+            provider.__class__.__name__,
+            getattr(provider, "model", "unknown"),
+            vector,
+        )
+        return vector
+
+    def _semantic_similarity(self, query_embedding: list[float], entity: DomainKnowledgeEntity) -> float:
+        """Compute cosine similarity between the query and an entity text representation."""
+        provider = self.embedding_provider
+        if provider.__class__.__name__ == "NullEmbeddingProvider":
+            return 0.0
+        entity_text = " ".join([entity.name, *entity.aliases, entity.summary]).strip()
+        if not entity_text:
+            return 0.0
+        cache_key = _embedding_cache_key(entity_text)
+        cached = self.store.get_entity_embedding(cache_key)
+        if cached:
+            entity_embedding = cached
+        else:
+            try:
+                vectors = provider.embed([entity_text])
+            except Exception:
+                return 0.0
+            if not vectors or not vectors[0]:
+                return 0.0
+            entity_embedding = vectors[0]
+            self.store.upsert_entity_embedding(
+                cache_key,
+                provider.__class__.__name__,
+                getattr(provider, "model", "unknown"),
+                entity_embedding,
+            )
+        return cosine_similarity(query_embedding, entity_embedding)
 
 
 def _terms(value: str) -> list[str]:
