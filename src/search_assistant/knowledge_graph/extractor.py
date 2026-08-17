@@ -250,6 +250,12 @@ def extract_relations(
     return relations[:50]
 
 
+def _auto_graph_slug(value: str) -> str:
+    """Normalize a topic or graph id into a safe auto-graph id suffix."""
+    slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", value).strip("-")[:40]
+    return slug or "misc"
+
+
 def extend_graph_from_briefing(
     store: MemoryStore,
     briefing: DailyBriefing,
@@ -258,27 +264,25 @@ def extend_graph_from_briefing(
 ) -> dict[str, Any]:
     """Merge trajectory-extracted entities into a knowledge graph.
 
-    A dedicated auto graph (``auto-<graph_id>``) is used so reviewed seed graphs
-    stay untouched; auto entities carry ``metadata.auto_extracted=True`` and are
-    meant to be reviewed before being treated as trusted knowledge.
+    A dedicated per-topic auto graph (``auto-<slug>``) is used so reviewed seed
+    graphs stay untouched and different topics never pollute each other's auto
+    graph.  The target id comes from ``graph_id`` when provided, otherwise from
+    the briefing topic.  Repeated briefings on the same topic accumulate into
+    the same auto graph; entities and co-occurrence relations are deduplicated
+    by name / entity pair.  Auto entities carry ``metadata.auto_extracted=True``
+    and are meant to be reviewed before being treated as trusted knowledge.
     """
     entities = extract_entities(briefing, min_occurrences=min_occurrences)
     if not entities:
         return {"graph_id": None, "added_entities": 0, "added_relations": 0, "total_entities": 0}
 
-    existing_graphs = store.list_domain_knowledge_graphs()
-    auto_graph: DomainKnowledgeGraph | None = None
-    for row in existing_graphs:
-        graph = store.get_domain_knowledge_graph(str(row["id"]))
-        if graph is not None and graph.id.startswith("auto-"):
-            auto_graph = graph
-            break
-
+    scope = str(graph_id).strip() if graph_id else briefing.topic
+    target_id = f"auto-{_auto_graph_slug(scope)}"
     relations = extract_relations(entities, briefing)
+    auto_graph = store.get_domain_knowledge_graph(target_id)
     if auto_graph is None:
-        slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", briefing.topic).strip("-")[:40] or "misc"
         auto_graph = DomainKnowledgeGraph(
-            id=f"auto-{slug}",
+            id=target_id,
             name=f"自动提取图谱（{briefing.topic}）",
             description="Auto-extracted from briefing trajectories; review before trusted use.",
             overview=f"Entities and co-occurrence relations extracted from the '{briefing.topic}' briefing trajectory.",
@@ -295,7 +299,8 @@ def extend_graph_from_briefing(
             "total_entities": len(entities),
         }
 
-    # Merge into the existing auto graph, deduplicating by name (case-insensitive).
+    # Merge into this topic's existing auto graph, deduplicating by name
+    # (case-insensitive).
     existing_names = {entity.name.lower() for entity in auto_graph.entities}
     added_entities = [entity for entity in entities if entity.name.lower() not in existing_names]
     if added_entities:

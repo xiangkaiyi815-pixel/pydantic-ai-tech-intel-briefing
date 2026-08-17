@@ -198,6 +198,8 @@
 
 **✅ 实施结果（d20e9cf）**：新增 `knowledge_graph/extractor.py`（单词 + 英文 bigram 词频提取实体、共现关系），写入 `auto-<slug>` 图谱（不动种子图谱），briefing 完成后自动调用（`extend_graph_from_briefing`）。5 个测试通过。
 
+**⚠️ 后续修复（跨主题合并 bug）**：原实现合并时只找第一个 `auto-` 图谱（`graph_id` 参数被忽略），导致不同主题的自动提取实体混入同一张图（实测 133 实体三题混杂）。已修复：目标图谱改为按 `graph_id`/主题 slug 定位（`auto-<slug>`），同主题多轮合入同一张图、不同主题各自成图；存量污染数据已按实体 evidence 的 briefing 归属拆分还原（50/45/38）。
+
 #### 4.3 多类型记忆查询路由 ✅ 已完成（d20e9cf）
 
 **现状**：

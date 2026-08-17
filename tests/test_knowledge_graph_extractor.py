@@ -129,14 +129,35 @@ def test_extend_graph_creates_auto_graph_and_merges():
     auto_graphs = [g for g in graphs if str(g["id"]).startswith("auto-")]
     assert len(auto_graphs) == 1
 
-    # Second run merges into the same graph without duplicating entities.
-    result2 = extend_graph_from_briefing(store, _briefing("vector store latency"))
+    # A second run on the SAME topic merges into the same graph without
+    # duplicating entities.
+    second_briefing = _briefing("AI agent memory architectures")
+    second_briefing.id = "brief-2"
+    result2 = extend_graph_from_briefing(store, second_briefing)
     assert result2["graph_id"] == result["graph_id"]
     graph = store.get_domain_knowledge_graph(result["graph_id"])
     assert graph is not None
     # "vector store" already exists from the first run -> not duplicated.
     names = [entity.name for entity in graph.entities]
     assert names.count("vector store") <= 1
+
+
+def test_extend_graph_isolates_auto_graphs_by_topic():
+    """Different topics must land in different auto graphs (no cross-topic merge)."""
+    store = _store()
+    first = extend_graph_from_briefing(store, _briefing("AI agent memory architectures"))
+    second = extend_graph_from_briefing(store, _briefing("vector store latency"))
+
+    assert first["graph_id"] != second["graph_id"]
+    auto_graphs = [g for g in store.list_domain_knowledge_graphs() if str(g["id"]).startswith("auto-")]
+    assert len(auto_graphs) == 2
+    first_graph = store.get_domain_knowledge_graph(first["graph_id"])
+    second_graph = store.get_domain_knowledge_graph(second["graph_id"])
+    assert first_graph is not None and second_graph is not None
+    # Every entity stays in the graph of the topic that produced it: the entity
+    # summary records the source briefing topic.
+    assert all("AI agent memory architectures" in (entity.summary or "") for entity in first_graph.entities)
+    assert all("vector store latency" in (entity.summary or "") for entity in second_graph.entities)
 
 
 def test_extend_graph_with_empty_briefing_returns_noop():
