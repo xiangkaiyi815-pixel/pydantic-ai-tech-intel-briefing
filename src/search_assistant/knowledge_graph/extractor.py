@@ -112,7 +112,33 @@ _STOP_WORDS = {
 
 _MIN_TERM_LEN = 2
 _MAX_TERM_LEN = 40
-_MIN_OCCURRENCES = 2
+_MIN_OCCURRENCES = 3
+
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+_MAX_CJK_RUN_LEN = 10
+
+# Terms that are too generic to guide retrieval even when they recur.
+_GENERIC_ENTITY_NAMES = frozenset(
+    {
+        "ai",
+        "api",
+        "data",
+        "llm",
+        "model",
+        "models",
+        "system",
+        "systems",
+        "use",
+        "used",
+        "using",
+        "模型",
+        "部署",
+        "设计",
+        "产品",
+        "协议",
+    }
+    | _STOP_WORDS
+)
 
 
 def _entity_type(name: str) -> DomainKnowledgeEntityType:
@@ -144,6 +170,82 @@ def _meaningful_term(term: str) -> bool:
     return True
 
 
+_CJK_BIGRAM_RE = re.compile(r"[\u4e00-\u9fff]{2}")
+
+
+def is_cjk_fragment(term: str, cjk_runs: list[str]) -> bool:
+    """True when a 2-char CJK term is a fragment of a longer CJK run.
+
+    The shared tokenizer chunks CJK text into overlapping bigrams, so
+    "智能体" produces both "智能" and "能体".  These fragments are poor graph
+    entities; when the full run is present in the same text they are dropped
+    while the run itself becomes the entity.
+    """
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2}", term):
+        return False
+    return any(len(run) > 2 and term in run for run in cjk_runs)
+
+
+def is_meaningful_entity_name(name: str, sibling_names: set[str] | None = None) -> bool:
+    """Whether an entity name is specific enough to guide retrieval.
+
+    Rejects single characters, generic terms, 2-char CJK fragments that are
+    substrings of a longer sibling entity, and spaced names whose two parts are
+    both 2-char CJK pieces (overlapping window artifacts such as "大模 模型").
+    """
+    stripped = name.strip()
+    if len(stripped) < 2:
+        return False
+    if stripped.lower() in _GENERIC_ENTITY_NAMES:
+        return False
+    if " " in stripped:
+        parts = [part for part in stripped.split() if part]
+        if len(parts) == 2 and all(_CJK_BIGRAM_RE.fullmatch(part) for part in parts):
+            return False
+    if re.fullmatch(r"[\u4e00-\u9fff]{2}", stripped):
+        if sibling_names is not None:
+            for sibling in sibling_names:
+                if sibling != stripped and stripped in sibling:
+                    return False
+    return True
+
+
+def _candidate_terms(text: str) -> list[str]:
+    """Candidate entity terms extracted from one text field.
+
+    English words and word bigrams come from the shared tokenizer; CJK content
+    is additionally matched as whole runs (2-10 characters) so that "智能体"
+    survives as one entity while its overlapping bigram fragments ("智能",
+    "能体") are dropped.
+    """
+    tokens = [token for token in tokenize(text) if _meaningful_term(token)]
+    cjk_runs = [run for run in _CJK_RUN_RE.findall(text) if len(run) <= _MAX_CJK_RUN_LEN]
+    kept_tokens = [token for token in tokens if not is_cjk_fragment(token, cjk_runs)]
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        if term not in seen:
+            seen.add(term)
+            terms.append(term)
+
+    for token in kept_tokens:
+        add(token)
+    for left, right in zip(kept_tokens, kept_tokens[1:]):
+        # Skip overlapping CJK window pairs ("大模 模型", "端视 视觉"): they
+        # are artifacts of bigram chunking, not meaningful phrases.  Latin-Latin
+        # ("persistent memory") and Latin-CJK ("a2a 协议") pairs stay.
+        if _CJK_BIGRAM_RE.fullmatch(left) and _CJK_BIGRAM_RE.fullmatch(right):
+            continue
+        bigram = f"{left} {right}"
+        if _meaningful_term(bigram):
+            add(bigram)
+    for run in cjk_runs:
+        if _meaningful_term(run):
+            add(run)
+    return terms
+
+
 def _collect_texts(briefing: DailyBriefing) -> list[str]:
     """Collect the free-text fields that should contribute candidate terms."""
     texts: list[str] = []
@@ -172,22 +274,18 @@ def extract_entities(
 ) -> list[DomainKnowledgeEntity]:
     """Extract candidate entities from a briefing trajectory by term frequency.
 
-    Both single tokens and adjacent English bigrams are counted, so meaningful
-    phrases such as "persistent memory" or "vector store" surface as entities
-    instead of being split into generic words.  Only terms that appear in at
-    least ``min_occurrences`` different fields are kept, filtering out one-off
-    vocabulary while retaining recurring domain concepts.
+    English words and word bigrams are counted alongside whole CJK runs, so
+    meaningful phrases such as "persistent memory" or "受控工单编排" surface as
+    entities.  Overlapping CJK bigram fragments (e.g. "能体" inside "智能体")
+    are dropped.  Only terms that appear in at least ``min_occurrences``
+    different fields are kept, filtering out one-off vocabulary while retaining
+    recurring domain concepts.
     """
     texts = _collect_texts(briefing)
     counter: Counter[str] = Counter()
     for text in texts:
-        tokens = [token for token in tokenize(text) if _meaningful_term(token)]
-        for term in set(tokens):
+        for term in set(_candidate_terms(text)):
             counter[term] += 1
-        for left, right in zip(tokens, tokens[1:]):
-            bigram = f"{left} {right}"
-            if _meaningful_term(bigram):
-                counter[bigram] += 1
 
     now = datetime.now(UTC).isoformat()
     entities: list[DomainKnowledgeEntity] = []

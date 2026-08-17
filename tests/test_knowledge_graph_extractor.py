@@ -107,6 +107,98 @@ def test_extract_entities_filters_stop_words():
         assert stop not in names
 
 
+def test_extract_entities_rejects_cjk_fragment_bigrams():
+    """Bigram fragments of a longer CJK run (智能/能体 from 智能体) are dropped."""
+    briefing = _briefing("智能体 编排")
+    briefing.search_directions = ["智能体 任务编排", "智能体 工具调用"]
+    briefing.keywords = ["智能体", "工作流"]
+    briefing.sources = [
+        _source(
+            "https://example.com/cjk/1",
+            "智能体 上下文管理",
+            "智能体 需要受控工具调用与人工审批",
+        )
+    ]
+    briefing.synthesis.themes[0].analysis = "智能体 编排需要受控工具调用与回滚机制。"
+
+    names = {entity.name for entity in extract_entities(briefing)}
+    assert "智能体" in names
+    assert "能体" not in names
+    assert "智能" not in names
+
+
+def test_extract_entities_keeps_standalone_cjk_bigrams():
+    """A 2-char CJK term that is not a fragment of a longer run stays an entity."""
+    briefing = _briefing("视觉质检")
+    briefing.search_directions = ["机器视觉 质检", "视觉 缺陷检测"]
+    briefing.keywords = ["视觉", "缺陷"]
+    briefing.sources = [_source("https://example.com/vision/1", "视觉 质检流程", "视觉 定位缺陷")]
+
+    names = {entity.name for entity in extract_entities(briefing)}
+    assert "视觉" in names
+
+
+def test_is_meaningful_entity_name_filters_generic_and_fragments():
+    from search_assistant.knowledge_graph.extractor import is_meaningful_entity_name
+
+    assert is_meaningful_entity_name("受控工单编排") is True
+    assert is_meaningful_entity_name("MES") is True
+    assert is_meaningful_entity_name("ai") is False
+    assert is_meaningful_entity_name("模型") is False
+    assert is_meaningful_entity_name("能体", {"智能体"}) is False
+    assert is_meaningful_entity_name("视觉", {"机器视觉"}) is False
+    assert is_meaningful_entity_name("视觉", {"机器视觉质检"}) is False
+    assert is_meaningful_entity_name("视觉", {"目标检测"}) is True
+    # Overlapping CJK window artifacts are rejected; Latin-CJK pairs survive.
+    assert is_meaningful_entity_name("大模 模型") is False
+    assert is_meaningful_entity_name("端视 视觉") is False
+    assert is_meaningful_entity_name("mes 工单") is True
+    assert is_meaningful_entity_name("a2a 协议") is True
+    assert is_meaningful_entity_name("persistent memory") is True
+
+
+def test_query_relevant_skips_fragment_and_generic_entities():
+    from search_assistant.contracts import DomainKnowledgeEntity, DomainKnowledgeGraph
+    from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
+
+    store = _store()
+    graph = DomainKnowledgeGraph(
+        id="auto-quality-test",
+        name="自动提取图谱（质量测试）",
+        description="test graph",
+        overview="test overview",
+        source="auto-extracted",
+        version="1",
+        entities=[
+            DomainKnowledgeEntity(
+                id="e1", name="智能体", entity_type="concept", aliases=[],
+                summary="智能体 编排与工具调用", evidence_refs=["briefing:b1"], metadata={},
+            ),
+            DomainKnowledgeEntity(
+                id="e2", name="能体", entity_type="concept", aliases=[],
+                summary="切词碎片", evidence_refs=["briefing:b1"], metadata={},
+            ),
+            DomainKnowledgeEntity(
+                id="e3", name="ai", entity_type="concept", aliases=[],
+                summary="泛化词", evidence_refs=["briefing:b1"], metadata={},
+            ),
+            DomainKnowledgeEntity(
+                id="e4", name="受控工单编排", entity_type="workflow", aliases=[],
+                summary="受控工单编排 写回 MES", evidence_refs=["briefing:b1"], metadata={},
+            ),
+        ],
+        relations=[],
+    )
+    store.upsert_domain_knowledge_graph(graph)
+    service = DomainKnowledgeGraphService(store, hybrid_retrieval=True)
+    hits = service.query_relevant("智能体 受控工单编排", limit=10, min_score=0.0)
+    names = {hit.entity_name for hit in hits}
+    assert "智能体" in names
+    assert "受控工单编排" in names
+    assert "能体" not in names
+    assert "ai" not in names
+
+
 def test_extract_relations_uses_co_occurrence():
     entities = extract_entities(_briefing())
     relations = extract_relations(entities, _briefing())

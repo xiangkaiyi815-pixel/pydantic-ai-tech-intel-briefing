@@ -27,7 +27,7 @@ from search_assistant.knowledge_graph.embedding import (
     cosine_similarity,
     _embedding_cache_key,
 )
-from search_assistant.knowledge_graph.extractor import extend_graph_from_briefing
+from search_assistant.knowledge_graph.extractor import extend_graph_from_briefing, is_meaningful_entity_name
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchClient, SearchOutcome, SearchResult, search_with_provider_events
@@ -1406,11 +1406,14 @@ class DailyBriefingService:
         knowledge_context: dict[str, object],
     ) -> list[tuple[str, str]]:
         queries: list[tuple[str, str]] = []
-        for hit in knowledge_context.get("reviewed_graph_hits", [])[:3]:
+        for hit in knowledge_context.get("reviewed_graph_hits", [])[:5]:
             if not isinstance(hit, dict):
                 continue
             entity_name = str(hit.get("entity_name") or "").strip()
-            if entity_name:
+            # Skip generic terms and tokenizer fragments so the graph-guided
+            # queries carry discriminating vocabulary (e.g. "受控工单编排")
+            # instead of noise (e.g. "能体", "部署").
+            if entity_name and is_meaningful_entity_name(entity_name):
                 queries.append(("知识图谱补充", f"{topic} {entity_name} implementation evidence"))
         # Validated self-evolution candidates are intentionally NOT turned into raw
         # search queries here. Directly concatenating claim terms from a previous

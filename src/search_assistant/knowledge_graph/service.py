@@ -15,6 +15,7 @@ from search_assistant.knowledge_graph.embedding import (
     cosine_similarity,
     _embedding_cache_key,
 )
+from search_assistant.knowledge_graph.extractor import is_meaningful_entity_name
 from search_assistant.knowledge_graph.seeds import default_domain_graphs
 from search_assistant.memory.store import MemoryStore
 
@@ -71,9 +72,15 @@ class DomainKnowledgeGraphService:
         hits: list[DomainKnowledgeSearchHit] = []
         for graph in graphs:
             entity_by_id = {entity.id: entity for entity in graph.entities}
+            sibling_names = {entity.name for entity in graph.entities}
             bm25_scores = self._bm25_scores_for_graph(graph.id, normalized) if self.hybrid_retrieval else None
             bm25_max = max(bm25_scores) if bm25_scores else 0.0
             for index, entity in enumerate(graph.entities):
+                # Skip entities that are too generic or are tokenizer fragments
+                # (e.g. 2-char CJK substrings of a longer entity name).  This
+                # keeps noisy auto-extracted vocabulary out of retrieval.
+                if not is_meaningful_entity_name(entity.name, sibling_names):
+                    continue
                 score, matched_aliases = self._score_entity(normalized, entity)
                 relation_bonus = self._relation_bonus(normalized, entity, graph.relations, entity_by_id)
                 score += relation_bonus
