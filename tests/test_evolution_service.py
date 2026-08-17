@@ -25,9 +25,10 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     store.initialize()
     service = DomainKnowledgeCandidateService(store)
     briefing = _briefing(source_count=2)
+    independent_briefing = _briefing(source_count=2, briefing_id="briefing-2", url_prefix="independent")
 
     first_ids = service.capture_briefing(briefing)
-    second_ids = service.capture_briefing(briefing)
+    second_ids = service.capture_briefing(independent_briefing)
 
     assert first_ids == second_ids
     assert len(first_ids) == 1
@@ -36,8 +37,11 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     assert candidates[0]["topic"] == "industrial AI"
     assert candidates[0]["status"] == "candidate"
     assert candidates[0]["confidence"] == "medium"
-    assert len(candidates[0]["evidence"]) == 2
+    # Evidence and source ids from both independent briefings are merged.
+    assert len(candidates[0]["evidence"]) == 4
     assert candidates[0]["source_ids"][0] == briefing.id
+    assert "briefing-2" in candidates[0]["source_ids"]
+    assert service.independent_trajectory_count(candidates[0]) == 2
     graph_links = store.list_domain_candidate_graph_links(first_ids[0])
     assert len(graph_links) == 1
     assert graph_links[0]["graph_id"] == "industrial-ai"
@@ -56,6 +60,7 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     assert validation["candidate_id"] == first_ids[0]
     assert validation["failures"] == []
     assert validation["knowledge_layer"] == "validated_knowledge"
+    assert validation["independent_trajectory_count"] == 2
     assert store.get_domain_knowledge_candidate(first_ids[0])["status"] == "deprecated"
     gates = store.list_gate_records()
     assert {gate["gate_type"] for gate in gates} == {
@@ -66,8 +71,9 @@ def test_briefing_evidence_creates_deduplicated_reviewable_domain_candidates(tmp
     rollback_entries = store.list_project_ledger_entries(entry_type="knowledge_rollback")
     assert rollback_entries[0]["status"] == "deprecated"
     events = store.list_domain_knowledge_candidate_events(first_ids[0])
-    assert [event["to_status"] for event in events] == ["candidate", "validated", "deprecated"]
+    assert [event["to_status"] for event in events] == ["candidate", "candidate", "validated", "deprecated"]
     assert events[-1]["reason"] == "superseded by a later evidence review"
+    assert any("merged evidence" in event["reason"] for event in events)
     with sqlite3.connect(database_path) as connection:
         with pytest.raises(sqlite3.IntegrityError, match="candidate events are immutable"):
             connection.execute(
@@ -85,15 +91,37 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     result = service.validate(candidate_id)
 
     assert result["validated"] is False
-    assert result["failures"] == ["fewer_than_two_original_sources", "low_confidence"]
+    assert result["failures"] == [
+        "fewer_than_two_original_sources",
+        "fewer_than_two_independent_trajectories",
+        "low_confidence",
+    ]
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "candidate"
     gates = store.list_gate_records(gate_type="domain_knowledge_candidate_validation")
     assert len(gates) == 1
     assert gates[0]["result"] == "failed"
     assert gates[0]["metadata"]["evidence_url_count"] == 1
+    assert gates[0]["metadata"]["independent_trajectory_count"] == 1
     assert gates[0]["metadata"]["knowledge_layer"] == "weak_signal"
     assert "exploratory clue" in gates[0]["metadata"]["intended_use"]
     assert result["knowledge_layer"] == "weak_signal"
+
+
+def test_multi_source_single_trajectory_stays_weak_signal(tmp_path):
+    """Two sources inside one briefing are not enough: independent trajectories are required."""
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
+
+    result = service.record_validation_gate(candidate_id)
+
+    assert result["validated"] is False
+    assert result["failures"] == ["fewer_than_two_independent_trajectories"]
+    assert result["knowledge_layer"] == "weak_signal"
+    weak_signals = service.list_candidates(layer="weak_signal")
+    assert [candidate["id"] for candidate in weak_signals] == [candidate_id]
+    assert "independent corroborating sources" in weak_signals[0]["knowledge_layer_next_action"]
 
 
 def test_candidate_list_can_surface_weak_signals_without_promoting_them(tmp_path):
@@ -135,6 +163,8 @@ def test_candidate_approval_records_human_gate_and_release_ledger(tmp_path):
     store.initialize()
     service = DomainKnowledgeCandidateService(store)
     candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
+    # A second independent briefing makes the claim cross-trajectory validated.
+    service.capture_briefing(_briefing(source_count=2, briefing_id="briefing-2", url_prefix="independent"))
 
     result = service.approve(
         candidate_id,
@@ -270,14 +300,15 @@ def test_learning_report_surfaces_trajectory_and_domain_candidate_status(tmp_pat
     assert "graph links: 1" in report
 
 
-def _briefing(source_count: int) -> DailyBriefing:
+def _briefing(source_count: int, briefing_id: str = "briefing-1", url_prefix: str | None = None) -> DailyBriefing:
+    prefix = url_prefix or "industrial-ai"
     sources = [
         CollectedSource(
-            id=f"source-{index}",
+            id=f"source-{prefix}-{index}",
             topic_id="topic-1",
             user_id="user-1",
             title=f"Industrial AI source {index}",
-            url=f"https://example.com/industrial-ai/{index}",
+            url=f"https://example.com/{prefix}/{index}",
             snippet="A source-backed workflow with review gates.",
             platform="web",
             provider=f"provider-{index}",
@@ -289,7 +320,7 @@ def _briefing(source_count: int) -> DailyBriefing:
         for index in range(1, source_count + 1)
     ]
     return DailyBriefing(
-        id="briefing-1",
+        id=briefing_id,
         topic_id="topic-1",
         user_id="user-1",
         chat_id="chat-1",

@@ -130,5 +130,21 @@ Phase one separates stable online execution from offline, reviewable evolution:
    by original source URLs. Candidates remain reviewable until an explicit
    evidence gate validates them; deprecated records and status events are kept
    for rollback and audit.
-4. Learning reports expose trajectory and candidate status. They are reporting
+4. The offline evolution loop (`evolution-offline-run`) aggregates immutable
+   trajectories and runs a three-layer verifier on each: a code-based result
+   layer (answer present, search executed, sources returned), a code-based
+   process layer (required search, calibration/review discipline, citation
+   provenance, uncertainty disclosure), and a rubric quality layer (deterministic
+   rule judge by default; an LLM rubric judge can be enabled and calibrated
+   against expert labels before use). Verdicts carry evidence locations and may
+   abstain with `uncertain` instead of guessing. Failures are routed to
+   reviewable experience items; release stays human-gated.
+5. Knowledge candidates accumulate evidence across independent trajectories:
+   a claim that reappears in a second briefing merges its sources into the same
+   candidate, and the validation gate requires at least two independent
+   trajectories plus at least two original sources before a candidate can reach
+   the `validated_knowledge` layer. The offline loop re-runs these gates
+   (distillation) and monitors the eval report and regressed candidates without
+   auto-promoting or auto-deprecating anything.
+6. Learning reports expose trajectory and candidate status. They are reporting
    artifacts, not trusted evidence and not an automatic release mechanism.

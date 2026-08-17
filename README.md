@@ -158,6 +158,8 @@ python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 864
 python -m search_assistant.cli knowledge-graph-seed
 python -m search_assistant.cli knowledge-graph-query "MES 工单 写回" --domain industrial-ai
 python -m search_assistant.cli knowledge-graph-export agent-engineering
+python -m search_assistant.cli evolution-offline-run --judge rule
+python -m search_assistant.cli evolution-offline-run --judge llm --max-trajectories 10
 python -m search_assistant.cli agentops-report
 python -m search_assistant.cli provider-health
 python -m search_assistant.cli trace-list

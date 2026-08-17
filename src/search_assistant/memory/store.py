@@ -814,6 +814,20 @@ class MemoryStore:
         ]
 
     def add_domain_knowledge_candidate(self, candidate: DomainKnowledgeCandidate) -> str:
+        return self.upsert_domain_knowledge_candidate(candidate)[0]
+
+    def upsert_domain_knowledge_candidate(self, candidate: DomainKnowledgeCandidate) -> tuple[str, bool]:
+        """Insert a candidate or merge new evidence into the existing row.
+
+        Deduplication key is ``fingerprint`` (topic + claim).  When the
+        fingerprint already exists, evidence is unioned by URL, ``source_ids``
+        and ``contradictions`` are unioned, confidence never decreases, and a
+        candidate event records the merge.  This is what lets a claim that
+        reappears in an independent briefing accumulate cross-trajectory
+        support instead of being silently dropped by ``INSERT OR IGNORE``.
+
+        Returns ``(candidate_id, created)``.
+        """
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -845,14 +859,63 @@ class MemoryStore:
                     to_status="candidate",
                     reason="created from traceable search evidence",
                 )
-                return candidate.id
+                return candidate.id, True
             row = connection.execute(
-                "SELECT id FROM domain_knowledge_candidates WHERE fingerprint = ?",
+                "SELECT * FROM domain_knowledge_candidates WHERE fingerprint = ?",
                 (candidate.fingerprint,),
             ).fetchone()
         if row is None:
             raise RuntimeError("candidate insert was ignored without a matching fingerprint")
-        return str(row["id"])
+        existing = self._domain_candidate_row(row)
+        return self._merge_domain_knowledge_candidate(existing, candidate), False
+
+    def _merge_domain_knowledge_candidate(
+        self,
+        existing: dict[str, Any],
+        candidate: DomainKnowledgeCandidate,
+    ) -> str:
+        evidence_by_url = {
+            str(item.get("url", "")): item
+            for item in existing["evidence"]
+            if str(item.get("url", ""))
+        }
+        for item in candidate.evidence:
+            url = str(item.url or "")
+            if url and url not in evidence_by_url:
+                evidence_by_url[url] = item.model_dump(mode="json")
+        merged_evidence = list(evidence_by_url.values())
+        merged_source_ids = list(dict.fromkeys([*existing["source_ids"], *candidate.source_ids]))
+        merged_contradictions = list(dict.fromkeys([*existing["contradictions"], *candidate.contradictions]))
+        confidence_rank = {"high": 3, "medium": 2, "low": 1}
+        merged_confidence = max(
+            [str(existing["confidence"]), str(candidate.confidence)],
+            key=lambda value: confidence_rank.get(value, 0),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE domain_knowledge_candidates
+                SET evidence_json = ?, source_ids_json = ?, contradictions_json = ?,
+                    confidence = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(merged_evidence, ensure_ascii=False),
+                    json.dumps(merged_source_ids, ensure_ascii=False),
+                    json.dumps(merged_contradictions, ensure_ascii=False),
+                    merged_confidence,
+                    _now_iso(),
+                    existing["id"],
+                ),
+            )
+            self._insert_candidate_event(
+                connection,
+                str(existing["id"]),
+                from_status="candidate",
+                to_status="candidate",
+                reason="merged evidence from an independent trajectory",
+            )
+        return str(existing["id"])
 
     def list_domain_knowledge_candidates(self, status: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM domain_knowledge_candidates"

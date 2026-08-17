@@ -642,7 +642,7 @@ def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(t
         contradictions=[],
         confidence="medium",
         status="candidate",
-        source_ids=["briefing-harness"],
+        source_ids=["briefing-harness-a", "briefing-harness-b"],
         fingerprint="validated-agent-harness-candidate-fingerprint",
         created_at=now,
         updated_at=now,

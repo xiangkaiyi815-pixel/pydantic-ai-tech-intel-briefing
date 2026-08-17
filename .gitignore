@@ -16,5 +16,6 @@ outputs/
 .pytest-tmp*/
 .pytest-temp/
 tmp/
+tmprun/
 .workbuddy/
 skills/drafts/

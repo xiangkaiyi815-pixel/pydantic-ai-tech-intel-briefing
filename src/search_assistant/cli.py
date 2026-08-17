@@ -127,6 +127,24 @@ def main(argv: list[str] | None = None) -> int:
     evolve_loop_parser.add_argument("--interval-seconds", type=float, default=86400.0)
     evolve_loop_parser.add_argument("--max-runs", type=int, default=None)
 
+    offline_evolution_parser = subparsers.add_parser(
+        "evolution-offline-run",
+        help="Verify immutable trajectories with the three-layer verifier, distill knowledge candidates, and monitor release gates.",
+    )
+    offline_evolution_parser.add_argument(
+        "--judge",
+        choices=["rule", "llm"],
+        default="rule",
+        help="Quality-layer judge: deterministic offline rules (default) or an LLM rubric judge.",
+    )
+    offline_evolution_parser.add_argument(
+        "--max-trajectories",
+        type=_positive_int,
+        default=None,
+        help="Only verify the newest N trajectories that do not yet have an evaluation.",
+    )
+    _add_data_dir(offline_evolution_parser)
+
     eval_parser = subparsers.add_parser("eval-suite")
     eval_parser.add_argument("--questions", default=None)
     eval_parser.add_argument("--max-questions", type=_positive_int, default=None)
@@ -465,6 +483,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "evolution-offline-run":
+        result = _run_offline_evolution(
+            store,
+            data_dir,
+            judge_name=args.judge,
+            max_trajectories=args.max_trajectories,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
     if args.command == "eval-suite":
         result = _run_evaluation(
             store,
@@ -1428,6 +1455,34 @@ def _run_evolution_loop(
         "results": results,
         "runtime_session_id": session_id,
     }
+
+
+def _run_offline_evolution(
+    store: MemoryStore,
+    data_dir: Path,
+    judge_name: str = "rule",
+    max_trajectories: int | None = None,
+) -> dict[str, Any]:
+    """Run the offline evolution loop: three-layer trajectory verification,
+    knowledge-candidate distillation, and release/rollback monitoring."""
+    from search_assistant.evolution.offline_loop import OfflineEvolutionLoop
+    from search_assistant.evolution.verification import LLMRubricJudge
+
+    judge = None
+    if judge_name == "llm":
+        runtime = runtime_from_settings(Settings.from_env())
+
+        def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
+            return runtime._run_agent_with_max_tokens(
+                instructions,
+                payload,
+                temperature=0.0,
+                max_tokens=1400,
+            )
+
+        judge = LLMRubricJudge(judge_runner=_llm_judge_runner)
+    loop = OfflineEvolutionLoop(store, data_dir=data_dir, judge=judge)
+    return loop.run(max_trajectories=max_trajectories)
 
 
 def run_long_connection(data_dir: Path | None = None) -> None:

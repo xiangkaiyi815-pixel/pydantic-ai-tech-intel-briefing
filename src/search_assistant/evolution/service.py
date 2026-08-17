@@ -115,7 +115,7 @@ class DomainKnowledgeCandidateService:
                 created_at=now,
                 updated_at=now,
             )
-            candidate_ids.append(self.store.add_domain_knowledge_candidate(candidate))
+            candidate_ids.append(self.store.upsert_domain_knowledge_candidate(candidate)[0])
         unique_ids = list(dict.fromkeys(candidate_ids))
         self.link_candidates_to_knowledge_graphs(unique_ids)
         return unique_ids
@@ -231,6 +231,9 @@ class DomainKnowledgeCandidateService:
             failures.append("fewer_than_two_original_sources")
         if candidate["contradictions"]:
             failures.append("unresolved_contradictions")
+        independent_trajectories = self.independent_trajectory_count(candidate)
+        if independent_trajectories < 2:
+            failures.append("fewer_than_two_independent_trajectories")
         if candidate["confidence"] == "low":
             failures.append("low_confidence")
         knowledge_layer = self._knowledge_layer(failures)
@@ -247,6 +250,7 @@ class DomainKnowledgeCandidateService:
                     "topic": candidate["topic"],
                     "confidence": candidate["confidence"],
                     "evidence_url_count": len(evidence_urls),
+                    "independent_trajectory_count": independent_trajectories,
                     "candidate_status": candidate["status"],
                     "knowledge_layer": knowledge_layer,
                     **layer_metadata,
@@ -256,6 +260,7 @@ class DomainKnowledgeCandidateService:
                 "validated": False,
                 "candidate_id": candidate_id,
                 "failures": failures,
+                "independent_trajectory_count": independent_trajectories,
                 "knowledge_layer": knowledge_layer,
                 **layer_metadata,
             }
@@ -264,19 +269,22 @@ class DomainKnowledgeCandidateService:
             self.store.update_domain_knowledge_candidate_status(
                 candidate_id,
                 "validated",
-                "passed traceability gate: multiple original sources, no unresolved contradictions, non-low confidence",
+                "passed traceability gate: multiple original sources across at least two independent trajectories, "
+                "no unresolved contradictions, non-low confidence",
             )
         self.store.add_gate_record(
             gate_type="domain_knowledge_candidate_validation",
             subject_type="domain_knowledge_candidate",
             subject_id=candidate_id,
             result="passed",
-            reason="multiple original sources, no unresolved contradictions, non-low confidence",
+            reason="multiple original sources across at least two independent trajectories, no unresolved "
+            "contradictions, non-low confidence",
             evidence_refs=self._candidate_evidence_refs(candidate),
             metadata={
                 "topic": candidate["topic"],
                 "confidence": candidate["confidence"],
                 "evidence_url_count": len(evidence_urls),
+                "independent_trajectory_count": independent_trajectories,
                 "candidate_status": candidate["status"],
                 "knowledge_layer": knowledge_layer,
                 **layer_metadata,
@@ -286,9 +294,59 @@ class DomainKnowledgeCandidateService:
             "validated": True,
             "candidate_id": candidate_id,
             "failures": [],
+            "independent_trajectory_count": independent_trajectories,
             "knowledge_layer": knowledge_layer,
             **layer_metadata,
         }
+
+    def distill_candidates(self, limit: int | None = None) -> dict[str, Any]:
+        """Re-run validation gates for non-deprecated candidates.
+
+        Called by the offline evolution loop after trajectories are verified:
+        a candidate whose claim reappeared in an independent briefing now has
+        merged evidence and can move from ``weak_signal`` toward
+        ``validated_knowledge``.  Promotion to status ``validated`` still
+        requires the explicit :meth:`validate` (or human approval) path; this
+        method only re-records the automatic gate.
+        """
+        candidates = [
+            candidate
+            for candidate in self.store.list_domain_knowledge_candidates()
+            if str(candidate["status"]) != "deprecated"
+        ]
+        if limit is not None:
+            candidates = candidates[:limit]
+        results = [self.record_validation_gate(str(candidate["id"])) for candidate in candidates]
+        layer_counts: dict[str, int] = {}
+        for result in results:
+            layer = str(result["knowledge_layer"])
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+        return {
+            "considered": len(candidates),
+            "layer_counts": layer_counts,
+            "validated": layer_counts.get(KNOWLEDGE_LAYER_VALIDATED, 0),
+            "weak_signal": layer_counts.get(KNOWLEDGE_LAYER_WEAK_SIGNAL, 0),
+            "rejected_noise": layer_counts.get(KNOWLEDGE_LAYER_REJECTED, 0),
+            "details": results,
+        }
+
+    @staticmethod
+    def independent_trajectory_count(candidate: dict[str, Any]) -> int:
+        """Count distinct briefing runs (trajectories) that support a candidate.
+
+        ``capture_briefing`` records the briefing id (``brief_...``) as the
+        first source id; merged candidates accumulate every briefing id that
+        produced the same claim, so this is the cross-trajectory support count
+        used by the validation gate.
+        """
+        source_ids = candidate.get("source_ids") or []
+        return len(
+            {
+                str(source_id)
+                for source_id in source_ids
+                if re.match(r"^brief", str(source_id), flags=re.IGNORECASE)
+            }
+        )
 
     def approve(
         self,
