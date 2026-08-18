@@ -195,7 +195,8 @@ def test_authoritative_source_offsets_marketing_sources(tmp_path):
 
     assert "insufficient_source_authority" not in result["failures"]
     assert "fewer_than_two_independent_sources" not in result["failures"]
-    assert result["effective_source_count"] == 3.0 + 1.0 / 3.0
+    # effective_source_count is rounded to 3 decimals in the gate record.
+    assert abs(result["effective_source_count"] - (3.0 + 1.0 / 3.0)) < 0.001
     # Two distinct domains + two trajectories + enough authority -> validated.
     assert result["validated"] is True
     assert result["failures"] == []
