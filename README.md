@@ -129,8 +129,9 @@ pool when the local network can reach its HTML endpoint. Machines that have
 [Agent Reach](https://github.com/Panniantong/Agent-Reach) installed can also
 set `SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach` to route retrieval through
 `agent-reach doctor --json` and its selected read-only backends, or set
-`SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` to try Agent Reach first inside the
-default `hybrid` provider and then fall back to MCP/browser search. Use
+`SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` to add Agent Reach as a
+supplementary pass after MCP/browser search inside the default `hybrid`
+provider. Use
 `python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"` to make
 that CLI available from the project virtual environment on a fresh checkout.
 Platform capability is deliberately explicit:

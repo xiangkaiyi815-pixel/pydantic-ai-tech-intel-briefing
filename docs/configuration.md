@@ -34,9 +34,9 @@ names and never a secret value.
 | `SEARCH_ASSISTANT_SEARCH_PROVIDER` | `hybrid` | `hybrid`, `agent-reach`, `mcp`, `browser`, `brave`, `searxng`, or `duckduckgo`. Use `agent-reach` only on machines with the Agent Reach CLI installed. |
 | `SEARCH_ASSISTANT_MCP_SEARCH_CONFIG` | checked-in default when unset | MCP server and read-only search bindings. |
 | `MCP_SEARCH_TIMEOUT_SECONDS` | `18` | MCP request timeout. |
-| `SEARCH_ASSISTANT_AGENT_REACH_ENABLED` | `false` | When `true` and the provider is `hybrid`, try Agent Reach first and fall back to MCP/browser search if the local Agent Reach route is unavailable. |
+| `SEARCH_ASSISTANT_AGENT_REACH_ENABLED` | `false` | When `true` and the provider is `hybrid`, run Agent Reach as a **supplementary pass after** MCP/browser search. Agent Reach routes spawn a subprocess per query (mcporter for Exa), so they run last to avoid starving the briefing search budget; MCP/browser results are collected first and Agent Reach adds scoped or Exa results when the budget allows. |
 | `AGENT_REACH_COMMAND` | `agent-reach` | Agent Reach CLI executable or absolute path. |
-| `AGENT_REACH_TIMEOUT_SECONDS` | `30` | Per Agent Reach routed command timeout. |
+| `AGENT_REACH_TIMEOUT_SECONDS` | `30` | Per Agent Reach routed command timeout. For the daily briefing, lower values (10-15) stop a slow route from consuming the shared search budget. |
 | `AGENT_REACH_DOCTOR_CACHE_SECONDS` | `300` | Cache window for `agent-reach doctor --json` results. |
 | `BROWSER_SEARCH_ENGINES` | `bing,baidu,google` | Public engines for browser search; `duckduckgo` can also be included. |
 | `BROWSER_SEARCH_BASE_URL` | `https://cn.bing.com/search` | Bing public-result endpoint. |

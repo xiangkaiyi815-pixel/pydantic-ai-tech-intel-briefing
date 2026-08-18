@@ -517,6 +517,16 @@ class AgentReachSearchClient:
 
     @staticmethod
     def _run_subprocess(command: list[str], timeout_seconds: float) -> str:
+        import shutil
+
+        # Windows: CreateProcess cannot execute npm-style .cmd/.bat shims
+        # directly (mcporter installed via `npm install -g` ships only
+        # mcporter.cmd / mcporter.ps1).  Resolve the command and delegate
+        # script shims to cmd.exe so the subprocess actually runs.
+        if os.name == "nt" and command:
+            resolved = shutil.which(command[0])
+            if resolved and resolved.lower().endswith((".cmd", ".bat")):
+                command = ["cmd.exe", "/c", *command]
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -1853,12 +1863,16 @@ def search_client_from_settings(settings: Settings) -> SearchClient:
     if provider == "mcp":
         return _mcp_search_client_from_settings(settings)
     if provider == "hybrid":
-        clients: list[SearchClient] = []
+        # MCP and browser first; Agent Reach last as a supplementary pass.
+        # Agent Reach routes spawn a subprocess per query (e.g. mcporter for
+        # Exa), so running them first starves the briefing search budget and
+        # the browser engines never get to contribute.
+        clients: list[SearchClient] = [
+            _mcp_search_client_from_settings(settings),
+            _browser_search_client_from_settings(settings),
+        ]
         if settings.agent_reach_enabled:
             clients.append(_agent_reach_search_client_from_settings(settings, require_available=False))
-        clients.extend(
-            [_mcp_search_client_from_settings(settings), _browser_search_client_from_settings(settings)]
-        )
         return CompositeSearchClient(
             clients,
             # Public MCP sources provide structured technical evidence, but a

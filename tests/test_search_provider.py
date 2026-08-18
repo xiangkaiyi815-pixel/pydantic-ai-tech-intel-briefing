@@ -1526,7 +1526,7 @@ def test_search_client_from_settings_allows_agent_reach_provider(tmp_path):
     assert client.doctor_cache_seconds == 22.0
 
 
-def test_search_client_from_settings_can_prepend_agent_reach_to_hybrid(tmp_path):
+def test_search_client_from_settings_appends_agent_reach_to_hybrid(tmp_path):
     settings = Settings.from_env(
         {
             "SEARCH_ASSISTANT_DATA_DIR": str(tmp_path),
@@ -1537,10 +1537,12 @@ def test_search_client_from_settings_can_prepend_agent_reach_to_hybrid(tmp_path)
     client = search_client_from_settings(settings)
 
     assert isinstance(client, CompositeSearchClient)
-    assert isinstance(client.clients[0], AgentReachSearchClient)
-    assert isinstance(client.clients[1], McpSearchClient)
-    assert isinstance(client.clients[2], BrowserSearchClient)
-    assert client.clients[0].require_available is False
+    assert isinstance(client.clients[0], McpSearchClient)
+    assert isinstance(client.clients[1], BrowserSearchClient)
+    # Agent Reach runs last as a supplementary pass so its slower subprocess
+    # routes cannot starve the MCP/browser engines of the search budget.
+    assert isinstance(client.clients[2], AgentReachSearchClient)
+    assert client.clients[2].require_available is False
 
 
 def test_search_client_from_settings_allows_browser_engine_selection(tmp_path):
