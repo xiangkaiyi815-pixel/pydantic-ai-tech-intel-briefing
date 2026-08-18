@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 import uuid
@@ -171,11 +172,30 @@ def main(argv: list[str] | None = None) -> int:
     eval_parser = subparsers.add_parser("eval-suite")
     eval_parser.add_argument("--questions", default=None)
     eval_parser.add_argument("--max-questions", type=_positive_int, default=None)
+    eval_parser.add_argument(
+        "--judge",
+        choices=["rule", "llm"],
+        default="rule",
+        help="Quality-layer judge for answer evaluation: deterministic rule judge (default) or an LLM rubric judge.",
+    )
+    eval_parser.add_argument(
+        "--pool",
+        choices=["mixed", "simple", "research", "hard", "high_stakes"],
+        default=None,
+        help="Use the layered evaluation question pool (default: all 12 questions) or a specific tier. "
+        "mixed samples 2 questions per tier.",
+    )
     _add_data_dir(eval_parser)
 
     eval_replay_parser = subparsers.add_parser("eval-replay")
     eval_replay_parser.add_argument("--report", default=None)
     eval_replay_parser.add_argument("--max-items", type=_positive_int, default=None)
+    eval_replay_parser.add_argument(
+        "--judge",
+        choices=["rule", "llm"],
+        default="rule",
+        help="Quality judge for previous-vs-current answer deltas (default: deterministic rule judge).",
+    )
     _add_data_dir(eval_replay_parser)
 
     evidence_backfill_parser = subparsers.add_parser("evidence-backfill")
@@ -527,6 +547,8 @@ def main(argv: list[str] | None = None) -> int:
             data_dir,
             questions_source=args.questions,
             max_questions=args.max_questions,
+            judge_name=args.judge,
+            pool=args.pool,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -536,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir,
             report_path=Path(args.report) if args.report else None,
             max_items=args.max_items,
+            judge_name=args.judge,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
@@ -888,11 +911,32 @@ def _run_feishu_fixture(store: MemoryStore, path: Path) -> dict[str, Any]:
     return client.reply_text(message.message_id, package.answer_text)
 
 
+def _build_quality_judge(judge_name: str):
+    """Build a quality judge (rule or LLM rubric) for evaluation commands."""
+    from search_assistant.evolution.verification import LLMRubricJudge, RuleQualityJudge
+
+    if judge_name == "rule":
+        return RuleQualityJudge()
+    runtime = runtime_from_settings(Settings.from_env())
+
+    def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
+        return runtime._run_agent_with_max_tokens(
+            instructions,
+            payload,
+            temperature=0.0,
+            max_tokens=1400,
+        )
+
+    return LLMRubricJudge(judge_runner=_llm_judge_runner)
+
+
 def _run_evaluation(
     store: MemoryStore,
     data_dir: Path,
     questions_source: str | None = None,
     max_questions: int | None = None,
+    judge_name: str = "rule",
+    pool: str | None = None,
 ) -> dict[str, Any]:
     settings = Settings.from_env()
     workflow = SearchAssistantWorkflow(
@@ -909,11 +953,55 @@ def _run_evaluation(
         workflow=workflow,
         output_dir=data_dir / "evaluations",
         report_output_dir=data_dir / "reports",
+        judge=_build_quality_judge(judge_name),
     )
     return service.run(
         _load_evaluation_questions(questions_source) if questions_source else None,
         max_questions=max_questions,
+        tier=pool,
     )
+
+
+def _verdict_rank(verdict: str) -> int:
+    """Rank rubric verdicts: pass > uncertain > fail."""
+    return {"pass": 2, "uncertain": 1, "fail": 0}.get(str(verdict).lower(), 1)
+
+
+def _judge_verdicts(judge: Any, question: str, answer: str, source_urls: list[str], unverified: list[str]) -> dict[str, str]:
+    """Run a quality judge over one answer and return per-dimension verdicts."""
+    payload = {
+        "question": question,
+        "classification": "research",
+        "final_answer": answer,
+        "review": {"ran": True, "approved": True, "issues": [], "revision": answer},
+        "unverified_claims": unverified or [],
+    }
+    sources = [{"title": "", "url": url, "snippet": ""} for url in source_urls if str(url).startswith("http")]
+    judged = judge.judge(payload, sources)
+    dimensions = judged.get("dimensions") or {}
+    return {str(dim): str(value.get("verdict", "uncertain")) for dim, value in dimensions.items()}
+
+
+def _answer_body(text: str) -> str:
+    """Strip the appended search-record section before judging an answer."""
+    marker = "\n搜索记录:"
+    if marker in text:
+        return text.split(marker, maxsplit=1)[0].strip()
+    return text.strip()
+
+
+def _mcnemar_p_value(improved: int, regressed: int) -> float:
+    """Two-sided exact McNemar test on the discordant pair (improved, regressed).
+
+    With no discordant pairs the p-value is 1.0; otherwise it is twice the
+    lower tail of the binomial(n, 0.5) distribution, clamped to 1.0.
+    """
+    n = improved + regressed
+    if n == 0:
+        return 1.0
+    k = min(improved, regressed)
+    p = 2.0 * sum(math.comb(n, i) * (0.5**n) for i in range(k + 1))
+    return min(1.0, p)
 
 
 def _run_evaluation_replay(
@@ -921,6 +1009,7 @@ def _run_evaluation_replay(
     data_dir: Path,
     report_path: Path | None = None,
     max_items: int | None = None,
+    judge_name: str = "rule",
 ) -> dict[str, Any]:
     source_path = report_path or data_dir / "evaluations" / "evaluation-report.json"
     if not source_path.exists():
@@ -949,11 +1038,15 @@ def _run_evaluation_replay(
         report_output_dir=data_dir / "reports",
         admin_user_ids=set(settings.admin_user_ids),
     )
+    judge = _build_quality_judge(judge_name)
 
     replay_items: list[dict[str, Any]] = []
     failures = 0
     changed_answers = 0
     changed_source_sets = 0
+    improved_questions = 0
+    regressed_questions = 0
+    stable_questions = 0
     for index, previous in enumerate(selected_items, start=1):
         question = str(previous.get("question") or "").strip()
         if not question:
@@ -999,6 +1092,47 @@ def _run_evaluation_replay(
         source_set_changed = previous_source_urls != current_source_urls
         changed_answers += 1 if answer_changed else 0
         changed_source_sets += 1 if source_set_changed else 0
+
+        # Quality delta: judge the previous and current answers on the same
+        # rubric and compare verdicts per dimension.
+        previous_verdicts = _judge_verdicts(
+            judge,
+            question,
+            _answer_body(previous_answer),
+            previous_source_urls,
+            [str(claim) for claim in previous.get("unverified_claim_samples", [])],
+        )
+        current_verdicts = _judge_verdicts(
+            judge,
+            question,
+            _answer_body(_preview_text(package.answer_text, max_chars=4000)),
+            current_source_urls,
+            [str(claim) for claim in package.unverified_claims],
+        )
+        improved = [
+            dim
+            for dim in current_verdicts
+            if _verdict_rank(current_verdicts[dim]) > _verdict_rank(previous_verdicts.get(dim, "uncertain"))
+        ]
+        regressed = [
+            dim
+            for dim in current_verdicts
+            if _verdict_rank(current_verdicts[dim]) < _verdict_rank(previous_verdicts.get(dim, "uncertain"))
+        ]
+        stable = [dim for dim in current_verdicts if dim not in improved and dim not in regressed]
+        quality_delta = {
+            "improved": improved,
+            "regressed": regressed,
+            "stable": stable,
+            "previous_verdicts": previous_verdicts,
+            "current_verdicts": current_verdicts,
+        }
+        if improved and not regressed:
+            improved_questions += 1
+        elif regressed and not improved:
+            regressed_questions += 1
+        else:
+            stable_questions += 1
         replay_items.append(
             {
                 "index": index,
@@ -1012,14 +1146,24 @@ def _run_evaluation_replay(
                 "current_source_count": len(current_source_urls),
                 "previous_quality_flags": previous.get("quality_flags", []),
                 "current_confidence": package.confidence,
+                "quality_delta": quality_delta,
             }
         )
 
+    p_value = _mcnemar_p_value(improved_questions, regressed_questions)
+    significance = {
+        "improved_questions": improved_questions,
+        "regressed_questions": regressed_questions,
+        "stable_questions": stable_questions,
+        "mcnemar_p_value": round(p_value, 4),
+        "significant": p_value < 0.05,
+    }
     output_dir = data_dir / "evaluations"
     output_dir.mkdir(parents=True, exist_ok=True)
     replay_path = output_dir / "evaluation-replay-report.json"
     result = {
         "ok": failures == 0,
+        "judge": judge_name,
         "source_report_path": str(source_path),
         "replay_report_path": str(replay_path),
         "requested_items": len(selected_items),
@@ -1027,6 +1171,7 @@ def _run_evaluation_replay(
         "failed": failures,
         "answer_changed": changed_answers,
         "source_set_changed": changed_source_sets,
+        "quality_delta_summary": significance,
         "items": replay_items,
     }
     replay_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1042,20 +1187,24 @@ def _run_evaluation_replay(
             "replayed": result["replayed"],
             "answer_changed": result["answer_changed"],
             "source_set_changed": result["source_set_changed"],
+            "quality_delta": significance,
+            "judge": judge_name,
         },
     )
     store.add_project_ledger_entry(
         entry_type="evaluation_replay",
         subject=str(source_path),
         status="completed" if result["ok"] else "failed",
-        summary=f"Replayed {result['replayed']} of {result['requested_items']} evaluation questions.",
+        summary=f"Replayed {result['replayed']} of {result['requested_items']} evaluation questions with the {judge_name} judge.",
         evidence_refs=[gate_id, str(replay_path)],
-        risk="Replay compares deterministic fields and source sets; human review is still needed for semantic quality drift.",
+        risk="Replay quality deltas come from the configured judge; human review is still needed for semantic drift.",
         rollback="Rerun eval-suite and eval-replay in an isolated data directory after fixing failures.",
         metadata={
             "answer_changed": result["answer_changed"],
             "source_set_changed": result["source_set_changed"],
+            "quality_delta": significance,
             "failed": result["failed"],
+            "judge": judge_name,
         },
     )
     return result
