@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 import json
 import sqlite3
 import sys
@@ -202,6 +202,78 @@ def test_authoritative_source_offsets_marketing_sources(tmp_path):
     assert result["failures"] == []
 
 
+def test_rephrased_claim_merges_across_briefings_for_cross_trajectory_gate(tmp_path):
+    """A rephrased claim from a second briefing on the same topic merges into the
+    same candidate, so the cross-trajectory gate can actually fire."""
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    first = _briefing(source_count=2, briefing_id="briefing-1", url_prefix="run-a")
+    second = _briefing(source_count=2, briefing_id="briefing-2", url_prefix="run-b")
+    second.synthesis.themes[0].analysis = (
+        "Industrial AI systems maintain a human approval gate before writing work "
+        "orders into MES production execution."
+    )
+
+    first_id = service.capture_briefing(first)[0]
+    second_id = service.capture_briefing(second)[0]
+
+    assert first_id == second_id
+    candidate = store.get_domain_knowledge_candidate(first_id)
+    assert service.independent_trajectory_count(candidate) == 2
+    result = service.validate(first_id)
+    assert result["validated"] is True
+    assert result["failures"] == []
+
+
+def test_different_topic_claim_does_not_fuzzy_merge(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    first_id = service.capture_briefing(_briefing(source_count=2, briefing_id="briefing-1", url_prefix="a"))[0]
+    second_id = service.capture_briefing(
+        _briefing(topic="vector store latency", source_count=2, briefing_id="briefing-2", url_prefix="b")
+    )[0]
+
+    assert first_id != second_id
+    assert len(store.list_domain_knowledge_candidates()) == 2
+
+
+def test_stale_evidence_blocks_validation(tmp_path):
+    """Evidence older than the staleness window cannot validate."""
+    from datetime import timedelta
+    from search_assistant.contracts import DomainKnowledgeCandidate, DomainKnowledgeEvidence
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = datetime.now(UTC)
+    stale = (now - timedelta(days=60)).isoformat()
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-stale",
+        topic="工业智能体",
+        claim="受控工单编排需要人工审批与回滚。",
+        applies_when="test",
+        evidence=[
+            DomainKnowledgeEvidence(title="旧文档 A", url="https://example.com/old-a", provider="example", retrieved_at=stale),
+            DomainKnowledgeEvidence(title="旧文档 B", url="https://example.org/old-b", provider="example", retrieved_at=stale),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-a", "briefing-b"],
+        fingerprint="stale-fingerprint",
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+    store.add_domain_knowledge_candidate(candidate)
+    service = DomainKnowledgeCandidateService(store)
+
+    result = service.record_validation_gate(candidate.id)
+
+    assert "stale_evidence" in result["failures"]
+    assert result["validated"] is False
+
+
 def test_candidate_list_can_surface_weak_signals_without_promoting_them(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -378,7 +450,12 @@ def test_learning_report_surfaces_trajectory_and_domain_candidate_status(tmp_pat
     assert "graph links: 1" in report
 
 
-def _briefing(source_count: int, briefing_id: str = "briefing-1", url_prefix: str | None = None) -> DailyBriefing:
+def _briefing(
+    topic: str = "industrial AI",
+    source_count: int = 2,
+    briefing_id: str = "briefing-1",
+    url_prefix: str | None = None,
+) -> DailyBriefing:
     prefix = url_prefix or "industrial-ai"
     sources = [
         CollectedSource(
@@ -403,7 +480,7 @@ def _briefing(source_count: int, briefing_id: str = "briefing-1", url_prefix: st
         topic_id="topic-1",
         user_id="user-1",
         chat_id="chat-1",
-        topic="industrial AI",
+        topic=topic,
         run_date=date(2026, 8, 6),
         search_directions=["industrial AI workflow"],
         keywords=["industrial AI"],

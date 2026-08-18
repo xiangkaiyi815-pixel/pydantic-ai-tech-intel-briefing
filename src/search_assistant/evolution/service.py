@@ -71,6 +71,54 @@ _WEAK_SOURCE_WEIGHT = 1.0 / 3.0
 _NEUTRAL_SOURCE_WEIGHT = 1.0
 _MIN_EFFECTIVE_SOURCE_COUNT = 2.0
 
+# How old evidence must be before a candidate can no longer validate.
+_EVIDENCE_STALE_DAYS = 30
+
+# Fuzzy-merge thresholds: a new claim merges into an existing candidate when
+# its normalized topic matches and it shares at least three claim tokens with
+# at least 35% of the smaller token set.  This lets the cross-trajectory gate
+# fire for rephrased claims in a tracked topic pool without merging unrelated
+# claims that merely share topic vocabulary.
+_MIN_SHARED_CLAIM_TOKENS = 3
+_CLAIM_OVERLAP_RATIO = 0.35
+
+
+def _normalize_text(value: str) -> str:
+    """Lowercase and collapse separators so phrasing variants compare fairly."""
+    return re.sub(r"\s+|[,，。；;:：、.!?！？()（）\[\]【】\"']", " ", value).strip().lower()
+
+
+def _topic_similar(left: str, right: str) -> bool:
+    """Topics are similar when normalized equal, one contains the other, or the
+    token overlap is high (>= 0.8 of the smaller set)."""
+    if not left or not right:
+        return False
+    a, b = _normalize_text(left), _normalize_text(right)
+    if a == b or a in b or b in a:
+        return True
+    ta, tb = set(re.findall(r"[a-z0-9]+", a)) | set(re.findall(r"[\u4e00-\u9fff]{2,}", a)), set(
+        re.findall(r"[a-z0-9]+", b)
+    ) | set(re.findall(r"[\u4e00-\u9fff]{2,}", b))
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / max(1, min(len(ta), len(tb))) >= 0.8
+
+
+def _claim_tokens(claim: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", claim.lower())) | set(
+        re.findall(r"[\u4e00-\u9fff]{2,}", claim)
+    )
+
+
+def _claims_similar(left: str, right: str) -> bool:
+    a, b = _claim_tokens(left), _claim_tokens(right)
+    if not a or not b:
+        return False
+    shared = len(a & b)
+    if shared < _MIN_SHARED_CLAIM_TOKENS:
+        return False
+    return shared / max(1, min(len(a), len(b))) >= _CLAIM_OVERLAP_RATIO
+
 
 def source_authority_weight(url: str) -> float:
     """Weight an evidence URL by source authority.
@@ -182,6 +230,12 @@ class DomainKnowledgeCandidateService:
             ]
             now = datetime.now(UTC).isoformat()
             fingerprint = self._fingerprint(briefing.topic, claim)
+            # Fuzzy merge: when a rephrased claim from the same tracked topic
+            # already exists, reuse its fingerprint so the store merge path
+            # accumulates evidence instead of creating a parallel candidate.
+            similar = self._find_similar_candidate(briefing.topic, claim)
+            if similar is not None:
+                fingerprint = str(similar["fingerprint"])
             candidate = DomainKnowledgeCandidate(
                 id=f"knowledge_{uuid.uuid4().hex}",
                 topic=briefing.topic,
@@ -329,6 +383,12 @@ class DomainKnowledgeCandidateService:
         independent_trajectories = self.independent_trajectory_count(candidate)
         if independent_trajectories < 2:
             failures.append("fewer_than_two_independent_trajectories")
+        oldest_evidence = self._oldest_evidence_retrieved_at(candidate)
+        if (
+            oldest_evidence is not None
+            and (datetime.now(UTC) - oldest_evidence).days > _EVIDENCE_STALE_DAYS
+        ):
+            failures.append("stale_evidence")
         if candidate["confidence"] == "low":
             failures.append("low_confidence")
         knowledge_layer = self._knowledge_layer(failures)
@@ -654,6 +714,33 @@ class DomainKnowledgeCandidateService:
     def _fingerprint(topic: str, claim: str) -> str:
         normalized = re.sub(r"\s+", " ", f"{topic.strip().lower()}\n{claim.strip().lower()}")
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _find_similar_candidate(self, topic: str, claim: str) -> dict[str, Any] | None:
+        """Find an existing candidate whose topic matches and whose claim is a
+        rephrasing of ``claim``, so the cross-trajectory gate can fire for
+        repeated tracking of the same topic even when wording shifts."""
+        for candidate in self.store.list_domain_knowledge_candidates():
+            if str(candidate["status"]) == "deprecated":
+                continue
+            if not _topic_similar(topic, str(candidate.get("topic", ""))):
+                continue
+            if _claims_similar(claim, str(candidate.get("claim", ""))):
+                return candidate
+        return None
+
+    @staticmethod
+    def _oldest_evidence_retrieved_at(candidate: dict[str, Any]):
+        """Earliest evidence retrieval timestamp, or None when unparsable."""
+        dates: list[datetime] = []
+        for item in candidate.get("evidence") or []:
+            raw = str(item.get("retrieved_at") or "").strip()
+            if not raw:
+                continue
+            try:
+                dates.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+        return min(dates) if dates else None
 
     @staticmethod
     def _confidence(evidence_count: int) -> str:

@@ -283,3 +283,39 @@ def test_extend_graph_keeps_occurrence_threshold_for_large_briefings():
     briefing.sources = [_source(f"https://example.com/many/{i}", f"Source {i}", "more content") for i in range(12)]
     result = extend_graph_from_briefing(store, briefing)
     assert result["min_occurrences_used"] == 3
+
+
+def test_extend_graph_caps_auto_graph_entities():
+    from search_assistant.contracts import DomainKnowledgeEntity, DomainKnowledgeGraph
+
+    store = _store()
+    entities = [
+        DomainKnowledgeEntity(
+            id=f"cap-e{i}",
+            name=f"term{i:03d}",
+            entity_type="concept",
+            aliases=[],
+            summary=f"term{i:03d}",
+            evidence_refs=["briefing:cap"],
+            metadata={"auto_extracted": True, "occurrences": 10 - (i % 5)},
+        )
+        for i in range(55)
+    ]
+    graph = DomainKnowledgeGraph(
+        id="auto-cap-test",
+        name="cap test",
+        description="cap test graph",
+        overview="cap test",
+        source="auto-extracted",
+        version="1",
+        entities=entities,
+        relations=[],
+    )
+    store.upsert_domain_knowledge_graph(graph)
+
+    result = extend_graph_from_briefing(store, _briefing("cap test"))
+
+    assert result["graph_id"] == "auto-cap-test"
+    merged = store.get_domain_knowledge_graph("auto-cap-test")
+    assert merged is not None
+    assert len(merged.entities) <= 60

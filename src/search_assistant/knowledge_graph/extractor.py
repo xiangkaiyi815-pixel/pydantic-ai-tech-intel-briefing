@@ -114,6 +114,10 @@ _MIN_TERM_LEN = 2
 _MAX_TERM_LEN = 40
 _MIN_OCCURRENCES = 3
 
+# Upper bound for a single auto graph; further merges trim to the strongest
+# entities by occurrence count so retrieval stays focused.
+_MAX_AUTO_GRAPH_ENTITIES = 60
+
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 _MAX_CJK_RUN_LEN = 10
 
@@ -442,6 +446,21 @@ def extend_graph_from_briefing(
             existing_pairs.add((source_id, target_id))
 
     auto_graph.relations.extend(added_relations)
+    # Capacity cap: an auto graph that keeps growing without bound pollutes
+    # retrieval.  Trim to the strongest entities by occurrence count and drop
+    # relations whose endpoints were trimmed away.
+    if len(auto_graph.entities) > _MAX_AUTO_GRAPH_ENTITIES:
+        auto_graph.entities.sort(
+            key=lambda entity: int((entity.metadata or {}).get("occurrences", 0)),
+            reverse=True,
+        )
+        auto_graph.entities = auto_graph.entities[:_MAX_AUTO_GRAPH_ENTITIES]
+        kept_ids = {entity.id for entity in auto_graph.entities}
+        auto_graph.relations = [
+            relation
+            for relation in auto_graph.relations
+            if relation.source_entity_id in kept_ids and relation.target_entity_id in kept_ids
+        ]
     store.upsert_domain_knowledge_graph(auto_graph)
     return {
         "graph_id": auto_graph.id,
