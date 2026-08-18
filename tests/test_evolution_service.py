@@ -239,6 +239,40 @@ def test_different_topic_claim_does_not_fuzzy_merge(tmp_path):
     assert len(store.list_domain_knowledge_candidates()) == 2
 
 
+def test_chinese_rephrased_claim_merges_across_briefings(tmp_path):
+    """Rephrased Chinese claims on the same topic merge via the trigram path."""
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    first = _briefing(topic="工业智能体 MES 工单编排 生产协同", source_count=2, briefing_id="briefing-1", url_prefix="za")
+    first.synthesis.themes[0].analysis = "材料要求工业智能体低延时、高可靠、可审计，应部署为靠近设备侧的受控组件。"
+    second = _briefing(topic="工业智能体 MES 工单编排 生产协同", source_count=2, briefing_id="briefing-2", url_prefix="zb")
+    second.synthesis.themes[0].analysis = "今日头条文章明确工业AI智能体需有低延时、高可靠、可审计特性，并支持边缘推理。"
+
+    first_id = service.capture_briefing(first)[0]
+    second_id = service.capture_briefing(second)[0]
+
+    assert first_id == second_id
+    candidate = store.get_domain_knowledge_candidate(first_id)
+    assert service.independent_trajectory_count(candidate) == 2
+
+
+def test_same_topic_different_claims_do_not_fuzzy_merge(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    first = _briefing(topic="工业智能体 MES 工单编排 生产协同", source_count=2, briefing_id="briefing-1", url_prefix="na")
+    first.synthesis.themes[0].analysis = "材料要求工业智能体低延时、高可靠、可审计，应部署为靠近设备侧的受控组件。"
+    second = _briefing(topic="工业智能体 MES 工单编排 生产协同", source_count=2, briefing_id="briefing-2", url_prefix="nb")
+    second.synthesis.themes[0].analysis = "本批材料明确把 OPC UA / REST API 与语义层统一作为打通 MES 的关键，应先解决数据标准化和语义映射。"
+
+    first_id = service.capture_briefing(first)[0]
+    second_id = service.capture_briefing(second)[0]
+
+    assert first_id != second_id
+    assert len(store.list_domain_knowledge_candidates()) == 2
+
+
 def test_stale_evidence_blocks_validation(tmp_path):
     """Evidence older than the staleness window cannot validate."""
     from datetime import timedelta

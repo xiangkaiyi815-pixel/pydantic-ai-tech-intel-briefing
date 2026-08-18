@@ -75,12 +75,27 @@ _MIN_EFFECTIVE_SOURCE_COUNT = 2.0
 _EVIDENCE_STALE_DAYS = 30
 
 # Fuzzy-merge thresholds: a new claim merges into an existing candidate when
-# its normalized topic matches and it shares at least three claim tokens with
-# at least 35% of the smaller token set.  This lets the cross-trajectory gate
-# fire for rephrased claims in a tracked topic pool without merging unrelated
-# claims that merely share topic vocabulary.
-_MIN_SHARED_CLAIM_TOKENS = 3
-_CLAIM_OVERLAP_RATIO = 0.35
+# its normalized topic matches and it shares at least two claim tokens with at
+# least 20% of the smaller token set.  Claims are long paragraphs; for the
+# tracked-topic-pool usage pattern, same-topic rephrased claims should merge so
+# the cross-trajectory gate can fire.  Chinese claims are split on common
+# connectives so shared phrases ("低延时", "高可靠") actually produce shared
+# tokens instead of whole-run strings.
+_MIN_SHARED_CLAIM_TOKENS = 2
+_CLAIM_OVERLAP_RATIO = 0.2
+_CJK_TRIGRAM_JACCARD_MIN = 0.14
+
+# Connectives and function words used to split CJK runs into phrase tokens.
+_CJK_SEPARATORS = (
+    "而不是", "意味着", "并且", "以及", "通过", "作为", "提出", "认为", "明确",
+    "需要", "要求", "说明", "不能", "可以", "本批", "材料", "主要", "证据",
+    "包括", "部署", "写入", "直接", "以及", "和", "与", "为", "以", "是", "在",
+    "把", "将", "从", "到", "对", "被", "使", "让", "而", "或", "也", "都",
+    "仍", "需", "该", "这", "那", "其", "中", "的", "了",
+)
+_CJK_SEPARATOR_PATTERN = "|".join(
+    re.escape(word) for word in sorted(_CJK_SEPARATORS, key=len, reverse=True)
+)
 
 
 def _normalize_text(value: str) -> str:
@@ -105,19 +120,47 @@ def _topic_similar(left: str, right: str) -> bool:
 
 
 def _claim_tokens(claim: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", claim.lower())) | set(
-        re.findall(r"[\u4e00-\u9fff]{2,}", claim)
-    )
+    """Claim tokens: latin words plus CJK phrases.
+
+    CJK runs are split on common connectives so that "低延时、高可靠、可审计"
+    yields "低延时" / "高可靠" / "可审计" tokens instead of one opaque run.
+    """
+    tokens = set(re.findall(r"[a-z0-9]+", claim.lower()))
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", claim):
+        for piece in re.split(_CJK_SEPARATOR_PATTERN, run):
+            if len(piece) >= 2:
+                tokens.add(piece)
+    return tokens
+
+
+def _cjk_char_sequence(text: str) -> str:
+    return "".join(re.findall(r"[\u4e00-\u9fff]", text.lower()))
+
+
+def _cjk_trigrams(text: str) -> set[str]:
+    seq = _cjk_char_sequence(text)
+    return {seq[index : index + 3] for index in range(len(seq) - 2)}
 
 
 def _claims_similar(left: str, right: str) -> bool:
     a, b = _claim_tokens(left), _claim_tokens(right)
-    if not a or not b:
-        return False
-    shared = len(a & b)
-    if shared < _MIN_SHARED_CLAIM_TOKENS:
-        return False
-    return shared / max(1, min(len(a), len(b))) >= _CLAIM_OVERLAP_RATIO
+    if a and b:
+        shared = len(a & b)
+        ratio = shared / max(1, min(len(a), len(b)))
+        if shared >= _MIN_SHARED_CLAIM_TOKENS and ratio >= _CLAIM_OVERLAP_RATIO:
+            return True
+    # Chinese fallback: whole-run tokenization still fragments rephrased
+    # sentences, so also compare character trigram overlap.  Shared phrases
+    # ("低延时", "高可靠", "可审计") produce shared trigrams; unrelated
+    # same-topic claims share only topic words and stay below the threshold.
+    left_seq, right_seq = _cjk_char_sequence(left), _cjk_char_sequence(right)
+    if len(left_seq) >= 15 and len(right_seq) >= 15:
+        left_grams, right_grams = _cjk_trigrams(left), _cjk_trigrams(right)
+        if left_grams and right_grams:
+            jaccard = len(left_grams & right_grams) / len(left_grams | right_grams)
+            if jaccard >= _CJK_TRIGRAM_JACCARD_MIN:
+                return True
+    return False
 
 
 def source_authority_weight(url: str) -> float:
