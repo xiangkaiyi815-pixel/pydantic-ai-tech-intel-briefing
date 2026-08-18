@@ -268,3 +268,18 @@ def test_extend_graph_with_empty_briefing_returns_noop():
     briefing.synthesis.analysis_judgment = ""
     result = extend_graph_from_briefing(store, briefing)
     assert result["added_entities"] == 0
+
+
+def test_extend_graph_lowers_occurrence_threshold_for_short_briefings():
+    """Fewer than 10 sources drops the occurrence threshold from 3 to 2."""
+    store = _store()
+    result = extend_graph_from_briefing(store, _briefing())
+    assert result["min_occurrences_used"] == 2  # test helper has 2 sources
+
+
+def test_extend_graph_keeps_occurrence_threshold_for_large_briefings():
+    store = _store()
+    briefing = _briefing()
+    briefing.sources = [_source(f"https://example.com/many/{i}", f"Source {i}", "more content") for i in range(12)]
+    result = extend_graph_from_briefing(store, briefing)
+    assert result["min_occurrences_used"] == 3

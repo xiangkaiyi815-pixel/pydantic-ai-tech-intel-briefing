@@ -5,6 +5,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from search_assistant.contracts import (
     DailyBriefing,
@@ -20,6 +21,89 @@ KNOWLEDGE_LAYER_VALIDATED = "validated_knowledge"
 KNOWLEDGE_LAYER_WEAK_SIGNAL = "weak_signal"
 KNOWLEDGE_LAYER_REJECTED = "rejected_noise"
 KNOWLEDGE_LAYER_UNREVIEWED = "unreviewed_candidate"
+
+# Domains whose content is treated as primary technical evidence: papers,
+# source repositories, model hubs, and standards bodies.  One such URL counts
+# as three generic URLs in the authority gate.
+_PRIMARY_SOURCE_DOMAINS = frozenset(
+    {
+        "arxiv.org",
+        "github.com",
+        "gitlab.com",
+        "huggingface.co",
+        "hf-mirror.com",
+        "modelscope.cn",
+        "paperswithcode.com",
+        "openreview.net",
+        "doi.org",
+        "ieee.org",
+        "acm.org",
+        "nature.com",
+        "science.org",
+        "springer.com",
+        "sciencedirect.com",
+        "ncbi.nlm.nih.gov",
+        "pubmed.ncbi.nlm.nih.gov",
+        "arxiv-vanity.com",
+        "pytorch.org",
+        "tensorflow.org",
+        "w3.org",
+        "ietf.org",
+        "oasis-open.org",
+    }
+)
+
+# Marketing-funnel domains that contribute only a third of a generic URL.
+_WEAK_SOURCE_DOMAINS = frozenset(
+    {
+        "mp.weixin.qq.com",
+        "weixin.qq.com",
+        "toutiao.com",
+        "xiaohongshu.com",
+        "xhslink.com",
+        "baijiahao.baidu.com",
+        "sohu.com",
+    }
+)
+
+_PRIMARY_SOURCE_WEIGHT = 3.0
+_WEAK_SOURCE_WEIGHT = 1.0 / 3.0
+_NEUTRAL_SOURCE_WEIGHT = 1.0
+_MIN_EFFECTIVE_SOURCE_COUNT = 2.0
+
+
+def source_authority_weight(url: str) -> float:
+    """Weight an evidence URL by source authority.
+
+    Primary sources (papers, repositories, model hubs) count three times as
+    much as generic URLs; marketing-funnel domains count one third.  Hosts are
+    matched by exact suffix so subdomains (``x.github.io``, ``y.arxiv.org``)
+    inherit the parent's weight.
+    """
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return _NEUTRAL_SOURCE_WEIGHT
+    for suffix in _PRIMARY_SOURCE_DOMAINS:
+        if host == suffix or host.endswith("." + suffix):
+            return _PRIMARY_SOURCE_WEIGHT
+    for suffix in _WEAK_SOURCE_DOMAINS:
+        if host == suffix or host.endswith("." + suffix):
+            return _WEAK_SOURCE_WEIGHT
+    return _NEUTRAL_SOURCE_WEIGHT
+
+
+def evidence_source_domains(evidence_urls: set[str]) -> set[str]:
+    """Distinct netlocs across a candidate's evidence URLs."""
+    domains: set[str] = set()
+    for url in evidence_urls:
+        try:
+            host = urlparse(url).netloc.lower()
+        except ValueError:
+            continue
+        if host:
+            domains.add(host)
+    return domains
 
 
 class EvolutionDiagnosisService:
@@ -224,11 +308,22 @@ class DomainKnowledgeCandidateService:
             for item in candidate["evidence"]
             if str(item.get("url", "")).startswith(("http://", "https://"))
         }
+        source_domains = evidence_source_domains(evidence_urls)
+        effective_source_count = round(
+            sum(source_authority_weight(url) for url in evidence_urls), 3
+        )
         failures: list[str] = []
         if not evidence_urls:
             failures.append("no_original_source")
-        elif len(evidence_urls) < 2:
-            failures.append("fewer_than_two_original_sources")
+        elif len(evidence_urls) < 2 or len(source_domains) < 2:
+            # "Independent" means at least two deduplicated URLs from at least
+            # two distinct domains; two URLs from one domain are one source.
+            failures.append("fewer_than_two_independent_sources")
+        if effective_source_count < _MIN_EFFECTIVE_SOURCE_COUNT:
+            # Authority gate: papers/repositories/model hubs count triple,
+            # marketing-funnel domains count one third, so a marketing-heavy
+            # evidence set fails even when it has enough raw URLs.
+            failures.append("insufficient_source_authority")
         if candidate["contradictions"]:
             failures.append("unresolved_contradictions")
         independent_trajectories = self.independent_trajectory_count(candidate)
@@ -250,6 +345,8 @@ class DomainKnowledgeCandidateService:
                     "topic": candidate["topic"],
                     "confidence": candidate["confidence"],
                     "evidence_url_count": len(evidence_urls),
+                    "source_domain_count": len(source_domains),
+                    "effective_source_count": effective_source_count,
                     "independent_trajectory_count": independent_trajectories,
                     "candidate_status": candidate["status"],
                     "knowledge_layer": knowledge_layer,
@@ -260,6 +357,8 @@ class DomainKnowledgeCandidateService:
                 "validated": False,
                 "candidate_id": candidate_id,
                 "failures": failures,
+                "source_domain_count": len(source_domains),
+                "effective_source_count": effective_source_count,
                 "independent_trajectory_count": independent_trajectories,
                 "knowledge_layer": knowledge_layer,
                 **layer_metadata,
@@ -269,21 +368,23 @@ class DomainKnowledgeCandidateService:
             self.store.update_domain_knowledge_candidate_status(
                 candidate_id,
                 "validated",
-                "passed traceability gate: multiple original sources across at least two independent trajectories, "
-                "no unresolved contradictions, non-low confidence",
+                "passed traceability gate: multiple independent domains with sufficient source authority "
+                "across at least two independent trajectories, no unresolved contradictions, non-low confidence",
             )
         self.store.add_gate_record(
             gate_type="domain_knowledge_candidate_validation",
             subject_type="domain_knowledge_candidate",
             subject_id=candidate_id,
             result="passed",
-            reason="multiple original sources across at least two independent trajectories, no unresolved "
-            "contradictions, non-low confidence",
+            reason="multiple independent domains with sufficient source authority across at least two "
+            "independent trajectories, no unresolved contradictions, non-low confidence",
             evidence_refs=self._candidate_evidence_refs(candidate),
             metadata={
                 "topic": candidate["topic"],
                 "confidence": candidate["confidence"],
                 "evidence_url_count": len(evidence_urls),
+                "source_domain_count": len(source_domains),
+                "effective_source_count": effective_source_count,
                 "independent_trajectory_count": independent_trajectories,
                 "candidate_status": candidate["status"],
                 "knowledge_layer": knowledge_layer,
@@ -294,6 +395,8 @@ class DomainKnowledgeCandidateService:
             "validated": True,
             "candidate_id": candidate_id,
             "failures": [],
+            "source_domain_count": len(source_domains),
+            "effective_source_count": effective_source_count,
             "independent_trajectory_count": independent_trajectories,
             "knowledge_layer": knowledge_layer,
             **layer_metadata,

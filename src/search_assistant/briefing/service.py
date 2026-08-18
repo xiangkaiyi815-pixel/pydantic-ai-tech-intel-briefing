@@ -20,7 +20,12 @@ from search_assistant.contracts import (
     SourceCandidate,
     TopicSubscription,
 )
-from search_assistant.evolution.service import DomainKnowledgeCandidateService
+from search_assistant.evolution.service import (
+    DomainKnowledgeCandidateService,
+    _PRIMARY_SOURCE_WEIGHT,
+    _WEAK_SOURCE_WEIGHT,
+    source_authority_weight,
+)
 from search_assistant.knowledge_graph.embedding import (
     EmbeddingProvider,
     build_embedding_provider,
@@ -593,6 +598,52 @@ _SOURCE_EVIDENCE_PHRASES = (
     "开源",
 )
 
+# Tighter phrases used only to classify which collected sources are primary
+# evidence for the model-source quota (papers, repositories, model hubs,
+# benchmarks, official docs).  The broad phrase list above stays for relevance.
+_PRIMARY_EVIDENCE_PHRASES = (
+    "paper",
+    "论文",
+    "arxiv",
+    "github",
+    "repository",
+    "repo",
+    "源码",
+    "开源",
+    "benchmark",
+    "基准",
+    "dataset",
+    "数据集",
+    "white paper",
+    "白皮书",
+    "official documentation",
+    "官方文档",
+    "release notes",
+    "model card",
+    "模型卡",
+    "technical report",
+    "技术报告",
+)
+
+
+def _is_primary_evidence_source(source: CollectedSource) -> bool:
+    """A source counts as primary evidence when its domain is authoritative
+    (papers, repositories, model hubs) or its title/snippet carries primary
+    evidence phrases such as paper/repository/benchmark/official docs."""
+    if source_authority_weight(source.url) >= _PRIMARY_SOURCE_WEIGHT:
+        return True
+    text = f"{source.title} {source.snippet}".lower()
+    return any(phrase in text for phrase in _PRIMARY_EVIDENCE_PHRASES)
+
+
+def _is_weak_evidence_source(source: CollectedSource) -> bool:
+    """A source is weak when it comes from a marketing-funnel domain or its
+    text carries strong marketing phrases (广告, 免费领取, 加微信, ...)."""
+    if source_authority_weight(source.url) <= _WEAK_SOURCE_WEIGHT:
+        return True
+    text = f"{source.title} {source.snippet}".lower()
+    return any(phrase in text for phrase in _MARKETING_STRONG_PHRASES)
+
 
 _GENERIC_REFERENCE_DOMAINS = {
     "amap.com",
@@ -954,9 +1005,10 @@ class DailyBriefingService:
             )
 
             phase_started = time.monotonic()
+            model_sources = self._select_model_sources(ranked_sources, self.model_max_sources)
             synthesis = self._synthesize(
                 subscription.topic,
-                ranked_sources[: self.model_max_sources],
+                model_sources,
                 search_plan,
                 fallback_sources=ranked_sources,
                 briefing_intent=briefing_intent,
@@ -971,7 +1023,10 @@ class DailyBriefingService:
                     "topic": subscription.topic,
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
-                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
+                    "model_source_count": len(model_sources),
+                    "primary_model_source_count": sum(
+                        1 for source in model_sources if _is_primary_evidence_source(source)
+                    ),
                     "theme_count": len(synthesis.themes),
                     "used_runtime": self.runtime is not None,
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
@@ -983,7 +1038,10 @@ class DailyBriefingService:
                 "synthesized",
                 payload={
                     "theme_count": len(synthesis.themes),
-                    "model_source_count": min(len(ranked_sources), self.model_max_sources),
+                    "model_source_count": len(model_sources),
+                    "primary_model_source_count": sum(
+                        1 for source in model_sources if _is_primary_evidence_source(source)
+                    ),
                     "used_runtime": self.runtime is not None,
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
@@ -2038,6 +2096,45 @@ class DailyBriefingService:
 
     def _search_with_trace(self, query: str) -> SearchOutcome:
         return search_with_provider_events(self.search_client, query, limit=self.results_per_query)
+
+    def _select_model_sources(
+        self,
+        ranked_sources: list[CollectedSource],
+        limit: int,
+    ) -> list[CollectedSource]:
+        """Choose up to ``limit`` sources for the synthesis model with a
+        primary-evidence quota.
+
+        Primary sources (papers, repositories, model hubs, benchmarks, official
+        docs) are taken first, then neutral sources, then at most a quarter of
+        the limit (capped at two) marketing-funnel sources.  A batch made only
+        of weak sources still fills the limit so the report can name the
+        evidence limitation instead of synthesizing from nothing.
+        """
+        if limit <= 0 or not ranked_sources:
+            return []
+        primary = [source for source in ranked_sources if _is_primary_evidence_source(source)]
+        weak = [
+            source
+            for source in ranked_sources
+            if not _is_primary_evidence_source(source) and _is_weak_evidence_source(source)
+        ]
+        neutral = [
+            source
+            for source in ranked_sources
+            if not _is_primary_evidence_source(source) and not _is_weak_evidence_source(source)
+        ]
+        selected: list[CollectedSource] = primary[:limit]
+        selected.extend(neutral[: limit - len(selected)])
+        if weak:
+            # Cap marketing-funnel sources unless the batch has nothing else;
+            # an all-weak batch still fills the limit so the report can name
+            # the evidence limitation instead of synthesizing from nothing.
+            weak_cap = limit if not (primary or neutral) else min(2, max(1, limit // 4))
+            selected.extend(weak[: min(weak_cap, limit - len(selected))])
+        if not selected and weak:
+            selected = weak[:limit]
+        return selected
 
     def _synthesize(
         self,

@@ -230,7 +230,8 @@ def _briefing(briefing_id: str, url_prefix: str) -> DailyBriefing:
             topic_id="topic-1",
             user_id="user-1",
             title=f"Industrial AI source {index}",
-            url=f"https://example.com/{url_prefix}/{index}",
+            # Alternate host so multi-source briefings span at least two domains.
+            url=f"https://{'example.org' if index % 2 == 0 else 'example.com'}/{url_prefix}/{index}",
             snippet="A source-backed workflow with review gates.",
             platform="web",
             provider=f"provider-{index}",

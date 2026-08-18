@@ -354,6 +354,18 @@ def _auto_graph_slug(value: str) -> str:
     return slug or "misc"
 
 
+def _effective_min_occurrences(briefing: DailyBriefing, min_occurrences: int) -> int:
+    """Lower the occurrence threshold for short briefings.
+
+    A daily briefing with fewer than 10 collected sources rarely repeats a term
+    in 3 different fields, so extraction would come back empty.  Such briefings
+    use a threshold of 2 instead of the configured default.
+    """
+    if len(briefing.sources) < 10 and min_occurrences >= 3:
+        return 2
+    return min_occurrences
+
+
 def extend_graph_from_briefing(
     store: MemoryStore,
     briefing: DailyBriefing,
@@ -370,7 +382,7 @@ def extend_graph_from_briefing(
     by name / entity pair.  Auto entities carry ``metadata.auto_extracted=True``
     and are meant to be reviewed before being treated as trusted knowledge.
     """
-    entities = extract_entities(briefing, min_occurrences=min_occurrences)
+    entities = extract_entities(briefing, min_occurrences=_effective_min_occurrences(briefing, min_occurrences))
     if not entities:
         return {"graph_id": None, "added_entities": 0, "added_relations": 0, "total_entities": 0}
 
@@ -395,6 +407,7 @@ def extend_graph_from_briefing(
             "added_entities": len(entities),
             "added_relations": len(relations),
             "total_entities": len(entities),
+            "min_occurrences_used": _effective_min_occurrences(briefing, min_occurrences),
         }
 
     # Merge into this topic's existing auto graph, deduplicating by name
@@ -435,4 +448,5 @@ def extend_graph_from_briefing(
         "added_entities": len(added_entities),
         "added_relations": len(added_relations),
         "total_entities": len(auto_graph.entities),
+        "min_occurrences_used": _effective_min_occurrences(briefing, min_occurrences),
     }

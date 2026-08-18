@@ -92,7 +92,8 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
 
     assert result["validated"] is False
     assert result["failures"] == [
-        "fewer_than_two_original_sources",
+        "fewer_than_two_independent_sources",
+        "insufficient_source_authority",
         "fewer_than_two_independent_trajectories",
         "low_confidence",
     ]
@@ -101,6 +102,8 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert len(gates) == 1
     assert gates[0]["result"] == "failed"
     assert gates[0]["metadata"]["evidence_url_count"] == 1
+    assert gates[0]["metadata"]["source_domain_count"] == 1
+    assert gates[0]["metadata"]["effective_source_count"] == 1.0
     assert gates[0]["metadata"]["independent_trajectory_count"] == 1
     assert gates[0]["metadata"]["knowledge_layer"] == "weak_signal"
     assert "exploratory clue" in gates[0]["metadata"]["intended_use"]
@@ -122,6 +125,80 @@ def test_multi_source_single_trajectory_stays_weak_signal(tmp_path):
     weak_signals = service.list_candidates(layer="weak_signal")
     assert [candidate["id"] for candidate in weak_signals] == [candidate_id]
     assert "independent corroborating sources" in weak_signals[0]["knowledge_layer_next_action"]
+
+
+def test_marketing_heavy_candidate_fails_authority_and_domain_gates(tmp_path):
+    """Two marketing-funnel URLs are neither two domains nor enough authority."""
+    from search_assistant.contracts import DomainKnowledgeCandidate, DomainKnowledgeEvidence
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = "2026-08-17T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-marketing",
+        topic="工业智能体",
+        claim="该智能体方案已被广泛采用。",
+        applies_when="test",
+        evidence=[
+            DomainKnowledgeEvidence(title="推广文 A", url="https://mp.weixin.qq.com/a", provider="wechat", retrieved_at=now),
+            DomainKnowledgeEvidence(title="推广文 B", url="https://mp.weixin.qq.com/b", provider="wechat", retrieved_at=now),
+            DomainKnowledgeEvidence(title="推广文 C", url="https://toutiao.com/c", provider="toutiao", retrieved_at=now),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-a", "briefing-b"],
+        fingerprint="marketing-heavy-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+    service = DomainKnowledgeCandidateService(store)
+
+    result = service.record_validation_gate(candidate.id)
+
+    # 3 marketing URLs: 2 domains (weixin/toutiao) but effective count 1.0 < 2.
+    assert result["validated"] is False
+    assert "insufficient_source_authority" in result["failures"]
+    assert result["effective_source_count"] == 1.0
+    assert result["source_domain_count"] == 2
+
+
+def test_authoritative_source_offsets_marketing_sources(tmp_path):
+    """One paper + one marketing URL passes the authority gate (3 + 1/3 >= 2)."""
+    from search_assistant.contracts import DomainKnowledgeCandidate, DomainKnowledgeEvidence
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    now = "2026-08-17T00:00:00Z"
+    candidate = DomainKnowledgeCandidate(
+        id="knowledge-authority-mix",
+        topic="工业智能体",
+        claim="受控工单编排需要人工审批与回滚。",
+        applies_when="test",
+        evidence=[
+            DomainKnowledgeEvidence(title="arXiv 论文", url="https://arxiv.org/abs/2508.0001", provider="arxiv", retrieved_at=now),
+            DomainKnowledgeEvidence(title="推广文", url="https://mp.weixin.qq.com/x", provider="wechat", retrieved_at=now),
+        ],
+        contradictions=[],
+        confidence="medium",
+        status="candidate",
+        source_ids=["briefing-a", "briefing-b"],
+        fingerprint="authority-mix-fingerprint",
+        created_at=now,
+        updated_at=now,
+    )
+    store.add_domain_knowledge_candidate(candidate)
+    service = DomainKnowledgeCandidateService(store)
+
+    result = service.record_validation_gate(candidate.id)
+
+    assert "insufficient_source_authority" not in result["failures"]
+    assert "fewer_than_two_independent_sources" not in result["failures"]
+    assert result["effective_source_count"] == 3.0 + 1.0 / 3.0
+    # Two distinct domains + two trajectories + enough authority -> validated.
+    assert result["validated"] is True
+    assert result["failures"] == []
 
 
 def test_candidate_list_can_surface_weak_signals_without_promoting_them(tmp_path):
@@ -308,7 +385,8 @@ def _briefing(source_count: int, briefing_id: str = "briefing-1", url_prefix: st
             topic_id="topic-1",
             user_id="user-1",
             title=f"Industrial AI source {index}",
-            url=f"https://example.com/{prefix}/{index}",
+            # Alternate host so multi-source briefings span at least two domains.
+            url=f"https://{'example.org' if index % 2 == 0 else 'example.com'}/{prefix}/{index}",
             snippet="A source-backed workflow with review gates.",
             platform="web",
             provider=f"provider-{index}",

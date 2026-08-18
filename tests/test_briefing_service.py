@@ -634,7 +634,7 @@ def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(t
             ),
             DomainKnowledgeEvidence(
                 title="Agent harness replay evaluation",
-                url="https://example.com/agent-harness-evals",
+                url="https://example.org/agent-harness-evals",
                 provider="example",
                 retrieved_at=now,
             ),
