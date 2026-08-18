@@ -36,7 +36,7 @@ DIMENSIONS: tuple[str, ...] = (
 )
 VETO_DIMENSIONS: tuple[str, ...] = ("fact_grounding", "citation_fidelity")
 
-_URL_PATTERN = re.compile(r"https?://[^\s)\]}>\"']+")
+_URL_PATTERN = re.compile(r"https?://[^\s)\]}>\"'，。；;、]+")
 
 
 class QualityJudge(Protocol):
@@ -531,3 +531,62 @@ def calibrate_quality_judge(
             "fail_recall": round(true_positives / expected_fails, 3) if expected_fails else None,
         }
     return report
+
+
+# A small expert-labeled calibration set for quality judges.  The labels are
+# chosen so a well-behaved judge (rule or LLM) should agree on most of them;
+# run `evolution-judge-calibrate` to measure agreement before trusting an LLM
+# judge's output in the offline loop.
+DEFAULT_CALIBRATION_EXAMPLES: tuple[tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]], ...] = (
+    (
+        {
+            "question": "分布式大模型是否可以理解为多个相对独立的节点分别负责一部分推理工作？",
+            "classification": "hard",
+            "final_answer": (
+                "可以，分布式推理把模型拆分到多个节点协同工作，节点之间通过互联通信。"
+                "但缺少模型参数证据时只能给出条件性估算。参见 https://example.com/distributed。"
+            ),
+            "review": {"ran": True, "approved": True, "issues": [], "revision": "same"},
+            "unverified_claims": ["缺少官方模型参数，部署规模只能条件性估算"],
+        },
+        [{"title": "分布式推理", "url": "https://example.com/distributed", "snippet": "节点协同"}],
+        {
+            "fact_grounding": "pass",
+            "citation_fidelity": "pass",
+            "commitment_action_consistency": "pass",
+            "expression_quality": "pass",
+        },
+    ),
+    (
+        {
+            "question": "2026 年世界模型进展如何？",
+            "classification": "research",
+            "final_answer": "我已阻断本轮生成，因为搜索证据不足。",
+            "review": {"ran": True, "approved": False, "issues": ["evidence gap"], "revision": "same"},
+            "unverified_claims": ["世界模型公开基准缺失，无法横向比较"],
+        },
+        [{"title": "世界模型", "url": "https://example.com/world-model", "snippet": "research demo"}],
+        {
+            "fact_grounding": "pass",
+            "citation_fidelity": "pass",
+            "commitment_action_consistency": "fail",
+            "expression_quality": "fail",
+        },
+    ),
+    (
+        {
+            "question": "什么是 CXL？",
+            "classification": "research",
+            "final_answer": "CXL 与 AI 服务器、内存池化的关系：CXL 是缓存一致性互连协议。它允许内存池化与设备共享。",
+            "review": {"ran": True, "approved": True, "issues": [], "revision": "same"},
+            "unverified_claims": [],
+        },
+        [],
+        {
+            "fact_grounding": "uncertain",
+            "citation_fidelity": "pass",
+            "commitment_action_consistency": "pass",
+            "expression_quality": "pass",
+        },
+    ),
+)

@@ -1821,7 +1821,8 @@ class FakeSearchClient:
 def search_with_provider_events(client: SearchClient, query: str, limit: int = 5) -> SearchOutcome:
     traced_search = getattr(client, "search_with_events", None)
     if callable(traced_search):
-        return traced_search(query, limit=limit)
+        outcome = traced_search(query, limit=limit)
+        return _screen_injection(outcome, client, query)
 
     provider = _client_provider_name(client)
     started = time.monotonic()
@@ -1840,18 +1841,49 @@ def search_with_provider_events(client: SearchClient, query: str, limit: int = 5
                 )
             ],
         )
-    return SearchOutcome(
-        results=results,
-        provider_events=[
-            _provider_event(
-                provider=provider,
-                query=query,
-                status="success" if results else "empty",
-                result_count=len(results),
-                elapsed_ms=_elapsed_ms(started),
-            )
-        ],
+    return _screen_injection(
+        SearchOutcome(
+            results=results,
+            provider_events=[
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if results else "empty",
+                    result_count=len(results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            ],
+        ),
+        client,
+        query,
     )
+
+
+def _screen_injection(outcome: SearchOutcome, client: SearchClient, query: str) -> SearchOutcome:
+    """Drop retrieved sources that carry prompt-injection patterns.
+
+    Screened content is untrusted data, not instructions; matched sources are
+    removed from what reaches the LLM context while a provider event keeps the
+    audit trail.  Applies to every retrieval path (traced and plain).
+    """
+    if not outcome.results:
+        return outcome
+    from search_assistant.search.injection import strip_injected_sources
+
+    clean, flagged = strip_injected_sources(outcome.results)
+    if not flagged:
+        return outcome
+    provider_events = list(outcome.provider_events)
+    provider_events.append(
+        _provider_event(
+            provider=_client_provider_name(client),
+            query=query,
+            status="filtered",
+            result_count=len(flagged),
+            reason="prompt_injection",
+        )
+    )
+    return SearchOutcome(results=clean, provider_events=provider_events)
 
 
 def search_client_from_settings(settings: Settings) -> SearchClient:

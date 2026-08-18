@@ -126,7 +126,37 @@ python -m search_assistant.cli feishu-fixture tests/fixtures/feishu_message_even
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Primary OpenAI-compatible embedding endpoint. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name. |
 
-If `OPENAI_API_KEY` is empty, the provider falls back to `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` so a DeepSeek-compatible or third-party OpenAI-compatible endpoint can be reused. If no key is available, semantic matching is disabled and the graph uses literal matching only.
+If `OPENAI_API_KEY` is empty, the provider falls back to the resolved
+`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` from `Settings` (this includes
+`.env.local` values), and only as a last resort to process environment
+variables. If no key is available, semantic matching is disabled and the graph
+uses literal matching only.
+
+**DeepSeek's API has no embedding endpoint.** To actually enable semantic
+matching, point the three `OPENAI_*` variables at an OpenAI-compatible embedding
+service:
+
+```ini
+# Zhipu GLM (same vendor as the chat model)
+OPENAI_API_KEY=<GLM_API_KEY>
+OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+OPENAI_EMBEDDING_MODEL=embedding-3
+
+# Alibaba DashScope
+OPENAI_API_KEY=<DashScope key>
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_EMBEDDING_MODEL=text-embedding-v4
+
+# SiliconFlow (open models, e.g. BGE)
+OPENAI_API_KEY=<SiliconFlow key>
+OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+OPENAI_EMBEDDING_MODEL=BAAI/bge-m3
+```
+
+After switching the embedding model, clear the `entity_embeddings` cache table
+so stale vectors from the previous model are not reused. Run
+`python -m search_assistant.cli knowledge-graph-query "<query>" --domain <id>` to
+confirm semantic hits appear.
 
 ## MCP Configuration
 

@@ -116,6 +116,41 @@ def test_build_embedding_provider_prefers_openai_over_deepseek(monkeypatch):
     assert isinstance(provider, OpenAIEmbeddingProvider)
 
 
+class _FakeSettings:
+    """Minimal Settings-like object; os.environ is left empty by the test."""
+
+    def __init__(self, **values):
+        for key, value in values.items():
+            setattr(self, key, value)
+
+
+def test_embedding_provider_from_settings_uses_resolved_deepseek_credentials(monkeypatch):
+    """A DeepSeek key that lives only in Settings (like .env.local) must be used."""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = _FakeSettings(
+        embedding_enabled=True,
+        openai_api_key=None,
+        openai_base_url=None,
+        deepseek_api_key="sk-from-settings",
+        deepseek_base_url="https://api.deepseek.com/v1",
+    )
+    from search_assistant.knowledge_graph.embedding import embedding_provider_from_settings
+
+    provider = embedding_provider_from_settings(settings)
+    assert isinstance(provider, OpenAIEmbeddingProvider)
+    assert provider._client.api_key == "sk-from-settings"
+
+
+def test_embedding_provider_from_settings_returns_null_without_any_credentials(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = _FakeSettings(embedding_enabled=True)
+    from search_assistant.knowledge_graph.embedding import embedding_provider_from_settings
+
+    assert isinstance(embedding_provider_from_settings(settings), NullEmbeddingProvider)
+
+
 def test_service_uses_semantic_match_for_english_query_and_chinese_entity(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()

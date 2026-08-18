@@ -15,6 +15,7 @@ ProviderEventStatus = Literal[
     "error",
     "timeout",
     "skipped",
+    "filtered",
     "fallback_used",
 ]
 SourceCandidateStatus = Literal[

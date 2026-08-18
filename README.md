@@ -163,6 +163,9 @@ python -m search_assistant.cli topic-add "industrial AI"
 python -m search_assistant.cli brief-feedback "industrial AI" "focus on controlled MES agents" --url "https://example.com/case"
 python -m search_assistant.cli brief-run "industrial AI"
 python -m search_assistant.cli brief-loop "industrial AI" --interval-seconds 86400
+# Track a fixed topic pool so cross-trajectory knowledge candidates accumulate:
+python -m search_assistant.cli brief-loop "工业智能体" --topics "GraphRAG,医学影像" --max-runs 6 --interval-seconds 86400
+python -m search_assistant.cli evolution-judge-calibrate --judge rule
 python -m search_assistant.cli knowledge-graph-seed
 python -m search_assistant.cli knowledge-graph-query "MES 工单 写回" --domain industrial-ai
 python -m search_assistant.cli knowledge-graph-export agent-engineering

@@ -133,14 +133,25 @@ def embedding_provider_from_settings(settings: object) -> EmbeddingProvider:
     already hold a ``Settings`` instance: it reads the resolved values (which
     include the ``DEEPSEEK_*`` fallbacks applied by ``Settings.from_env``)
     instead of relying on raw ``os.environ``, which does not contain
-    ``.env.local`` entries.
+    ``.env.local`` entries.  The explicit ``OPENAI_*`` settings win; otherwise
+    the resolved DeepSeek credentials from ``Settings`` are used (``.env.local``
+    values are loaded into ``Settings``, not into ``os.environ``), and only as a
+    last resort does the function fall back to the process environment.
     """
     enabled = bool(getattr(settings, "embedding_enabled", True))
     if not enabled:
         return NullEmbeddingProvider()
-    api_key = getattr(settings, "openai_api_key", None) or os.getenv("DEEPSEEK_API_KEY")
+    api_key = (
+        getattr(settings, "openai_api_key", None)
+        or getattr(settings, "deepseek_api_key", None)
+        or os.getenv("DEEPSEEK_API_KEY")
+    )
     if not api_key:
         return NullEmbeddingProvider()
-    base_url = getattr(settings, "openai_base_url", None) or os.getenv("DEEPSEEK_BASE_URL")
+    base_url = (
+        getattr(settings, "openai_base_url", None)
+        or getattr(settings, "deepseek_base_url", None)
+        or os.getenv("DEEPSEEK_BASE_URL")
+    )
     model = getattr(settings, "openai_embedding_model", None) or "text-embedding-3-small"
     return OpenAIEmbeddingProvider(api_key=api_key, base_url=base_url, model=model)

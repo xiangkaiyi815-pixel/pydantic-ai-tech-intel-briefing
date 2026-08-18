@@ -87,6 +87,17 @@ def main(argv: list[str] | None = None) -> int:
     briefing_loop_parser.add_argument("--chat-id", default="local-cli")
     briefing_loop_parser.add_argument("--interval-seconds", type=float, default=86400.0)
     briefing_loop_parser.add_argument("--max-runs", type=int, default=None)
+    briefing_loop_parser.add_argument(
+        "--topics",
+        default=None,
+        help="Comma-separated topic pool to rotate each run, e.g. '工业智能体,GraphRAG,医学影像'. "
+        "Repeated tracking of a fixed pool lets cross-trajectory knowledge candidates accumulate.",
+    )
+    briefing_loop_parser.add_argument(
+        "--topics-file",
+        default=None,
+        help="Path to a UTF-8 file with one topic per line; rotates together with --topics.",
+    )
     _add_data_dir(briefing_loop_parser)
 
     feedback_parser = subparsers.add_parser("brief-feedback")
@@ -144,6 +155,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Only verify the newest N trajectories that do not yet have an evaluation.",
     )
     _add_data_dir(offline_evolution_parser)
+
+    judge_calibration_parser = subparsers.add_parser(
+        "evolution-judge-calibrate",
+        help="Measure a quality judge's agreement against the expert-labeled calibration set.",
+    )
+    judge_calibration_parser.add_argument(
+        "--judge",
+        choices=["rule", "llm"],
+        default="rule",
+        help="Quality judge to calibrate: deterministic rule judge (default) or the LLM rubric judge.",
+    )
+    _add_data_dir(judge_calibration_parser)
 
     eval_parser = subparsers.add_parser("eval-suite")
     eval_parser.add_argument("--questions", default=None)
@@ -400,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
             args.chat_id,
             args.interval_seconds,
             args.max_runs,
+            topics=args.topics,
+            topics_file=args.topics_file,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -492,6 +517,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
+    if args.command == "evolution-judge-calibrate":
+        result = _run_judge_calibration(store, data_dir, judge_name=args.judge)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "eval-suite":
         result = _run_evaluation(
             store,
@@ -740,6 +769,28 @@ def _run_briefing(store: MemoryStore, topic: str, user_id: str, chat_id: str):
     return briefing, path, artifact_path
 
 
+def _topic_pool(primary: str, topics: str | None, topics_file: str | None) -> list[str]:
+    """Resolve the briefing-loop topic pool.
+
+    ``primary`` is always kept; ``--topics`` adds comma-separated topics and
+    ``--topics-file`` adds one topic per line.  Duplicates are removed while
+    preserving order.
+    """
+    pool: list[str] = [primary]
+    if topics:
+        pool.extend(part.strip() for part in topics.split(",") if part.strip())
+    if topics_file:
+        path = Path(topics_file)
+        pool.extend(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    seen: set[str] = set()
+    unique: list[str] = []
+    for topic in pool:
+        if topic not in seen:
+            seen.add(topic)
+            unique.append(topic)
+    return unique
+
+
 def _run_briefing_loop(
     store: MemoryStore,
     topic: str,
@@ -747,9 +798,13 @@ def _run_briefing_loop(
     chat_id: str,
     interval_seconds: float,
     max_runs: int | None,
+    topics: str | None = None,
+    topics_file: str | None = None,
 ) -> dict[str, object]:
+    pool = _topic_pool(topic, topics, topics_file)
     metadata: dict[str, object] = {
         "topic": topic,
+        "topic_pool": pool,
         "user_id": user_id,
         "chat_id": chat_id,
         "interval_seconds": interval_seconds,
@@ -760,9 +815,11 @@ def _run_briefing_loop(
     runs = 0
     try:
         while max_runs is None or runs < max_runs:
-            briefing, path, artifact_path = _run_briefing(store, topic, user_id, chat_id)
+            current_topic = pool[runs % len(pool)]
+            briefing, path, artifact_path = _run_briefing(store, current_topic, user_id, chat_id)
             results.append(
                 {
+                    "topic": current_topic,
                     "path": str(path),
                     "artifact_path": str(artifact_path),
                     "sources": len(briefing.sources),
@@ -778,7 +835,7 @@ def _run_briefing_loop(
     finally:
         metadata["runs"] = runs
         store.update_runtime_session_status(session_id, "completed", metadata)
-    return {"runtime_session_id": session_id, "runs": runs, "results": results}
+    return {"runtime_session_id": session_id, "runs": runs, "topic_pool": pool, "results": results}
 
 
 def _safe_filename(value: str) -> str:
@@ -1483,6 +1540,55 @@ def _run_offline_evolution(
         judge = LLMRubricJudge(judge_runner=_llm_judge_runner)
     loop = OfflineEvolutionLoop(store, data_dir=data_dir, judge=judge)
     return loop.run(max_trajectories=max_trajectories)
+
+
+def _run_judge_calibration(
+    store: MemoryStore,
+    data_dir: Path,
+    judge_name: str = "rule",
+) -> dict[str, Any]:
+    """Measure the quality judge against the expert-labeled calibration set."""
+    from search_assistant.evolution.verification import (
+        DEFAULT_CALIBRATION_EXAMPLES,
+        LLMRubricJudge,
+        RuleQualityJudge,
+        calibrate_quality_judge,
+    )
+
+    judge = RuleQualityJudge()
+    if judge_name == "llm":
+        runtime = runtime_from_settings(Settings.from_env())
+
+        def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
+            return runtime._run_agent_with_max_tokens(
+                instructions,
+                payload,
+                temperature=0.0,
+                max_tokens=1400,
+            )
+
+        judge = LLMRubricJudge(judge_runner=_llm_judge_runner)
+    report = calibrate_quality_judge(judge, DEFAULT_CALIBRATION_EXAMPLES)
+    result = {
+        "judge": judge_name,
+        "calibration_examples": len(DEFAULT_CALIBRATION_EXAMPLES),
+        "dimensions": report,
+        "report_path": str(data_dir / "evolution" / "judge-calibration.json"),
+    }
+    output_path = data_dir / "evolution"
+    output_path.mkdir(parents=True, exist_ok=True)
+    report_file = output_path / "judge-calibration.json"
+    report_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    store.add_gate_record(
+        gate_type="evolution_judge_calibration",
+        subject_type="quality_judge",
+        subject_id=judge_name,
+        result="passed",
+        reason=f"calibrated {judge_name} judge against {len(DEFAULT_CALIBRATION_EXAMPLES)} expert-labeled examples",
+        evidence_refs=[str(report_file)],
+        metadata={"judge": judge_name, "dimensions": report},
+    )
+    return result
 
 
 def run_long_connection(data_dir: Path | None = None) -> None:
