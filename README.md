@@ -81,6 +81,13 @@ python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
 agent-reach doctor --json
 ```
 
+`doctor --json` shows which channels are ready. General web queries need an
+Exa MCP backend (`mcporter`), GitHub needs `gh`, YouTube needs `yt-dlp` with a
+JS runtime; Bilibili, V2EX and RSS work out of the box. Unconfigured channels
+return empty and the hybrid provider falls back to MCP/browser search. Full
+per-channel setup and the enable/disable recommendation are in
+[docs/configuration.md#optional-agent-reach-install](docs/configuration.md#optional-agent-reach-install).
+
 Set a model provider and its credentials only in `.env.local`, your shell, or
 your deployment secret manager. Never commit a populated `.env.local` file.
 See [docs/configuration.md](docs/configuration.md) for variable definitions and

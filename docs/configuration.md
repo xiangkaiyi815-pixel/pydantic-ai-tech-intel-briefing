@@ -65,10 +65,32 @@ service without activating the virtual environment, set `AGENT_REACH_COMMAND`
 to the absolute path of that environment's `agent-reach` executable in local
 or deployment-only configuration.
 
-The Python extra installs the Agent Reach CLI and its Python dependencies. Some
-platform backends still require external tools, browser login state, cookies,
-or API configuration; use the `agent-reach doctor --json` output and the
-upstream Agent Reach install guide before enabling those routes with
+The Python extra installs the Agent Reach CLI and its Python dependencies.
+**Most platform backends still require external tools or API configuration**;
+`agent-reach doctor --json` lists which channels are ready (`status: ok`),
+missing a backend (`warn`), or entirely unavailable (`off`). Channel
+availability is checked at runtime, so an unconfigured route returns empty
+results instead of raising; the hybrid provider then falls back to MCP/browser
+search. Per-channel requirements:
+
+| Channel | Backend | Install / configure |
+| --- | --- | --- |
+| **General web (exa_search)** | mcporter + Exa MCP | `npm install -g mcporter`, then `mcporter config add exa https://mcp.exa.ai/mcp` and set the Exa API key. Without this, plain (non-`site:`) web queries have **no** Agent Reach route and stay empty. |
+| GitHub | gh CLI | Install from <https://cli.github.com>; the channel activates once `gh` is on `PATH`. |
+| YouTube | yt-dlp | `yt-dlp` must be installed; add `--js-runtimes node` to `~/.config/yt-dlp/config` (Node.js is usually already present). |
+| Bilibili | built-in public API | Zero-config; the search API is reached via `curl` with browser headers. |
+| V2EX / RSS | built-in | Zero-config public endpoints / feedparser. |
+| X / Reddit / Xiaohongshu / WeChat / LinkedIn / Facebook / Instagram | twitter-cli, rdt-cli, OpenCLI, ... | Require installing the CLI **and** a browser login state / cookies. This project deliberately does not automate logged-in accounts, so these channels are left `off` unless the operator enables them explicitly. |
+
+Recommended enable path for the daily briefing:
+
+1. Run `agent-reach doctor --json` and confirm at least `bilibili` and `v2ex`/`rss` show `ok`, and `exa_search` shows `ok` after installing mcporter.
+2. Keep `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` with the `hybrid` provider so Agent Reach is tried first and MCP/browser search remains the fallback.
+3. If no general-web backend will be installed, set `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=false` to avoid the empty-route calls (each unresolved query is recorded as `AgentReachSearchClient:empty` in the provider trace).
+
+The project treats Agent Reach as a read-only capability layer: it never passes
+login state and never performs writes on behalf of the user. See the upstream
+Agent Reach install guide before enabling channels with
 `agent-reach install --system`.
 
 ## Daily Briefing Settings
