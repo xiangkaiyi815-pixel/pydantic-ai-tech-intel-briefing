@@ -137,7 +137,8 @@ def test_offline_loop_distills_two_trajectory_candidates(tmp_path):
     assert report["distillation"]["validated"] == 1
     assert report["distillation"]["weak_signal"] == 0
     candidates = store.list_domain_knowledge_candidates()
-    assert candidates[0]["status"] == "candidate"
+    # Distillation now promotes a candidate that passes every gate.
+    assert candidates[0]["status"] == "validated"
     assert service.list_candidates(layer="validated_knowledge")[0]["id"] == candidates[0]["id"]
 
 

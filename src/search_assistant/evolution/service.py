@@ -511,9 +511,11 @@ class DomainKnowledgeCandidateService:
         Called by the offline evolution loop after trajectories are verified:
         a candidate whose claim reappeared in an independent briefing now has
         merged evidence and can move from ``weak_signal`` toward
-        ``validated_knowledge``.  Promotion to status ``validated`` still
-        requires the explicit :meth:`validate` (or human approval) path; this
-        method only re-records the automatic gate.
+        ``validated_knowledge``.  Candidates that pass every gate are promoted
+        to status ``validated`` automatically (same promotion path as
+        :meth:`validate`); candidates that fail stay reviewable candidates and
+        keep their gate failure record.  Deprecated candidates are never
+        promoted.
         """
         candidates = [
             candidate
@@ -522,7 +524,15 @@ class DomainKnowledgeCandidateService:
         ]
         if limit is not None:
             candidates = candidates[:limit]
-        results = [self.record_validation_gate(str(candidate["id"])) for candidate in candidates]
+        results = []
+        for candidate in candidates:
+            if str(candidate["status"]) == "validated":
+                results.append(self.record_validation_gate(str(candidate["id"])))
+            else:
+                # Promote through the full validate() path so a candidate that
+                # now satisfies every gate flips to status "validated" instead
+                # of only recording a passing gate record.
+                results.append(self.validate(str(candidate["id"])))
         layer_counts: dict[str, int] = {}
         for result in results:
             layer = str(result["knowledge_layer"])

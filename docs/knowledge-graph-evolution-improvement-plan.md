@@ -241,9 +241,9 @@
 - ✅ 验证门新增 `fewer_than_two_independent_trajectories`：至少 2 条独立轨迹 + 至少 2 个原始来源才能进入 `validated_knowledge` 层；单轨迹多来源候选停留在 `weak_signal`
 - ✅ `distill_candidates()`：离线循环内重跑非废弃候选的验证门
 
-#### 5.4 发布/回滚/灰度自动化 ⚠️ 监控部分完成（发布仍人工把关）
+#### 5.4 发布/回滚/灰度自动化 ⚠️ 监控完成（发布仍人工把关）
 
-**实施结果**：离线循环增加发布监控（读取最新 eval 报告，存在阻断项则报告失败）与回滚监控（发现已 validated 但独立轨迹数 < 2 的候选，仅列出建议、不自动废弃）。自动发布与自动回滚按项目"先成为 reviewable candidate"的设计原则不实现；发布仍须 `knowledge-candidate-approve`（要求 eval 门通过），回滚仍走 `knowledge-candidate-deprecate`。
+**实施结果**：离线循环增加发布监控（读取最新 eval 报告，存在阻断项则报告失败）与回滚监控（发现已 validated 但独立轨迹数 < 2 的候选，仅列出建议、不自动废弃）。**候选提升已自动化**：`distill_candidates()` 对通过全部验证门（≥2 独立轨迹、≥2 独立域、权威度达标、无矛盾、非低置信、非陈旧）的候选自动提升为 `validated_knowledge`（与 `validate()` 同一提升路径）；未达标的候选保持 `candidate` 并保留失败门记录。自动发布仍不启用——`validated_knowledge` 进入正式知识上下文前仍须 `knowledge-candidate-approve`（要求 eval 门通过）；回滚仍走 `knowledge-candidate-deprecate`。
 
 ---
 
