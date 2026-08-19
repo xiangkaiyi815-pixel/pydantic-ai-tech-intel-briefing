@@ -185,6 +185,8 @@ python -m search_assistant.cli skill-library-list
 python -m search_assistant.cli skill-library-archive <slug> --reason "superseded"
 python -m search_assistant.cli skill-learning-loop --bad-case <question_id> --fix "retry review parse failures"
 python -m search_assistant.cli knowledge-candidate-list --layer weak_signal
+python -m search_assistant.cli knowledge-candidate-list --status pending_user_confirm
+python -m search_assistant.cli knowledge-candidate-confirm <candidate_id> --reviewer <name>
 ```
 
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
@@ -229,6 +231,16 @@ Knowledge candidates are layered by the latest validation gate metadata:
 keeps single-source or low-confidence clues for follow-up search, and
 `rejected_noise` is retained only as an audit trail. This prevents weak but
 useful leads from being deleted while keeping them out of trusted knowledge.
+
+Candidates that pass every gate (≥1 briefing trajectory, ≥2 independent
+domains, sufficient source authority, technical-not-marketing content,
+non-low confidence) are promoted to `pending_user_confirm` by automatic
+distillation — they only become `validated` after a user confirms them in
+chat ("确认知识候选：<id>") or via `knowledge-candidate-confirm`. Marketing and
+vague claims are rejected by the semantic quality gate instead of being
+promoted. Topic strings that are rephrased across briefings ("AI Agent
+Harness 上下文工程" vs "上下文工程") merge through an embedding similarity
+fallback when an embedding endpoint is configured.
 
 ## Development And Verification
 

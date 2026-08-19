@@ -94,7 +94,6 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert result["failures"] == [
         "fewer_than_two_independent_sources",
         "insufficient_source_authority",
-        "fewer_than_two_independent_trajectories",
         "low_confidence",
     ]
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "candidate"
@@ -110,21 +109,25 @@ def test_candidate_validation_keeps_single_source_claim_in_candidate_state(tmp_p
     assert result["knowledge_layer"] == "weak_signal"
 
 
-def test_multi_source_single_trajectory_stays_weak_signal(tmp_path):
-    """Two sources inside one briefing are not enough: independent trajectories are required."""
+def test_multi_source_single_trajectory_reaches_pending_but_not_validated(tmp_path):
+    """With the trajectory gate relaxed to one briefing, a well-sourced claim
+    passes every gate and distillation moves it to pending_user_confirm; it is
+    not marked validated until a user confirms it."""
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     service = DomainKnowledgeCandidateService(store)
     candidate_id = service.capture_briefing(_briefing(source_count=2))[0]
 
-    result = service.record_validation_gate(candidate_id)
+    gate = service.record_validation_gate(candidate_id)
+    assert gate["validated"] is True
+    assert "fewer_than_two_independent_trajectories" not in gate["failures"]
+    assert gate["knowledge_layer"] == "validated_knowledge"
 
-    assert result["validated"] is False
-    assert result["failures"] == ["fewer_than_two_independent_trajectories"]
-    assert result["knowledge_layer"] == "weak_signal"
-    weak_signals = service.list_candidates(layer="weak_signal")
-    assert [candidate["id"] for candidate in weak_signals] == [candidate_id]
-    assert "independent corroborating sources" in weak_signals[0]["knowledge_layer_next_action"]
+    distill = service.distill_candidates()
+    candidate = store.get_domain_knowledge_candidate(candidate_id)
+    assert candidate["status"] == "pending_user_confirm"
+    assert distill["validated"] == 0  # not released without user confirmation
+    assert distill["weak_signal"] == 0
 
 
 def test_marketing_heavy_candidate_fails_authority_and_domain_gates(tmp_path):

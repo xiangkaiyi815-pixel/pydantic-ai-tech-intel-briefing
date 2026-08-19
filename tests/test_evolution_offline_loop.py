@@ -137,12 +137,28 @@ def test_offline_loop_distills_two_trajectory_candidates(tmp_path):
     assert report["distillation"]["validated"] == 1
     assert report["distillation"]["weak_signal"] == 0
     candidates = store.list_domain_knowledge_candidates()
-    # Distillation now promotes a candidate that passes every gate.
-    assert candidates[0]["status"] == "validated"
+    # Distillation promotes a passing candidate to pending_user_confirm;
+    # it becomes validated only after explicit user confirmation.
+    assert candidates[0]["status"] == "pending_user_confirm"
     assert service.list_candidates(layer="validated_knowledge")[0]["id"] == candidates[0]["id"]
 
 
-def test_offline_loop_single_trajectory_stays_weak_signal(tmp_path):
+def test_offline_loop_pending_candidate_is_confirmed_to_validated(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    service = DomainKnowledgeCandidateService(store)
+    candidate_id = service.capture_briefing(_briefing("briefing-1", "run-1"))[0]
+    OfflineEvolutionLoop(store, data_dir=tmp_path).run()
+    assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "pending_user_confirm"
+
+    confirmed = service.confirm_candidate(candidate_id, reviewer="user-1")
+    assert confirmed["confirmed"] is True
+    assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "validated"
+    assert store.list_project_ledger_entries(entry_type="knowledge_release")
+    assert store.list_gate_records(gate_type="domain_knowledge_candidate_human_review")
+
+
+def test_offline_loop_single_trajectory_well_sourced_reaches_pending(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     service = DomainKnowledgeCandidateService(store)
@@ -150,8 +166,9 @@ def test_offline_loop_single_trajectory_stays_weak_signal(tmp_path):
 
     report = OfflineEvolutionLoop(store, data_dir=tmp_path).run()
 
-    assert report["distillation"]["weak_signal"] == 1
-    assert report["distillation"]["validated"] == 0
+    assert report["distillation"]["weak_signal"] == 0
+    assert report["distillation"]["validated"] == 1
+    assert store.list_domain_knowledge_candidates()[0]["status"] == "pending_user_confirm"
 
 
 def test_offline_loop_release_monitor_reflects_eval_report(tmp_path):

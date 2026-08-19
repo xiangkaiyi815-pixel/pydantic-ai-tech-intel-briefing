@@ -1350,7 +1350,7 @@ class DailyBriefingService:
                     ]
                 ),
             }
-            if layer == "validated_knowledge" or str(candidate.get("status")) == "validated":
+            if str(candidate.get("status")) == "validated":
                 validated_candidates.append(item)
             elif layer == "weak_signal":
                 weak_signals.append(item)

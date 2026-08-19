@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import time
+from typing import Any
 
 from search_assistant.contracts import AnswerPackage, Classification, IncomingMessage, SearchRecord, SourceEvidence
 from search_assistant.memory.store import MemoryStore
@@ -64,6 +65,12 @@ class SearchAssistantWorkflow:
             return self._answer_skill_list_command(message, question_id)
         if self._is_skill_generation_request(message.text):
             return self._answer_skill_generation_command(message, question_id)
+        if self._is_candidate_confirm_request(message.text):
+            if not self._can_manage_skills(message):
+                return self._answer_skill_permission_denied(message, question_id)
+            return self._answer_candidate_confirm_command(message, question_id)
+        if self._is_candidate_pending_list_request(message.text):
+            return self._answer_candidate_pending_list_command(message, question_id)
         if self._is_evolution_request(message.text):
             return self._answer_evolution_command(message, question_id)
         if self._is_learning_report_request(message.text):
@@ -1997,6 +2004,170 @@ class SearchAssistantWorkflow:
             "转成",
         )
         return any(signal in lowered or signal in text for signal in action_signals)
+
+    def _is_candidate_confirm_request(self, text: str) -> bool:
+        """User confirms a pending knowledge candidate for release."""
+        lowered = text.lower().strip()
+        if self._is_candidate_pending_list_request(text):
+            return False
+        if lowered.startswith(("candidate-confirm", "/candidate-confirm", "confirm candidate", "confirm knowledge")):
+            return True
+        confirm_signals = ("确认知识", "同意入库", "确认入库", "通过候选", "确认沉淀", "确认候选")
+        if not any(signal in text for signal in confirm_signals):
+            return False
+        # A bare "确认候选" without an id is ambiguous; treat it as a prompt to
+        # list pending candidates instead of a confirm command.
+        return bool(self._candidate_confirm_target(text))
+
+    def _is_candidate_pending_list_request(self, text: str) -> bool:
+        """User asks to list candidates waiting for confirmation."""
+        lowered = text.lower().strip()
+        if lowered.startswith(("candidate-pending", "/candidate-pending", "pending candidates", "list pending")):
+            return True
+        list_signals = ("待确认知识", "待确认候选", "待入库候选", "待审批候选", "查看待确认")
+        return any(signal in text for signal in list_signals)
+
+    def _candidate_confirm_target(self, text: str) -> str:
+        """Extract the candidate id from a confirm request."""
+        patterns = (
+            r"(?:candidate-confirm|/candidate-confirm|confirm\s+(?:candidate|knowledge))\s*[:：]?\s*(.+)$",
+            r"(?:确认知识候选|确认知识|同意入库|确认入库|通过候选|确认沉淀|确认候选)\s*[:：]?\s*(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            target = match.group(1).strip()
+            # "确认知识候选：<id>" -> "候选：<id>": strip the trailing noun and
+            # its colon only when the noun is followed by a separator; never
+            # strip characters out of the id itself.
+            target = re.sub(r"^(候选|知识|candidate|knowledge)\s*[:：]\s*", "", target, flags=re.IGNORECASE)
+            if target and not target.lower().startswith(("list", "待确认")):
+                return target
+        return ""
+
+    def _answer_candidate_confirm_command(self, message: IncomingMessage, question_id: str) -> AnswerPackage:
+        """Confirm one pending knowledge candidate: pending -> validated."""
+        from search_assistant.evolution.service import DomainKnowledgeCandidateService
+
+        audit = SearchAudit(
+            executed=False,
+            queries=[],
+            sources=[],
+            engines=self._search_engine_names(),
+            skipped_reason="candidate confirm command does not trigger web search",
+        )
+        target = self._candidate_confirm_target(message.text)
+        service = DomainKnowledgeCandidateService(self.store)
+        confirmed: dict[str, Any] | None = None
+        error: str | None = None
+        if not target:
+            error = "没有识别到要确认的知识候选 id。可先发送“查看待确认候选”获取列表。"
+        else:
+            try:
+                confirmed = service.confirm_candidate(target, reviewer=message.user_id, reason="user confirmed in chat")
+            except (KeyError, ValueError) as exc:
+                error = str(exc)
+
+        if confirmed is not None and confirmed.get("already_validated"):
+            final_answer = f"知识候选 {target} 已经处于已确认（validated）状态，无需重复确认。"
+        elif confirmed is not None:
+            final_answer = (
+                f"已确认知识候选 {target}（{confirmed.get('topic', '')}）入库为 validated_knowledge。"
+                "它将作为规划上下文使用，不视为当前事实来源；引用前仍须打开原始来源核实。"
+            )
+        else:
+            final_answer = f"未能确认知识候选：{error or '未知错误'}"
+        package = AnswerPackage(
+            question_id=question_id,
+            answer_text=self._append_search_record(final_answer, audit),
+            classification="simple",
+            confidence="high" if confirmed else "low",
+            verified_claims=[],
+            unverified_claims=[] if confirmed else [error or "candidate confirmation failed"],
+            sources=[],
+            calibration=None,
+            review={
+                "ran": False,
+                "approved": bool(confirmed),
+                "issues": [] if confirmed else [error or "candidate confirmation failed"],
+                "revision": final_answer,
+                "reason": "user confirmed knowledge candidate release from chat",
+            },
+            memory_updates=[],
+            search_record=self._search_record_from_audit(audit),
+        )
+        self.store.record_answer(package)
+        self.store.add_experience_item(
+            title="User confirmed knowledge candidate",
+            body=(
+                f"user_request={message.text}\n"
+                f"target={target or ''}\n"
+                f"confirmed={bool(confirmed)}\n"
+                f"error={error or ''}\n"
+                "future_rule=Only user-confirmed knowledge candidates enter validated planning context."
+            ),
+            source_ids=[package.question_id],
+            user_id=message.user_id,
+            chat_id=message.chat_id,
+        )
+        return package
+
+    def _answer_candidate_pending_list_command(self, message: IncomingMessage, question_id: str) -> AnswerPackage:
+        """List candidates waiting for user confirmation."""
+        from search_assistant.evolution.service import DomainKnowledgeCandidateService
+
+        audit = SearchAudit(
+            executed=False,
+            queries=[],
+            sources=[],
+            engines=self._search_engine_names(),
+            skipped_reason="candidate pending list command does not trigger web search",
+        )
+        service = DomainKnowledgeCandidateService(self.store)
+        pending = [
+            candidate
+            for candidate in service.list_candidates(status="pending_user_confirm")
+            if str(candidate.get("status")) == "pending_user_confirm"
+        ]
+        if not pending:
+            final_answer = "当前没有等待确认的知识候选。"
+        else:
+            lines = ["以下知识候选已通过自动验证门，等待你确认入库：", ""]
+            for item in pending:
+                lines.append(
+                    f"- id: {item['id']} | 主题: {item['topic']} | 置信: {item.get('confidence')} | "
+                    f"证据: {item.get('evidence_url_count', 0)} 个来源"
+                )
+            lines.extend(
+                [
+                    "",
+                    "回复“确认知识候选：<id>”即可将其入库为 validated_knowledge；",
+                    "若内容有问题，可回复“废弃知识候选：<id>”。",
+                ]
+            )
+            final_answer = "\n".join(lines)
+        package = AnswerPackage(
+            question_id=question_id,
+            answer_text=self._append_search_record(final_answer, audit),
+            classification="simple",
+            confidence="high",
+            verified_claims=[],
+            unverified_claims=[],
+            sources=[],
+            calibration=None,
+            review={
+                "ran": False,
+                "approved": True,
+                "issues": [],
+                "revision": final_answer,
+                "reason": "user requested pending knowledge candidate list",
+            },
+            memory_updates=[],
+            search_record=self._search_record_from_audit(audit),
+        )
+        self.store.record_answer(package)
+        return package
 
     def _skill_promote_target(self, text: str) -> str:
         patterns = (

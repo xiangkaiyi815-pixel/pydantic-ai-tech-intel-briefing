@@ -238,12 +238,14 @@
 
 **现状**：
 - ✅ `capture_briefing` 改用 `store.upsert_domain_knowledge_candidate`：同指纹候选按 URL 合并 evidence、合并 source_ids/contradictions、置信度只升不降，并记录 merge 事件（原来 `INSERT OR IGNORE` 会静默丢弃第二次出现的证据）
-- ✅ 验证门新增 `fewer_than_two_independent_trajectories`：至少 2 条独立轨迹 + 至少 2 个原始来源才能进入 `validated_knowledge` 层；单轨迹多来源候选停留在 `weak_signal`
-- ✅ `distill_candidates()`：离线循环内重跑非废弃候选的验证门
+- ✅ **验证门门槛调整为 ≥1 条轨迹**（`_MIN_INDEPENDENT_TRAJECTORIES = 1`）：单条轨迹 + 双独立域 + 权威度达标 + 非低置信即可通过自动门
+- ✅ **语义质量门**（`evolution/semantics.py`）：LLM 主判（注入式 `llm_runner`，与 judge 同一约定）+ 规则回退，区分 technical / marketing / news / vague；营销话术与模糊空话判为 `marketing_or_vague_content` 失败 → `rejected_noise`，即使轨迹门槛放宽也不会升级
+- ✅ **用户确认门**：`distill_candidates()` 通过全部验证门的候选进入 `pending_user_confirm` 状态（不再自动 `validated`）；用户在聊天中发送"查看待确认候选"查看、"确认知识候选：<id>"确认后才置为 `validated`（写 human_review gate + knowledge_release ledger）。`validate()`/`approve()` 人工命令路径保持直接提升不变
+- ✅ **topic 语义合并**：`_find_similar_candidate` 的字面 `_topic_similar` 之外增加 embedding 语义通道（`_topic_semantically_similar`，cosine ≥ 0.75），"AI Agent Harness 上下文工程 工具调用可靠性" 与 "上下文工程" 这类措辞漂移可合并；embedding 不可用/熔断时自动回退字面匹配
 
 #### 5.4 发布/回滚/灰度自动化 ⚠️ 监控完成（发布仍人工把关）
 
-**实施结果**：离线循环增加发布监控（读取最新 eval 报告，存在阻断项则报告失败）与回滚监控（发现已 validated 但独立轨迹数 < 2 的候选，仅列出建议、不自动废弃）。**候选提升已自动化**：`distill_candidates()` 对通过全部验证门（≥2 独立轨迹、≥2 独立域、权威度达标、无矛盾、非低置信、非陈旧）的候选自动提升为 `validated_knowledge`（与 `validate()` 同一提升路径）；未达标的候选保持 `candidate` 并保留失败门记录。自动发布仍不启用——`validated_knowledge` 进入正式知识上下文前仍须 `knowledge-candidate-approve`（要求 eval 门通过）；回滚仍走 `knowledge-candidate-deprecate`。
+**实施结果**：离线循环增加发布监控（读取最新 eval 报告，存在阻断项则报告失败）与回滚监控（发现已 validated 但独立轨迹数 < 1 的候选，仅列出建议、不自动废弃）。**候选提升已自动化但入库需用户确认**：`distill_candidates()` 对通过全部验证门（≥1 独立轨迹、≥2 独立域、权威度达标、无矛盾、非低置信、非陈旧、非营销/模糊内容）的候选置为 `pending_user_confirm`，用户在聊天确认后才成为 `validated_knowledge`。自动发布仍不启用——`validated_knowledge` 进入正式知识上下文前须用户确认；回滚仍走 `knowledge-candidate-deprecate`。
 
 ---
 

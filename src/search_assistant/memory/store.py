@@ -228,7 +228,7 @@ class MemoryStore:
                     evidence_json TEXT NOT NULL,
                     contradictions_json TEXT NOT NULL,
                     confidence TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('candidate', 'validated', 'deprecated')),
+                    status TEXT NOT NULL CHECK(status IN ('candidate', 'validated', 'deprecated', 'pending_user_confirm')),
                     source_ids_json TEXT NOT NULL,
                     fingerprint TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
@@ -571,6 +571,48 @@ class MemoryStore:
             self._ensure_column(connection, "topic_subscriptions", "source_recipe_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(connection, "provider_trace_events", "tier", "TEXT")
             self._ensure_column(connection, "provider_trace_events", "budget_share", "REAL")
+            self._migrate_candidate_status_constraint(connection)
+
+    @staticmethod
+    def _migrate_candidate_status_constraint(connection: sqlite3.Connection) -> None:
+        """Rebuild domain_knowledge_candidates when its status CHECK constraint
+        predates ``pending_user_confirm`` (older schemas only allowed
+        candidate/validated/deprecated).  Data is preserved."""
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='domain_knowledge_candidates'"
+        ).fetchone()
+        if sql is None or "pending_user_confirm" in str(sql[0]):
+            return
+        connection.execute("ALTER TABLE domain_knowledge_candidates RENAME TO domain_knowledge_candidates_old")
+        connection.execute(
+            """
+            CREATE TABLE domain_knowledge_candidates (
+                id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                claim TEXT NOT NULL,
+                applies_when TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                contradictions_json TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('candidate', 'validated', 'deprecated', 'pending_user_confirm')),
+                source_ids_json TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO domain_knowledge_candidates
+                (id, topic, claim, applies_when, evidence_json, contradictions_json,
+                 confidence, status, source_ids_json, fingerprint, created_at, updated_at)
+            SELECT id, topic, claim, applies_when, evidence_json, contradictions_json,
+                   confidence, status, source_ids_json, fingerprint, created_at, updated_at
+            FROM domain_knowledge_candidates_old
+            """
+        )
+        connection.execute("DROP TABLE domain_knowledge_candidates_old")
 
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -943,7 +985,8 @@ class MemoryStore:
         reason: str,
     ) -> None:
         allowed_transitions = {
-            "candidate": {"validated", "deprecated"},
+            "candidate": {"validated", "deprecated", "pending_user_confirm"},
+            "pending_user_confirm": {"validated", "deprecated"},
             "validated": {"deprecated"},
             "deprecated": set(),
         }

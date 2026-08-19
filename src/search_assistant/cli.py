@@ -220,7 +220,11 @@ def main(argv: list[str] | None = None) -> int:
     _add_data_dir(kg_export_parser)
 
     candidate_list_parser = subparsers.add_parser("knowledge-candidate-list")
-    candidate_list_parser.add_argument("--status", choices=["candidate", "validated", "deprecated"], default=None)
+    candidate_list_parser.add_argument(
+        "--status",
+        choices=["candidate", "validated", "deprecated", "pending_user_confirm"],
+        default=None,
+    )
     candidate_list_parser.add_argument(
         "--layer",
         choices=[
@@ -236,6 +240,15 @@ def main(argv: list[str] | None = None) -> int:
     candidate_validate_parser = subparsers.add_parser("knowledge-candidate-validate")
     candidate_validate_parser.add_argument("candidate_id")
     _add_data_dir(candidate_validate_parser)
+
+    candidate_confirm_parser = subparsers.add_parser(
+        "knowledge-candidate-confirm",
+        help="Promote a pending_user_confirm candidate to validated after explicit user confirmation.",
+    )
+    candidate_confirm_parser.add_argument("candidate_id")
+    candidate_confirm_parser.add_argument("--reviewer", default="local-user")
+    candidate_confirm_parser.add_argument("--reason", default="user confirmed after review")
+    _add_data_dir(candidate_confirm_parser)
 
     candidate_approve_parser = subparsers.add_parser("knowledge-candidate-approve")
     candidate_approve_parser.add_argument("candidate_id")
@@ -632,6 +645,14 @@ def main(argv: list[str] | None = None) -> int:
         result = _candidate_service(store).validate(args.candidate_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["validated"] else 1
+    if args.command == "knowledge-candidate-confirm":
+        result = _candidate_service(store).confirm_candidate(
+            args.candidate_id,
+            reviewer=args.reviewer,
+            reason=args.reason,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("confirmed") else 1
     if args.command == "knowledge-candidate-approve":
         result = _candidate_service(store).approve(
             args.candidate_id,
@@ -791,7 +812,24 @@ def _candidate_service(store: MemoryStore) -> DomainKnowledgeCandidateService:
     return DomainKnowledgeCandidateService(
         store,
         embedding_provider=embedding_provider_from_settings(settings),
+        llm_runner=_build_semantic_llm_runner(),
     )
+
+
+def _build_semantic_llm_runner():
+    """LLM runner for semantic candidate classification, mirroring the judge
+    runner convention so it can be mocked in tests."""
+    runtime = runtime_from_settings(Settings.from_env())
+
+    def runner(instructions: str, payload: dict[str, Any]) -> str:
+        return runtime._run_agent_with_max_tokens(
+            instructions,
+            payload,
+            temperature=0.0,
+            max_tokens=400,
+        )
+
+    return runner
 
 
 def _graph_service(store: MemoryStore) -> DomainKnowledgeGraphService:

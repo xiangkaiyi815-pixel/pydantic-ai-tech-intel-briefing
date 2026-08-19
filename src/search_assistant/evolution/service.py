@@ -4,7 +4,7 @@ import hashlib
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from search_assistant.contracts import (
@@ -12,6 +12,7 @@ from search_assistant.contracts import (
     DomainKnowledgeCandidate,
     DomainKnowledgeEvidence,
 )
+from search_assistant.evolution.semantics import SemanticVerdict, classify_semantic_quality, is_noise_verdict
 from search_assistant.knowledge_graph.embedding import EmbeddingProvider, build_embedding_provider
 from search_assistant.knowledge_graph.service import DomainKnowledgeGraphService
 from search_assistant.memory.store import MemoryStore
@@ -70,6 +71,14 @@ _PRIMARY_SOURCE_WEIGHT = 3.0
 _WEAK_SOURCE_WEIGHT = 1.0 / 3.0
 _NEUTRAL_SOURCE_WEIGHT = 1.0
 _MIN_EFFECTIVE_SOURCE_COUNT = 2.0
+
+# Minimum number of distinct briefing trajectories that must support a
+# candidate.  Lowered to 1: with semantic quality gating and user-confirmed
+# promotion in place, a single well-sourced briefing is enough to become a
+# reviewable candidate; the marketing/vague-content gate and the
+# pending-user-confirm step provide the noise control that a second
+# trajectory used to provide.
+_MIN_INDEPENDENT_TRAJECTORIES = 1
 
 # How old evidence must be before a candidate can no longer validate.
 _EVIDENCE_STALE_DAYS = 30
@@ -242,12 +251,16 @@ class DomainKnowledgeCandidateService:
         store: MemoryStore,
         graph_service: DomainKnowledgeGraphService | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        llm_runner: Callable[[str, dict[str, Any]], str] | None = None,
     ):
         self.store = store
         self.embedding_provider = embedding_provider or build_embedding_provider()
         self.graph_service = graph_service or DomainKnowledgeGraphService(
             store, embedding_provider=self.embedding_provider
         )
+        # Semantic quality judge: LLM primary (injected), rule fallback in
+        # evolution.semantics.  None keeps the gate offline with rules only.
+        self.llm_runner = llm_runner
 
     def capture_briefing(self, briefing: DailyBriefing) -> list[str]:
         if not briefing.sources:
@@ -377,6 +390,35 @@ class DomainKnowledgeCandidateService:
     def validate(self, candidate_id: str) -> dict[str, Any]:
         return self._run_validation_gate(candidate_id, promote=True)
 
+    def _promote_to_pending(self, candidate_id: str) -> dict[str, Any]:
+        """Run the full gate and, on success, move the candidate to
+        ``pending_user_confirm`` so a user decision is required before it
+        becomes ``validated`` (used by automatic distillation)."""
+        return self._run_validation_gate(candidate_id, promote="pending")
+
+    def _semantic_verdict(self, candidate: dict[str, Any]) -> SemanticVerdict | None:
+        """Classify the candidate's claim semantics (technical vs marketing/vague).
+
+        Uses the injected LLM runner when available; otherwise the rule
+        fallback in ``evolution.semantics``.  Returns None only when the
+        candidate has no claim text at all (the no-original-source gate
+        already covers the empty case).
+        """
+        claim = str(candidate.get("claim") or "").strip()
+        if not claim:
+            return None
+        evidence_titles = [
+            str(item.get("title") or "")
+            for item in (candidate.get("evidence") or [])
+            if str(item.get("title") or "").strip()
+        ]
+        return classify_semantic_quality(
+            claim=claim,
+            topic=str(candidate.get("topic") or ""),
+            evidence_titles=evidence_titles,
+            llm_runner=self.llm_runner,
+        )
+
     def list_candidates(self, status: str | None = None, layer: str | None = None) -> list[dict[str, Any]]:
         candidates = self.store.list_domain_knowledge_candidates(status)
         latest_layers = self._latest_validation_layers()
@@ -396,7 +438,7 @@ class DomainKnowledgeCandidateService:
                 enriched.append(item)
         return enriched
 
-    def _run_validation_gate(self, candidate_id: str, promote: bool) -> dict[str, Any]:
+    def _run_validation_gate(self, candidate_id: str, promote: bool | str) -> dict[str, Any]:
         candidate = self.store.get_domain_knowledge_candidate(candidate_id)
         if candidate is None:
             raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
@@ -424,7 +466,7 @@ class DomainKnowledgeCandidateService:
         if candidate["contradictions"]:
             failures.append("unresolved_contradictions")
         independent_trajectories = self.independent_trajectory_count(candidate)
-        if independent_trajectories < 2:
+        if independent_trajectories < _MIN_INDEPENDENT_TRAJECTORIES:
             failures.append("fewer_than_two_independent_trajectories")
         oldest_evidence = self._oldest_evidence_retrieved_at(candidate)
         if (
@@ -434,6 +476,9 @@ class DomainKnowledgeCandidateService:
             failures.append("stale_evidence")
         if candidate["confidence"] == "low":
             failures.append("low_confidence")
+        semantic = self._semantic_verdict(candidate)
+        if semantic is not None and is_noise_verdict(semantic):
+            failures.append(f"marketing_or_vague_content:{semantic.kind}")
         knowledge_layer = self._knowledge_layer(failures)
         layer_metadata = self._layer_metadata(knowledge_layer)
         if failures:
@@ -453,6 +498,7 @@ class DomainKnowledgeCandidateService:
                     "independent_trajectory_count": independent_trajectories,
                     "candidate_status": candidate["status"],
                     "knowledge_layer": knowledge_layer,
+                    "semantic": semantic.to_dict() if semantic is not None else None,
                     **layer_metadata,
                 },
             )
@@ -467,20 +513,26 @@ class DomainKnowledgeCandidateService:
                 **layer_metadata,
             }
 
-        if promote:
+        if promote is True:
             self.store.update_domain_knowledge_candidate_status(
                 candidate_id,
                 "validated",
                 "passed traceability gate: multiple independent domains with sufficient source authority "
-                "across at least two independent trajectories, no unresolved contradictions, non-low confidence",
+                "across at least one independent trajectory, no unresolved contradictions, non-low confidence",
+            )
+        elif promote == "pending" and str(candidate["status"]) != "validated":
+            self.store.update_domain_knowledge_candidate_status(
+                candidate_id,
+                "pending_user_confirm",
+                "passed every validation gate; awaiting explicit user confirmation before release",
             )
         self.store.add_gate_record(
             gate_type="domain_knowledge_candidate_validation",
             subject_type="domain_knowledge_candidate",
             subject_id=candidate_id,
             result="passed",
-            reason="multiple independent domains with sufficient source authority across at least two "
-            "independent trajectories, no unresolved contradictions, non-low confidence",
+            reason="multiple independent domains with sufficient source authority across at least one "
+            "independent trajectory, no unresolved contradictions, non-low confidence",
             evidence_refs=self._candidate_evidence_refs(candidate),
             metadata={
                 "topic": candidate["topic"],
@@ -491,6 +543,7 @@ class DomainKnowledgeCandidateService:
                 "independent_trajectory_count": independent_trajectories,
                 "candidate_status": candidate["status"],
                 "knowledge_layer": knowledge_layer,
+                "semantic": semantic.to_dict() if semantic is not None else None,
                 **layer_metadata,
             },
         )
@@ -508,14 +561,13 @@ class DomainKnowledgeCandidateService:
     def distill_candidates(self, limit: int | None = None) -> dict[str, Any]:
         """Re-run validation gates for non-deprecated candidates.
 
-        Called by the offline evolution loop after trajectories are verified:
-        a candidate whose claim reappeared in an independent briefing now has
-        merged evidence and can move from ``weak_signal`` toward
-        ``validated_knowledge``.  Candidates that pass every gate are promoted
-        to status ``validated`` automatically (same promotion path as
-        :meth:`validate`); candidates that fail stay reviewable candidates and
-        keep their gate failure record.  Deprecated candidates are never
-        promoted.
+        Called by the offline evolution loop after trajectories are verified.
+        A candidate that passes every gate moves to status
+        ``pending_user_confirm`` — it is *eligible* for promotion but is not
+        marked ``validated`` until a user explicitly confirms it in chat or
+        via ``knowledge-candidate-confirm``.  Deprecated candidates are never
+        promoted and already-validated candidates are re-gated without
+        downgrading.
         """
         candidates = [
             candidate
@@ -526,13 +578,13 @@ class DomainKnowledgeCandidateService:
             candidates = candidates[:limit]
         results = []
         for candidate in candidates:
-            if str(candidate["status"]) == "validated":
+            status = str(candidate["status"])
+            if status == "validated":
                 results.append(self.record_validation_gate(str(candidate["id"])))
             else:
-                # Promote through the full validate() path so a candidate that
-                # now satisfies every gate flips to status "validated" instead
-                # of only recording a passing gate record.
-                results.append(self.validate(str(candidate["id"])))
+                # Full gate run; on success the candidate is promoted to
+                # pending_user_confirm, never straight to validated.
+                results.append(self._promote_to_pending(str(candidate["id"])))
         layer_counts: dict[str, int] = {}
         for result in results:
             layer = str(result["knowledge_layer"])
@@ -544,6 +596,59 @@ class DomainKnowledgeCandidateService:
             "weak_signal": layer_counts.get(KNOWLEDGE_LAYER_WEAK_SIGNAL, 0),
             "rejected_noise": layer_counts.get(KNOWLEDGE_LAYER_REJECTED, 0),
             "details": results,
+        }
+
+    def confirm_candidate(
+        self,
+        candidate_id: str,
+        reviewer: str = "user-confirmed",
+        reason: str = "user confirmed after review",
+    ) -> dict[str, Any]:
+        """Promote a pending candidate to ``validated`` after explicit user
+        confirmation (chat command or CLI).  Records a human-review gate and a
+        project ledger entry so the user decision is auditable."""
+        candidate = self.store.get_domain_knowledge_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(f"domain knowledge candidate not found: {candidate_id}")
+        status = str(candidate["status"])
+        if status == "validated":
+            return {"confirmed": True, "already_validated": True, "candidate_id": candidate_id}
+        if status != "pending_user_confirm":
+            raise ValueError(
+                f"candidate {candidate_id} is {status}; only pending_user_confirm candidates "
+                "can be confirmed for release"
+            )
+        self.store.update_domain_knowledge_candidate_status(
+            candidate_id,
+            "validated",
+            reason or "user confirmed after review",
+        )
+        gate_id = self.store.add_gate_record(
+            gate_type="domain_knowledge_candidate_human_review",
+            subject_type="domain_knowledge_candidate",
+            subject_id=candidate_id,
+            result="passed",
+            reason=reason or "user confirmed after review",
+            evidence_refs=self._candidate_evidence_refs(candidate),
+            metadata={"reviewer": reviewer, "topic": candidate["topic"], "confirmation": "chat-or-cli"},
+        )
+        ledger_id = self.store.add_project_ledger_entry(
+            entry_type="knowledge_release",
+            subject=candidate_id,
+            status="approved",
+            summary=f"Domain knowledge candidate confirmed by user for reviewed use: {candidate['topic']}",
+            evidence_refs=[gate_id, *self._candidate_evidence_refs(candidate)],
+            risk="User confirmation does not replace fresh source verification before current factual claims.",
+            rollback="knowledge-candidate-deprecate to remove the candidate.",
+            metadata={"reviewer": reviewer, "candidate_id": candidate_id, "topic": candidate["topic"]},
+        )
+        return {
+            "confirmed": True,
+            "already_validated": False,
+            "candidate_id": candidate_id,
+            "gate_id": gate_id,
+            "ledger_id": ledger_id,
+            "topic": candidate["topic"],
         }
 
     @staticmethod
@@ -714,7 +819,11 @@ class DomainKnowledgeCandidateService:
     def _knowledge_layer(failures: list[str]) -> str:
         if not failures:
             return KNOWLEDGE_LAYER_VALIDATED
-        if "no_original_source" in failures or "unresolved_contradictions" in failures:
+        if (
+            "no_original_source" in failures
+            or "unresolved_contradictions" in failures
+            or any(failure.startswith("marketing_or_vague_content") for failure in failures)
+        ):
             return KNOWLEDGE_LAYER_REJECTED
         return KNOWLEDGE_LAYER_WEAK_SIGNAL
 
@@ -771,15 +880,44 @@ class DomainKnowledgeCandidateService:
     def _find_similar_candidate(self, topic: str, claim: str) -> dict[str, Any] | None:
         """Find an existing candidate whose topic matches and whose claim is a
         rephrasing of ``claim``, so the cross-trajectory gate can fire for
-        repeated tracking of the same topic even when wording shifts."""
+        repeated tracking of the same topic even when wording shifts.
+
+        Topic matching is literal-first (``_topic_similar``) with an embedding
+        fallback (``_topic_semantically_similar``) so rephrased topic strings
+        such as "AI Agent Harness 上下文工程 工具调用可靠性" vs "上下文工程"
+        still merge; the embedding channel is a no-op when the provider is
+        disabled or unavailable.
+        """
         for candidate in self.store.list_domain_knowledge_candidates():
             if str(candidate["status"]) == "deprecated":
                 continue
-            if not _topic_similar(topic, str(candidate.get("topic", ""))):
+            if not (
+                _topic_similar(topic, str(candidate.get("topic", "")))
+                or self._topic_semantically_similar(topic, str(candidate.get("topic", "")))
+            ):
                 continue
             if _claims_similar(claim, str(candidate.get("claim", ""))):
                 return candidate
         return None
+
+    def _topic_semantically_similar(self, left: str, right: str) -> bool:
+        """Embedding-based topic similarity, used when literal matching fails.
+
+        Returns False when either topic is empty or the embedding provider
+        returns empty vectors (disabled/unavailable), so the caller falls back
+        to literal matching without raising.
+        """
+        if not left.strip() or not right.strip():
+            return False
+        try:
+            vectors = self.embedding_provider.embed([left, right])
+        except Exception:
+            return False
+        if len(vectors) != 2 or not vectors[0] or not vectors[1]:
+            return False
+        from search_assistant.knowledge_graph.embedding import cosine_similarity
+
+        return cosine_similarity(vectors[0], vectors[1]) >= 0.75
 
     @staticmethod
     def _oldest_evidence_retrieved_at(candidate: dict[str, Any]):
