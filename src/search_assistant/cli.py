@@ -305,6 +305,35 @@ def main(argv: list[str] | None = None) -> int:
     skill_list_parser = subparsers.add_parser("skill-list")
     _add_data_dir(skill_list_parser)
 
+    learning_loop_parser = subparsers.add_parser(
+        "skill-learning-loop",
+        help="Full learning loop: bad case -> staging draft -> eval-replay regression -> release gate -> audit.",
+    )
+    learning_loop_parser.add_argument(
+        "--bad-case",
+        default=None,
+        help="Question id of the bad case to learn from; resolved against the evaluation report items.",
+    )
+    learning_loop_parser.add_argument(
+        "--bad-case-json",
+        default=None,
+        help="Inline JSON bad-case record (id/question/quality_flags/root_causes/attribution_layer/...).",
+    )
+    learning_loop_parser.add_argument("--fix", default="", help="Description of the fix applied to the bad case.")
+    learning_loop_parser.add_argument("--max-items", type=_positive_int, default=None)
+    learning_loop_parser.add_argument("--judge", choices=["rule", "llm"], default="rule")
+    learning_loop_parser.add_argument("--report", default=None, help="Path to evaluation-report.json (default: data-dir).")
+    learning_loop_parser.add_argument("--audit-dir", default=None)
+    _add_data_dir(learning_loop_parser)
+
+    library_list_parser = subparsers.add_parser("skill-library-list", help="List active/staging/archive versioned skills.")
+    _add_data_dir(library_list_parser)
+
+    library_archive_parser = subparsers.add_parser("skill-library-archive", help="Deprecate an active skill into .archive/.")
+    library_archive_parser.add_argument("name_or_slug")
+    library_archive_parser.add_argument("--reason", default="")
+    _add_data_dir(library_archive_parser)
+
     fixture_parser = subparsers.add_parser("feishu-fixture")
     fixture_parser.add_argument("path")
     _add_data_dir(fixture_parser)
@@ -715,6 +744,17 @@ def main(argv: list[str] | None = None) -> int:
             active_dir=data_dir / "skills" / "active",
         ).list_review_status()
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "skill-learning-loop":
+        result = _run_skill_learning_loop(store, data_dir, args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if (result.get("release") or {}).get("decision", {}).get("approved") else 1
+    if args.command == "skill-library-list":
+        print(json.dumps(_skill_library_inventory(data_dir), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "skill-library-archive":
+        record = _skill_library_archive(data_dir, args.name_or_slug, reason=args.reason)
+        print(json.dumps(record, ensure_ascii=False, indent=2))
         return 0
     if args.command == "feishu-fixture":
         reply = _run_feishu_fixture(store, Path(args.path))
@@ -1581,6 +1621,123 @@ def _skill_draft_by_path(store: MemoryStore, active_path: str) -> dict[str, Any]
         if Path(str(draft["path"])).parent.name == active_slug:
             return draft
     return None
+
+
+def _run_skill_learning_loop(store: MemoryStore, data_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Run the Path-B learning loop: bad case -> staging -> regression -> gate -> audit."""
+    from search_assistant.skills.audit import SkillLearningAudit
+    from search_assistant.skills.learning import SkillLearningTrigger
+    from search_assistant.skills.library import VersionedSkillLibrary
+    from search_assistant.skills.loop import SkillLearningLoop
+    from search_assistant.skills.regression import SkillRegressionHook
+    from search_assistant.skills.release import SkillReleaseGate
+
+    report_path = Path(args.report) if args.report else data_dir / "evaluations" / "evaluation-report.json"
+    previous_items = _evaluation_report_items(report_path)
+    bad_case = _resolve_learning_bad_case(args, previous_items)
+
+    skills_root = data_dir / "skills"
+    library = VersionedSkillLibrary(skills_root)
+    audit_dir = Path(args.audit_dir) if args.audit_dir else skills_root / "audits"
+    trigger = SkillLearningTrigger(library, llm_runner=_build_learning_llm_runner())
+    regression_hook = SkillRegressionHook(judge=_build_quality_judge(args.judge))
+    loop = SkillLearningLoop(
+        store=store,
+        library=library,
+        audit=SkillLearningAudit(audit_dir),
+        trigger=trigger,
+        regression_hook=regression_hook,
+        release_gate=SkillReleaseGate(store, library),
+    )
+    return loop.run_cycle(
+        bad_case=bad_case,
+        previous_items=previous_items,
+        fix_note=args.fix,
+        max_items=args.max_items,
+        notes=(
+            f"Triggered by CLI skill-learning-loop with judge={args.judge}; "
+            f"bad_case={bad_case.get('id') or bad_case.get('question_id') or 'unknown'}."
+        ),
+    )
+
+
+def _build_learning_llm_runner():
+    """LLM runner for skill distillation, mirroring the judge runner convention."""
+    runtime = runtime_from_settings(Settings.from_env())
+
+    def runner(instructions: str, payload: dict[str, Any]) -> str:
+        return runtime._run_agent_with_max_tokens(
+            instructions,
+            payload,
+            temperature=0.2,
+            max_tokens=1400,
+        )
+
+    return runner
+
+
+def _evaluation_report_items(report_path: Path) -> list[dict[str, Any]]:
+    if not report_path.exists():
+        raise FileNotFoundError(f"Evaluation report not found: {report_path} (run eval-suite first)")
+    report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    items = report.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError(f"Evaluation report has no items list: {report_path}")
+    return [item for item in items if isinstance(item, dict) and str(item.get("question") or "").strip()]
+
+
+def _resolve_learning_bad_case(args: argparse.Namespace, previous_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick the bad case: explicit --bad-case-json wins, then --bad-case (question id),
+    then the first item with quality flags."""
+    if args.bad_case_json:
+        raw = json.loads(args.bad_case_json)
+        if not isinstance(raw, dict):
+            raise ValueError("--bad-case-json must be a JSON object")
+        return raw
+    if args.bad_case:
+        question_id = str(args.bad_case)
+        for item in previous_items:
+            if str(item.get("question_id") or "") == question_id or str(item.get("index") or "") == question_id:
+                return _bad_case_from_item(item)
+        raise FileNotFoundError(f"No evaluation item matches bad case {question_id!r}")
+    for item in previous_items:
+        if item.get("quality_flags"):
+            return _bad_case_from_item(item)
+    if previous_items:
+        return _bad_case_from_item(previous_items[0])
+    raise FileNotFoundError("No evaluation items available to derive a bad case; run eval-suite first")
+
+
+def _bad_case_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    diagnosis = item.get("diagnosis") or {}
+    return {
+        "id": str(item.get("question_id") or "unknown"),
+        "question": str(item.get("question") or ""),
+        "tier": str(item.get("tier") or item.get("classification") or ""),
+        "quality_flags": [str(flag) for flag in (item.get("quality_flags") or [])],
+        "root_causes": [str(cause) for cause in (diagnosis.get("root_causes") or [])],
+        "attribution_layer": "prompt/skill",
+        "answer_excerpt": str(item.get("answer_excerpt") or ""),
+    }
+
+
+def _skill_library_inventory(data_dir: Path) -> dict[str, Any]:
+    from search_assistant.skills.library import VersionedSkillLibrary
+
+    library = VersionedSkillLibrary(data_dir / "skills")
+    return {
+        "active": [record.to_dict() for record in library.list_active()],
+        "staging": [record.to_dict() for record in library.list_staging()],
+        "archive": [record.to_dict() for record in library.list_archive()],
+    }
+
+
+def _skill_library_archive(data_dir: Path, name_or_slug: str, reason: str = "") -> dict[str, Any]:
+    from search_assistant.skills.library import VersionedSkillLibrary
+
+    library = VersionedSkillLibrary(data_dir / "skills")
+    record = library.archive(name_or_slug, reason=reason)
+    return {"action": "archived", "skill": record.to_dict()}
 
 
 def _run_evolution(store: MemoryStore, data_dir: Path) -> dict[str, object]:

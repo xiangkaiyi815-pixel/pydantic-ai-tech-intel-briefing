@@ -181,6 +181,9 @@ python -m search_assistant.cli checkpoint-list
 python -m search_assistant.cli doctor
 python -m search_assistant.cli eval-suite
 python -m search_assistant.cli eval-replay
+python -m search_assistant.cli skill-library-list
+python -m search_assistant.cli skill-library-archive <slug> --reason "superseded"
+python -m search_assistant.cli skill-learning-loop --bad-case <question_id> --fix "retry review parse failures"
 python -m search_assistant.cli knowledge-candidate-list --layer weak_signal
 ```
 
@@ -194,6 +197,32 @@ make daily briefing runs and self-evolution changes reviewable before they are
 promoted. `knowledge-candidate-approve` requires a passing `eval-suite` report by
 default; `eval-replay` reruns the questions from an existing evaluation report to
 surface behavior drift before releasing new knowledge.
+
+### Learning Loop And Versioned Skills
+
+The learning loop closes the evaluation circle: a Bad Case fix is distilled into
+a versioned skill draft (staging), the draft is regression-checked with the
+shared eval-replay Delta + McNemar machinery, and only a statistically
+significant improvement (p < 0.05) with zero regressed questions is merged into
+the active skill library. Rejected or deprecated skills are archived under
+`skills/.archive/` instead of being deleted, and every cycle writes a JSON
+ledger plus a human-readable `REPORT.md` traceable to the triggering Bad Case.
+
+```powershell
+# List active/staging/archive versioned skills.
+python -m search_assistant.cli skill-library-list
+
+# Manually deprecate an active skill (moves to .archive/).
+python -m search_assistant.cli skill-library-archive <slug> --reason "superseded"
+
+# Full loop: bad case -> staging draft -> eval-replay regression -> release gate -> audit.
+python -m search_assistant.cli skill-learning-loop --bad-case <question_id> --fix "<fix description>"
+```
+
+Skill files use frontmatter (`name` / `version` / `related`); the version number
+is bumped on every modification. See
+[docs/knowledge-graph-evolution-improvement-plan.md](docs/knowledge-graph-evolution-improvement-plan.md)
+and the `search_assistant.skills` package for the loop design.
 
 Knowledge candidates are layered by the latest validation gate metadata:
 `validated_knowledge` can move toward human-reviewed release, `weak_signal`
