@@ -101,6 +101,7 @@ class DeepSeekChatRuntime:
         base_url: str = "https://api.deepseek.com",
         timeout_seconds: float = 60.0,
         briefing_planning_timeout_seconds: float | None = None,
+        briefing_synthesis_timeout_seconds: float | None = None,
         agent_runner: AgentRunner | None = None,
     ):
         if not api_key:
@@ -111,6 +112,13 @@ class DeepSeekChatRuntime:
         self.timeout_seconds = timeout_seconds
         self.briefing_planning_timeout_seconds = min(
             briefing_planning_timeout_seconds or timeout_seconds,
+            timeout_seconds,
+        )
+        # Synthesis gets its own, longer timeout: 25+ sources measured at
+        # 60-70s, so capping it at the general call timeout silently degrades
+        # the whole report to deterministic fallback templates.
+        self.briefing_synthesis_timeout_seconds = max(
+            briefing_synthesis_timeout_seconds or timeout_seconds,
             timeout_seconds,
         )
         self.agent_runner = agent_runner or _agent_framework_runner
@@ -431,7 +439,7 @@ class DeepSeekChatRuntime:
                 json.dumps(request_payload, ensure_ascii=False),
                 0.2,
                 2400,
-                self.timeout_seconds,
+                self.briefing_synthesis_timeout_seconds,
             )
         except TimeoutError:
             # A long source payload can exhaust a provider window even when
@@ -450,7 +458,7 @@ class DeepSeekChatRuntime:
                 json.dumps(retry_payload, ensure_ascii=False),
                 0.1,
                 1800,
-                min(self.timeout_seconds, 75.0),
+                min(self.briefing_synthesis_timeout_seconds, 75.0),
             )
         synthesis = _parse_briefing_synthesis(content, {source.url for source in sources})
         if not self._needs_scope_revision(synthesis):
@@ -677,6 +685,7 @@ def runtime_from_settings(settings: Settings) -> AgentRuntime:
             base_url=settings.deepseek_base_url,
             timeout_seconds=settings.deepseek_timeout_seconds,
             briefing_planning_timeout_seconds=settings.briefing_planning_timeout_seconds,
+            briefing_synthesis_timeout_seconds=settings.briefing_synthesis_timeout_seconds,
         )
     if provider == "glm":
         return GLMPydanticAIRuntime(
@@ -685,6 +694,7 @@ def runtime_from_settings(settings: Settings) -> AgentRuntime:
             base_url=settings.glm_base_url,
             timeout_seconds=settings.glm_timeout_seconds,
             briefing_planning_timeout_seconds=settings.briefing_planning_timeout_seconds,
+            briefing_synthesis_timeout_seconds=settings.briefing_synthesis_timeout_seconds,
         )
     if provider == "fake" and settings.allow_fake_runtime:
         return FakeAgentRuntime()
@@ -747,6 +757,7 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
         base_url: str = "https://open.bigmodel.cn/api/paas/v4/",
         timeout_seconds: float = 60.0,
         briefing_planning_timeout_seconds: float = 40.0,
+        briefing_synthesis_timeout_seconds: float | None = None,
         agent_runner: AgentRunner | None = None,
     ):
         if not api_key:
@@ -756,6 +767,7 @@ class GLMPydanticAIRuntime(DeepSeekChatRuntime):
             model=model,
             base_url=base_url,
             timeout_seconds=timeout_seconds,
+            briefing_synthesis_timeout_seconds=briefing_synthesis_timeout_seconds,
             agent_runner=agent_runner or self._pydantic_ai_runner,
         )
         self.briefing_planning_timeout_seconds = min(briefing_planning_timeout_seconds, timeout_seconds)

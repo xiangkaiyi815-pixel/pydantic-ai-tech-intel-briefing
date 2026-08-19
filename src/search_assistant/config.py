@@ -111,6 +111,11 @@ class Settings(BaseModel):
     workflow_search_budget_seconds: float = 45.0
     briefing_search_budget_seconds: float = 90.0
     briefing_planning_timeout_seconds: float = 40.0
+    # Briefing synthesis needs more headroom than general calls: 25+ sources
+    # regularly take 60-70s (measured), so the default is 120s instead of the
+    # 60s general deepseek timeout.  A synthesis that times out silently
+    # degrades the whole report to the deterministic fallback templates.
+    briefing_synthesis_timeout_seconds: float = 120.0
     deepseek_timeout_seconds: float = 60.0
     briefing_max_queries: int = 28
     briefing_results_per_query: int = 10
@@ -205,6 +210,10 @@ class Settings(BaseModel):
             "briefing_planning_timeout_seconds": _to_float(
                 source.get("BRIEFING_PLANNING_TIMEOUT_SECONDS"),
                 40.0,
+            ),
+            "briefing_synthesis_timeout_seconds": _to_float(
+                source.get("BRIEFING_SYNTHESIS_TIMEOUT_SECONDS"),
+                120.0,
             ),
             "deepseek_timeout_seconds": _to_float(source.get("DEEPSEEK_TIMEOUT_SECONDS"), 60.0),
             "briefing_max_queries": _to_int(source.get("BRIEFING_MAX_QUERIES"), 28),

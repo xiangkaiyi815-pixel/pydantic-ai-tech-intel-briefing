@@ -895,6 +895,121 @@ def _source_slug_for_plan(platform: str, query: str) -> str:
     return "general-web"
 
 
+def _topic_tokens(topic: str) -> set[str]:
+    """Lowercased latin words + CJK bigrams of a topic, used to keep
+    evidence-driven fallback headings from repeating the topic itself."""
+    tokens = set(re.findall(r"[a-z0-9]+", topic.lower()))
+    cjk_run = "".join(re.findall(r"[\u4e00-\u9fff]", topic))
+    for index in range(len(cjk_run) - 1):
+        tokens.add(cjk_run[index : index + 2])
+    return tokens
+
+
+def _extract_evidence_core_phrase(
+    sources: list["CollectedSource"],
+    exclude: set[str] | None = None,
+) -> str:
+    """Derive a short technical core phrase from a batch of evidence titles.
+
+    Used by the deterministic fallback so its detailed-summary headings are
+    evidence-driven ("…的算子融合：技术底座与开源生态") instead of repeating
+    the same canned suffix for every topic.  Returns "" when no specific
+    phrase can be extracted, in which case the caller falls back to the fixed
+    suffix.
+    """
+    exclude = exclude or set()
+    if not sources:
+        return ""
+    # Count technical tokens (latin words + CJK bigrams) across titles.
+    counts: dict[str, int] = {}
+    for source in sources:
+        text = f"{source.title} {source.snippet}".lower()
+        for match in re.findall(r"[a-z0-9][a-z0-9\-]{2,}", text):
+            if (
+                match in _STOP_WORDS
+                or match in exclude
+                or match in _EVIDENCE_GENERIC_PHRASES
+                or len(match) < 3
+            ):
+                continue
+            counts[match] = counts.get(match, 0) + 1
+        # CJK: prefer whole 2-4 char runs (e.g. "算子融合") over sliding
+        # bigrams ("子融") by counting only the 4-char and 2-char prefixes of
+        # each run — never the 3-char middle ("算子融") which splices across
+        # phrase boundaries.
+        cjk_runs = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+        for run in cjk_runs:
+            full = run[:4]
+            if (
+                len(full) >= 4
+                and full not in _CJK_STOP_WORDS
+                and full not in exclude
+                and full not in _EVIDENCE_GENERIC_PHRASES
+            ):
+                counts[full] = counts.get(full, 0) + 1
+            pair = run[:2]
+            if (
+                len(pair) >= 2
+                and pair not in _CJK_STOP_WORDS
+                and pair not in exclude
+                and pair not in _EVIDENCE_GENERIC_PHRASES
+            ):
+                counts[pair] = counts.get(pair, 0) + 1
+    if not counts:
+        return ""
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
+    best = ranked[0][0]
+    # A single occurrence is too weak to name the section; let the suffix
+    # fallback handle it.
+    if counts[best] < 2:
+        return ""
+    # Combine the top two distinct tokens for a more specific phrase, but skip
+    # a second token that is a redundant prefix/suffix of the first (e.g.
+    # "算子融合" + "算子" -> just "算子融合").
+    second = None
+    for token, count in ranked[1:]:
+        if token in best or best in token:
+            continue
+        if count >= 2:
+            second = token
+            break
+    if second is not None:
+        return f"{best}、{second}"
+    return best
+
+
+_STOP_WORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "this", "that", "what", "how",
+        "why", "when", "you", "your", "not", "are", "was", "has", "have",
+        "into", "onto", "about", "more", "most", "some", "such", "than",
+        "then", "they", "their", "there", "these", "those", "will", "would",
+        "can", "could", "should", "https", "http", "www", "com", "org",
+    }
+)
+
+_CJK_STOP_WORDS = frozenset(
+    {
+        "什么", "怎么", "如何", "为什么", "这个", "那个", "我们", "你们", "他们",
+        "以及", "还是", "不是", "没有", "可以", "需要", "能够", "应该", "已经",
+        "进行", "通过", "关于", "一个", "一种", "这个", "相关", "主要", "包括",
+    }
+)
+
+#: Macro / process words that name evidence categories rather than a concrete
+#: technical object.  They must not become evidence-driven fallback headings
+#: (e.g. "报告", "产业", "视频", "案例" would make every topic sound the same).
+_EVIDENCE_GENERIC_PHRASES = frozenset(
+    {
+        "报告", "白皮书", "产业", "行业", "市场", "案例", "视频", "教程", "课程",
+        "资料", "材料", "内容", "文章", "新闻", "评论", "讨论", "观点", "介绍",
+        "解析", "解读", "综述", "指南", "科普", "公开", "线索", "信号", "技术",
+        "智能", "模型", "框架", "系统", "平台", "产品", "应用", "方案", "项目",
+        "建设", "落地", "部署", "发布", "大会", "政策", "规划", "生态", "规模",
+    }
+)
+
+
 class DailyBriefingService:
     def __init__(
         self,
@@ -1029,6 +1144,7 @@ class DailyBriefingService:
                     ),
                     "theme_count": len(synthesis.themes),
                     "used_runtime": self.runtime is not None,
+                    "synthesis_source": "fallback" if getattr(self, "last_synthesis_fallback", False) else "llm",
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                 },
             )
@@ -2145,6 +2261,11 @@ class DailyBriefingService:
         briefing_intent: BriefingIntentProfile | None = None,
         knowledge_context: dict[str, object] | None = None,
     ) -> BriefingSynthesis:
+        # Track whether the deterministic fallback was used so the caller can
+        # annotate the report (synthesis_source=fallback) and audit it.  A
+        # silent fallback hides degraded report quality from both users and
+        # operators.
+        self.last_synthesis_fallback = False
         if self.runtime is not None:
             try:
                 generated = self.runtime.synthesize_briefing(
@@ -2159,11 +2280,52 @@ class DailyBriefingService:
                         "knowledge_context": knowledge_context or {},
                     },
                 )
-            except Exception:
+            except Exception as exc:
                 generated = None
-            if generated is not None and _is_substantive_synthesis(generated):
+                self._record_synthesis_fallback(topic, sources, exc)
+            substantive = generated is not None and _is_substantive_synthesis(generated)
+            if substantive:
                 return self._preserve_generated_detail(generated, topic, sources)
+            self._record_synthesis_fallback(topic, sources, None)
+        self.last_synthesis_fallback = True
         return self._fallback_synthesis(topic, fallback_sources or sources)
+
+    def _record_synthesis_fallback(
+        self,
+        topic: str,
+        sources: list[CollectedSource],
+        exc: Exception | None,
+    ) -> None:
+        """Persist an audit trail entry when briefing synthesis degrades to the
+        deterministic fallback (LLM error, timeout, or an insubstantive reply)."""
+        reason = (
+            f"briefing synthesis failed or returned insubstantive content: {type(exc).__name__}: {exc}"
+            if exc is not None
+            else "briefing synthesis returned content that failed the substantive check"
+        )
+        try:
+            gate_id = self.store.add_gate_record(
+                gate_type="briefing_synthesis_fallback",
+                subject_type="briefing_topic",
+                subject_id=topic.strip() or "unspecified",
+                result="failed",
+                reason=reason,
+                evidence_refs=[str(source.url) for source in sources[:5]],
+                metadata={"source_count": len(sources)},
+            )
+            self.store.add_project_ledger_entry(
+                entry_type="briefing_synthesis_fallback",
+                subject=topic.strip() or "unspecified",
+                status="degraded",
+                summary=reason,
+                evidence_refs=[gate_id, *[str(source.url) for source in sources[:5]]],
+                risk="Deterministic fallback templates were used; the report may miss evidence-driven detail.",
+                rollback="Re-run the briefing after fixing the synthesis timeout or model availability.",
+                metadata={"source_count": len(sources)},
+            )
+        except Exception:
+            # Audit recording must never break the briefing itself.
+            pass
 
     def _preserve_generated_detail(
         self,
@@ -2243,7 +2405,7 @@ class DailyBriefingService:
                     continue
                 themes.append(
                     BriefingTheme(
-                        name=self._display_generic_evidence_theme_name(topic, name),
+                        name=self._display_generic_evidence_theme_name(topic, name, evidence=evidence),
                         analysis=self._fallback_theme_analysis(evidence, technology, importance, maturity),
                         what_is_happening=self._evidence_summary(evidence),
                         core_technology=technology,
@@ -2341,10 +2503,26 @@ class DailyBriefingService:
         )
 
     @staticmethod
-    def _display_generic_evidence_theme_name(topic: str, generic_name: str) -> str:
+    def _display_generic_evidence_theme_name(
+        topic: str,
+        generic_name: str,
+        evidence: list[CollectedSource] | None = None,
+    ) -> str:
         clean_topic = " ".join(topic.split()).strip(" ：:，,。")
         if not clean_topic:
             clean_topic = "本主题"
+        # Evidence-driven heading: pull the most specific technical words from
+        # the batch so the fallback report does not reuse the same canned
+        # suffixes for every topic (which contradicts the report contract).
+        core = _extract_evidence_core_phrase(evidence or [], exclude=_topic_tokens(clean_topic))
+        if core:
+            angle = {
+                "技术底座、数据与开源生态": "技术底座与开源生态",
+                "应用落地与业务转型案例": "应用落地与业务案例",
+                "教育传播、公众讨论与弱证据线索": "传播讨论与证据边界",
+                "综合产业动态与待核验证据": "待核验线索",
+            }.get(generic_name, "证据线索")
+            return f"{clean_topic}的{core}：{angle}"
         suffixes = {
             "政策、规模与产业链信号": "政策、规模与产业链信号",
             "技术底座、数据与开源生态": "技术底座、数据与开源生态",

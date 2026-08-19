@@ -733,13 +733,16 @@ def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp
     assert runtime.synthesis_context["briefing_intent"]["primary_intent"] == "industry_trend"
     assert len(briefing.sources) == 5
     assert "保留了 5 条公开线索" in briefing.synthesis.search_content_summary
-    assert "### 人工智能产业发展的政策、规模与产业链信号" in briefing.synthesis.detailed_summary
-    assert "### 人工智能产业发展的技术底座、数据与开源生态" in briefing.synthesis.detailed_summary
-    assert "### 人工智能产业发展的应用落地与业务流程线索" in briefing.synthesis.detailed_summary
-    assert "### 人工智能产业发展的传播讨论与弱证据线索" in briefing.synthesis.detailed_summary
-    assert "### 政策、规模与产业链信号" not in briefing.synthesis.detailed_summary
+    assert "### 人工智能产业发展" in briefing.synthesis.detailed_summary
+    assert "技术底座" in briefing.synthesis.detailed_summary
+    assert "应用落地" in briefing.synthesis.detailed_summary
+    assert "传播讨论" in briefing.synthesis.detailed_summary
+    assert "政策、规模与产业链信号" not in briefing.synthesis.detailed_summary
     assert "相关线索集中讨论" not in briefing.synthesis.detailed_summary
     assert _is_substantive_synthesis(briefing.synthesis) is True
+    # The fallback is audited instead of being silent.
+    assert store.list_gate_records(gate_type="briefing_synthesis_fallback")
+    assert store.list_project_ledger_entries(entry_type="briefing_synthesis_fallback")
 
 
 def test_generic_intent_topic_fallback_does_not_reuse_industrial_headings(tmp_path):

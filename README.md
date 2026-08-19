@@ -192,6 +192,13 @@ python -m search_assistant.cli knowledge-candidate-confirm <candidate_id> --revi
 Use `--data-dir <path>` for an isolated run. Deployment, scheduling, and
 Feishu guidance are in [docs/operations.md](docs/operations.md).
 
+Briefing synthesis uses its own timeout (`BRIEFING_SYNTHESIS_TIMEOUT_SECONDS`,
+default 120s) because large briefings (25+ sources) regularly take 60-70s; a
+timeout there silently degrades the whole report to deterministic fallback
+templates. Fallback degradation is audited as a
+`briefing_synthesis_fallback` gate + ledger entry and the run is tagged
+`synthesis_source=fallback` so degraded reports are visible.
+
 The agent-ops commands expose append-only project ledger entries, project-state
 snapshots, self-evolution gate records, trace spans, run checkpoints, and
 search-provider health records from the local SQLite store. These are intended to
