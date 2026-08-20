@@ -1,5 +1,10 @@
 # 知识图谱与自进化系统改进计划
 
+> Historical planning note: this document records the branch and evolution
+> planning state that led into PR #10. Current runtime architecture is governed
+> by ADR 0001: Pydantic AI is the primary agent runtime; GLM and DeepSeek are
+> model providers, not separate agent frameworks.
+>
 > 基于《AI Agents in Depth》教程第 3 章和第 8 章，结合当前系统诊断结果。
 > **状态：已标注所有分支与改进计划的冲突与重叠。**
 > **更新时间：2026-08-17**

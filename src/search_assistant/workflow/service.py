@@ -18,7 +18,7 @@ from search_assistant.verification.policy import (
     requires_verification,
     verify_claims_against_sources,
 )
-from search_assistant.workflow.runtime import AgentRuntime
+from search_assistant.runtime import AgentRuntime
 
 
 @dataclass(frozen=True)

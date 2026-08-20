@@ -2075,9 +2075,20 @@ class MemoryStore:
         run_id: str | None = None,
         topic_id: str | None = None,
     ) -> str:
-        event_id = _new_id("provider")
+        return self.record_provider_trace_events([event], run_id=run_id, topic_id=topic_id)[0]
+
+    def record_provider_trace_events(
+        self,
+        events: list[ProviderTraceEvent],
+        run_id: str | None = None,
+        topic_id: str | None = None,
+    ) -> list[str]:
+        if not events:
+            return []
+        event_ids = [_new_id("provider") for _event in events]
+        created_at = _now_iso()
         with self._connect() as connection:
-            connection.execute(
+            connection.executemany(
                 """
                 INSERT INTO provider_trace_events (
                     id, run_id, topic_id, provider, query_text, status, result_count,
@@ -2085,24 +2096,27 @@ class MemoryStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    event_id,
-                    run_id,
-                    topic_id,
-                    event.provider,
-                    event.query,
-                    event.status,
-                    event.result_count,
-                    event.reason,
-                    event.error,
-                    event.elapsed_ms,
-                    event.tier,
-                    event.budget_share,
-                    event.checked_at,
-                    _now_iso(),
-                ),
+                [
+                    (
+                        event_id,
+                        run_id,
+                        topic_id,
+                        event.provider,
+                        event.query,
+                        event.status,
+                        event.result_count,
+                        event.reason,
+                        event.error,
+                        event.elapsed_ms,
+                        event.tier,
+                        event.budget_share,
+                        event.checked_at,
+                        created_at,
+                    )
+                    for event_id, event in zip(event_ids, events, strict=True)
+                ],
             )
-        return event_id
+        return event_ids
 
     def list_provider_trace_events(
         self,

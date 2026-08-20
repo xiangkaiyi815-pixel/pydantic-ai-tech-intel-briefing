@@ -36,7 +36,7 @@ from search_assistant.search.source_registry import (
 from search_assistant.skills.service import SkillDraftService
 from search_assistant.config import Settings
 from search_assistant.verification.backfill import VerificationBackfillService
-from search_assistant.workflow.runtime import runtime_from_settings
+from search_assistant.runtime.pydantic_ai import runtime_from_settings
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 
@@ -822,7 +822,7 @@ def _build_semantic_llm_runner():
     runtime = runtime_from_settings(Settings.from_env())
 
     def runner(instructions: str, payload: dict[str, Any]) -> str:
-        return runtime._run_agent_with_max_tokens(
+        return runtime.run_text_task(
             instructions,
             payload,
             temperature=0.0,
@@ -998,7 +998,7 @@ def _build_quality_judge(judge_name: str):
     runtime = runtime_from_settings(Settings.from_env())
 
     def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
-        return runtime._run_agent_with_max_tokens(
+        return runtime.run_text_task(
             instructions,
             payload,
             temperature=0.0,
@@ -1704,7 +1704,7 @@ def _build_learning_llm_runner():
     runtime = runtime_from_settings(Settings.from_env())
 
     def runner(instructions: str, payload: dict[str, Any]) -> str:
-        return runtime._run_agent_with_max_tokens(
+        return runtime.run_text_task(
             instructions,
             payload,
             temperature=0.2,
@@ -1874,7 +1874,7 @@ def _run_offline_evolution(
         runtime = runtime_from_settings(Settings.from_env())
 
         def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
-            return runtime._run_agent_with_max_tokens(
+            return runtime.run_text_task(
                 instructions,
                 payload,
                 temperature=0.0,
@@ -1904,7 +1904,7 @@ def _run_judge_calibration(
         runtime = runtime_from_settings(Settings.from_env())
 
         def _llm_judge_runner(instructions: str, payload: dict[str, Any]) -> str:
-            return runtime._run_agent_with_max_tokens(
+            return runtime.run_text_task(
                 instructions,
                 payload,
                 temperature=0.0,

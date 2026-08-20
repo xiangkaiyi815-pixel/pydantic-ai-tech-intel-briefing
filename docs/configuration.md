@@ -17,11 +17,20 @@ in command lines, reports, SQLite fixtures, or checked-in configuration files.
 
 | Variable | Purpose |
 | --- | --- |
-| `SEARCH_ASSISTANT_MODEL_PROVIDER` | `glm` by default; `deepseek` selects the legacy runtime. |
-| `GLM_API_KEY` | Required only for the GLM runtime. |
+| `SEARCH_ASSISTANT_MODEL_PROVIDER` | `glm` by default; `deepseek` selects the DeepSeek OpenAI-compatible provider through the Pydantic AI runtime. |
+| `GLM_API_KEY` | Required when `SEARCH_ASSISTANT_MODEL_PROVIDER=glm`. |
 | `GLM_BASE_URL` | OpenAI-compatible GLM endpoint. |
 | `GLM_MODEL` | Default: `glm-4.7`. |
 | `GLM_TIMEOUT_SECONDS` | Per-model request time budget. |
+| `DEEPSEEK_API_KEY` | Required when `SEARCH_ASSISTANT_MODEL_PROVIDER=deepseek`. |
+| `DEEPSEEK_BASE_URL` | OpenAI-compatible DeepSeek endpoint. |
+| `DEEPSEEK_MODEL` | Default: `deepseek-v4-flash`. |
+| `DEEPSEEK_TIMEOUT_SECONDS` | Per-model request time budget for DeepSeek. |
+
+`SEARCH_ASSISTANT_MODEL_PROVIDER` chooses the model provider only. GLM and
+DeepSeek both run through the same Pydantic AI runtime boundary; retrieval,
+verification, calibration, review, memory, evaluation, and evolution remain in
+the project harness.
 
 The project supports local encrypted configuration tooling in its development
 environment, but the public repository intentionally documents only variable
@@ -85,7 +94,7 @@ search. Per-channel requirements:
 Recommended enable path for the daily briefing:
 
 1. Run `agent-reach doctor --json` and confirm at least `bilibili` and `v2ex`/`rss` show `ok`, and `exa_search` shows `ok` after installing mcporter.
-2. Keep `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` with the `hybrid` provider so Agent Reach is tried first and MCP/browser search remains the fallback.
+2. Keep `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=true` with the `hybrid` provider so MCP/browser search runs first and Agent Reach adds supplementary routes when the budget allows.
 3. If no general-web backend will be installed, set `SEARCH_ASSISTANT_AGENT_REACH_ENABLED=false` to avoid the empty-route calls (each unresolved query is recorded as `AgentReachSearchClient:empty` in the provider trace).
 
 The project treats Agent Reach as a read-only capability layer: it never passes
@@ -101,9 +110,10 @@ Agent Reach install guide before enabling channels with
 | `BRIEFING_MAX_QUERIES` | `28` | Maximum combined planned and deterministic queries. |
 | `BRIEFING_RESULTS_PER_QUERY` | `10` | Per-query retrieval limit. |
 | `BRIEFING_MAX_SOURCES` | `50` | Full retained source cap. |
-| `BRIEFING_MODEL_MAX_SOURCES` | `12` | Ranked evidence cap supplied to GLM. |
+| `BRIEFING_MODEL_MAX_SOURCES` | `12` | Ranked evidence cap supplied to the configured Pydantic AI model provider. |
 | `BRIEFING_SEARCH_BUDGET_SECONDS` | `90` | Concurrent retrieval budget. |
-| `BRIEFING_PLANNING_TIMEOUT_SECONDS` | `40` | GLM planning budget. |
+| `BRIEFING_PLANNING_TIMEOUT_SECONDS` | `40` | Planning budget passed to the configured Pydantic AI model provider. |
+| `BRIEFING_SYNTHESIS_TIMEOUT_SECONDS` | `120` | Synthesis budget passed to the configured Pydantic AI model provider. |
 
 ## Optional Feishu Settings
 

@@ -36,6 +36,8 @@ py -3.12 -m pytest -q -o cache_dir=$env:TEMP\pydantic-ai-briefing-pytest
   known noisy-result regressions.
 - Briefing report sections, original URLs, model JSON validation, timeout retry,
   source filtering, and free-form detailed synthesis rendering.
+- Runtime boundary behavior: default execution uses Pydantic AI, while GLM and
+  DeepSeek remain model-provider choices rather than separate agent frameworks.
 - Source capability contracts, provider trace events, candidate lifecycle
   reasons, feedback signal typing, and layered memory persistence.
 - Feishu event parsing, formatting, polling, and local adapter behavior.

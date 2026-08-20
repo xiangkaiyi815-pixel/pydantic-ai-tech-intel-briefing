@@ -5,9 +5,7 @@
 #   python -m pip install -c constraints-dev.txt -e ".[dev,agent-reach]"
 #
 # The exact pydantic-ai-slim pin avoids long pip backtracking when combined
-# with Microsoft Agent Framework and the MCP extras.
-agent-framework-core==1.9.0
-agent-framework-openai==1.8.2
+# with OpenAI-compatible providers and the MCP extras.
 aiofile==3.12.3
 annotated-doc==0.0.5
 annotated-types==0.8.0

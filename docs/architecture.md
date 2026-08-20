@@ -14,7 +14,7 @@ The project has two adjacent workflows:
 flowchart TD
     Input[CLI, Feishu, or scheduler] --> Router[Workflow or briefing router]
     Router --> Memory[(SQLite)]
-    Router --> Planner[GLM planning]
+    Router --> Planner[Pydantic AI model planning]
     Planner --> Search[Hybrid search client]
     Search --> MCP[Read-only MCP tools]
     Search --> Engines[Public web engines]
@@ -23,8 +23,8 @@ flowchart TD
     Engines --> Filter
     RSS --> Filter
     Filter --> Rank[Deduplicate and rank]
-    Rank --> GLM[GLM Pydantic AI synthesis]
-    GLM --> Report[Chinese Markdown report]
+    Rank --> Model[Pydantic AI synthesis]
+    Model --> Report[Chinese Markdown report]
     Report --> Memory
     Report --> Delivery[Optional Feishu delivery]
 ```
@@ -34,17 +34,19 @@ flowchart TD
 1. A topic is created or resumed from a subscription.
 2. User feedback and case URLs are loaded as planning signals. A case URL is
    preserved even when public indexing cannot enrich it.
-3. GLM proposes focused technical queries. Deterministic coverage queries add
-   architecture, implementation, evaluation, and source-family routes.
+3. The configured Pydantic AI model provider proposes focused technical
+   queries. Deterministic coverage queries add architecture, implementation,
+   evaluation, and source-family routes.
 4. Retrieval runs concurrently with a bounded budget. Slow sources do not
    erase completed results.
 5. The service rejects malformed search-page text, generic reference pages,
    platform wrapper URLs, login pages, domain leakage from `site:` queries, and
    topic-specific false positives.
 6. Results are normalized, compacted, deduplicated, ranked, and persisted.
-7. GLM receives ranked evidence and produces structured JSON. The report's
-   detailed section remains free-form; evidence anchors preserve source
-   traceability without forcing a repeated per-theme schema.
+7. The configured Pydantic AI model provider receives ranked evidence and
+   produces structured JSON. The report's detailed section remains free-form;
+   evidence anchors preserve source traceability without forcing a repeated
+   per-theme schema.
 8. On a synthesis timeout, the runtime retries once with a smaller ranked
    evidence set. If both attempts fail, the deterministic fallback names the
    evidence limitation rather than asserting unobserved deployment facts.
@@ -99,11 +101,18 @@ sources.
 
 ## Model Boundary
 
-`GLMPydanticAIRuntime` uses Pydantic AI with an OpenAI-compatible GLM endpoint.
-It performs query planning and report synthesis. The code accepts a legacy
-DeepSeek runtime for compatibility. Model secrets are passed only through
-runtime environment configuration, never through reports, SQLite source text,
-or checked-in files.
+`PydanticAIModelRuntime` is the only primary agent runtime. `GLMPydanticAIRuntime`
+and `DeepSeekChatRuntime` are provider-specific configurations of that runtime
+over OpenAI-compatible endpoints. The in-repo harness owns workflow control,
+retrieval, verification, calibration, final review, memory, evaluation, and
+offline evolution; the model runtime only performs bounded text tasks and the
+workflow-specific planning/synthesis/review prompts. Microsoft Agent Framework
+is not in the default or DeepSeek execution path. Older superpowers MVP
+documents that mention it are retained as historical records, not current
+architecture.
+
+Model secrets are passed only through runtime environment configuration, never
+through reports, SQLite source text, or checked-in files.
 
 ## Safety Boundaries
 

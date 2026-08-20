@@ -1613,7 +1613,14 @@ class DailyBriefingService:
 
         def record_provider_event(event: ProviderTraceEvent) -> None:
             provider_events.append(event)
-            self.store.record_provider_trace_event(event, run_id=run_id, topic_id=subscription.id)
+
+        def persist_provider_events() -> None:
+            if not provider_events:
+                return
+            try:
+                self.store.record_provider_trace_events(provider_events, run_id=run_id, topic_id=subscription.id)
+            except Exception:
+                return
 
         def annotate_event(event: ProviderTraceEvent, task: BriefingSearchTask) -> ProviderTraceEvent:
             return event.model_copy(update={"tier": task.tier, "budget_share": task.budget_share})
@@ -1944,6 +1951,7 @@ class DailyBriefingService:
             )
             source_candidates.append(accepted)
             self.store.record_source_candidate(accepted)
+        persist_provider_events()
         return BriefingCollectionTrace(
             sources=persisted,
             source_candidates=source_candidates,

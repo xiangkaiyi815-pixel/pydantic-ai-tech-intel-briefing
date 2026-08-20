@@ -11,7 +11,8 @@ turning their daily report into a list of headlines.
 
 ## What It Does
 
-- Plans bilingual technical queries with GLM-4.7 through Pydantic AI.
+- Plans bilingual technical queries with the configured Pydantic AI model
+  provider, using GLM-4.7 by default.
 - Searches public web engines plus read-only MCP sources for GitHub, arXiv,
   Hacker News, and Stack Exchange.
 - Supports public-index or no-login discovery for selected Chinese platforms.
@@ -45,14 +46,21 @@ turning their daily report into a list of headlines.
 
 ## Architecture
 
+The primary agent runtime is Pydantic AI. `SEARCH_ASSISTANT_MODEL_PROVIDER`
+selects an OpenAI-compatible model provider such as GLM or DeepSeek; it does
+not select a separate agent framework. The in-repo harness owns retrieval,
+verification, calibration, review, memory, evaluation, and offline evolution.
+MCP, public web, RSS/API sources, and optional Agent Reach routes sit below the
+harness as read-only retrieval/tool layers.
+
 ```mermaid
 flowchart LR
-    Topic[Topic or case feedback] --> Planner[GLM query planner]
+    Topic[Topic or case feedback] --> Planner[Pydantic AI query planner]
     Planner --> Retrieval[Public search and read-only MCP]
     Retrieval --> Filter[URL, relevance, and noise filters]
     Filter --> Rank[Deduplicate and rank]
     Rank --> SQLite[(SQLite evidence store)]
-    Rank --> Synthesis[GLM technical synthesis]
+    Rank --> Synthesis[Pydantic AI technical synthesis]
     Synthesis --> Report[Chinese Markdown briefing]
     Report --> SQLite
     Report --> Feishu[Optional Feishu delivery]
@@ -257,8 +265,8 @@ py -3.12 -m pytest -q
 ```
 
 The suite covers configuration, search parsing, MCP and RSSHub adapters,
-briefing contracts, GLM JSON validation, Feishu adapters, storage, verification,
-and regression cases for noisy search results. See
+briefing contracts, Pydantic AI model-provider JSON validation, Feishu
+adapters, storage, verification, and regression cases for noisy search results. See
 [docs/development.md](docs/development.md) for test boundaries.
 
 ## Documentation

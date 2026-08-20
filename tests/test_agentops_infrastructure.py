@@ -176,4 +176,22 @@ def test_dependency_constraints_pin_the_backtracking_sensitive_pydantic_ai_versi
     constraints = (root / "constraints-dev.txt").read_text(encoding="utf-8")
 
     assert '"pydantic-ai-slim[openai,mcp]==1.107.1"' in pyproject
+    assert '"openai==2.53.0"' in pyproject
     assert "pydantic-ai-slim==1.107.1" in constraints
+    assert "openai==2.53.0" in constraints
+    assert "agent-framework-core" not in pyproject
+    assert "agent-framework-openai" not in pyproject
+    assert "agent-framework-core" not in constraints
+    assert "agent-framework-openai" not in constraints
+
+
+def test_business_code_does_not_import_agent_framework():
+    root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+
+    for path in (root / "src").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "import agent_framework" in text or "from agent_framework" in text:
+            offenders.append(str(path.relative_to(root)))
+
+    assert offenders == []

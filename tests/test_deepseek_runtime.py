@@ -3,10 +3,11 @@ import json
 import pytest
 
 from search_assistant.config import Settings
-from search_assistant.workflow.runtime import DeepSeekChatRuntime, runtime_from_settings
+from search_assistant.runtime import DeepSeekChatRuntime
+from search_assistant.runtime.pydantic_ai import runtime_from_settings
 
 
-def test_deepseek_runtime_uses_microsoft_agent_framework_runner():
+def test_deepseek_runtime_uses_pydantic_ai_runner_contract():
     calls = []
 
     def agent_runner(model, api_key, base_url, instructions, prompt, temperature, max_tokens, timeout_seconds):

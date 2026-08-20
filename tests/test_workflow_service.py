@@ -8,7 +8,7 @@ from search_assistant.contracts import AnswerPackage, IncomingMessage
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
 from search_assistant.skills.service import SkillDraftService
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

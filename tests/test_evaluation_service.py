@@ -4,7 +4,7 @@ from search_assistant.contracts import AnswerPackage, SearchRecord, SourceEviden
 from search_assistant.evaluation.service import DEFAULT_EVALUATION_QUESTIONS, EvaluationService, _evaluation_item
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

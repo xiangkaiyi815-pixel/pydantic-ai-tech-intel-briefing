@@ -18,8 +18,8 @@ from search_assistant.contracts import (
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
-from search_assistant.workflow.runtime import DeepSeekChatRuntime, FakeAgentRuntime
-from search_assistant.workflow.runtime import GLMPydanticAIRuntime, MicrosoftAgentRuntime, runtime_from_settings
+from search_assistant.runtime import DeepSeekChatRuntime, FakeAgentRuntime, GLMPydanticAIRuntime
+from search_assistant.runtime.pydantic_ai import runtime_from_settings
 from search_assistant.workflow.service import SearchAssistantWorkflow
 from search_assistant.config import Settings
 
@@ -1215,7 +1215,8 @@ def test_deepseek_provider_selects_runtime_with_briefing_planning_timeout():
         )
     )
 
-    assert isinstance(runtime, MicrosoftAgentRuntime)
+    assert isinstance(runtime, DeepSeekChatRuntime)
+    assert runtime.provider == "deepseek"
     assert runtime.model == "deepseek-v4-flash"
     assert runtime.timeout_seconds == 180.0
     assert runtime.briefing_planning_timeout_seconds == 40.0

@@ -14,7 +14,7 @@ from search_assistant.briefing.service import DailyBriefingService
 from search_assistant.config import Settings
 from search_assistant.contracts import CollectedSource
 from search_assistant.memory.store import MemoryStore
-from search_assistant.workflow.runtime import DeepSeekChatRuntime
+from search_assistant.runtime import DeepSeekChatRuntime
 
 
 # -- fix 1: dedicated synthesis timeout ---------------------------------------
