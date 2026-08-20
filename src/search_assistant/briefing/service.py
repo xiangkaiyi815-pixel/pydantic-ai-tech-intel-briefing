@@ -896,13 +896,26 @@ def _source_slug_for_plan(platform: str, query: str) -> str:
 
 
 def _topic_tokens(topic: str) -> set[str]:
-    """Lowercased latin words + CJK bigrams of a topic, used to keep
-    evidence-driven fallback headings from repeating the topic itself."""
+    """Lowercased latin words + CJK prefixes of a topic, used to keep
+    evidence-driven fallback headings from repeating the topic itself.
+
+    CJK covers both the 4-char prefix (what ``_extract_evidence_core_phrase``
+    counts as ``full``) and the 2-char prefix (its ``pair``), so a topic like
+    "意图识别" excludes both "意图识别" and "意图" from headings.
+    """
     tokens = set(re.findall(r"[a-z0-9]+", topic.lower()))
-    cjk_run = "".join(re.findall(r"[\u4e00-\u9fff]", topic))
-    for index in range(len(cjk_run) - 1):
-        tokens.add(cjk_run[index : index + 2])
+    for run in re.findall(r"[\u4e00-\u9fff]{2,6}", topic):
+        tokens.add(run[:4])
+        tokens.add(run[:2])
     return tokens
+
+
+def _is_generic_phrase_or_substring(phrase: str) -> bool:
+    """True when ``phrase`` is itself a generic evidence word or is a 2-char
+    substring of one (e.g. "白皮书" -> "白皮"/"皮书" are both generic)."""
+    if phrase in _EVIDENCE_GENERIC_PHRASES:
+        return True
+    return any(phrase in generic for generic in _EVIDENCE_GENERIC_PHRASES if len(generic) >= 2)
 
 
 def _extract_evidence_core_phrase(
@@ -944,7 +957,7 @@ def _extract_evidence_core_phrase(
                 len(full) >= 4
                 and full not in _CJK_STOP_WORDS
                 and full not in exclude
-                and full not in _EVIDENCE_GENERIC_PHRASES
+                and not _is_generic_phrase_or_substring(full)
             ):
                 counts[full] = counts.get(full, 0) + 1
             pair = run[:2]
@@ -952,7 +965,7 @@ def _extract_evidence_core_phrase(
                 len(pair) >= 2
                 and pair not in _CJK_STOP_WORDS
                 and pair not in exclude
-                and pair not in _EVIDENCE_GENERIC_PHRASES
+                and not _is_generic_phrase_or_substring(pair)
             ):
                 counts[pair] = counts.get(pair, 0) + 1
     if not counts:

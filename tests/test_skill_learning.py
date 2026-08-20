@@ -61,7 +61,15 @@ def test_learn_falls_back_to_bad_case_name_when_llm_omits_frontmatter(tmp_path):
 
 def test_learn_records_source_bad_case_in_frontmatter(tmp_path):
     library = VersionedSkillLibrary(tmp_path / "skills")
-    trigger = SkillLearningTrigger(library, llm_runner=_fake_llm)
+
+    def fake_llm_for_bc3(instructions, payload):
+        assert payload["bad_case"]["id"] == "bc-3"
+        return (
+            "---\nname: review-rejection-recovery\nversion: 1\n---\n\n"
+            "## Search Discipline\n\n- rule\n\n## Answer Discipline\n\n- rule\n"
+        )
+
+    trigger = SkillLearningTrigger(library, llm_runner=fake_llm_for_bc3)
     trigger.learn({"id": "bc-3", "question": "q"})
     record = library.find_staging("review-rejection-recovery")
     assert record is not None

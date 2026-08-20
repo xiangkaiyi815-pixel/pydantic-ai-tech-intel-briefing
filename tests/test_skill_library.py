@@ -79,7 +79,9 @@ def test_promote_moves_staging_to_active_and_bumps_over_existing(tmp_path):
     library.create_draft("Recovery Practice", "draft body v2")
     active2 = library.promote("recovery-practice")
     assert active2.version == 2
-    assert active2.path.read_text(encoding="utf-8") != active.path.read_text(encoding="utf-8")
+    assert active2.path == active.path  # same active file, overwritten in place
+    assert "draft body v2" in active2.path.read_text(encoding="utf-8")
+    assert "version: 2" in active2.path.read_text(encoding="utf-8")
 
 
 def test_reject_moves_staging_to_archive_never_deletes(tmp_path):
@@ -118,9 +120,11 @@ def test_list_states_are_separated(tmp_path):
     active = [record.slug for record in library.list_active()]
     staging = [record.slug for record in library.list_staging()]
     archive = [record.slug for record in library.list_archive()]
-    assert active == ["active-c"]
+    # staged-a was promoted and never archived; active-c was promoted then
+    # archived; staged-b was rejected straight into the archive.
+    assert active == ["staged-a"]
     assert staging == []
-    assert archive == ["staged-b", "active-c"]
+    assert archive == ["active-c", "staged-b"]
 
 
 def test_find_any_and_unknown(tmp_path):

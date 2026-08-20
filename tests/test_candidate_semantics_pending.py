@@ -147,8 +147,11 @@ def test_distill_promotes_to_pending_not_validated(tmp_path):
     candidate_id = service.capture_briefing(_briefing("briefing-1", "run-1"))[0]
 
     distill = service.distill_candidates()
+    # validated counts the validated_knowledge LAYER (the gate passed); the
+    # candidate STATUS stays pending_user_confirm until a user confirms.
     assert store.get_domain_knowledge_candidate(candidate_id)["status"] == "pending_user_confirm"
-    assert distill["validated"] == 0
+    assert distill["validated"] == 1
+    assert distill["weak_signal"] == 0
 
 
 def test_confirm_candidate_releases_to_validated(tmp_path):

@@ -537,8 +537,8 @@ def test_cli_eval_suite_uses_default_questions(monkeypatch, tmp_path):
     stream.flush()
     output = json.loads(stream.buffer.getvalue().decode("utf-8"))
 
-    assert output["total_questions"] == 4
-    assert "GB10" in output["items"][0]["question"]
+    assert output["total_questions"] == 12  # layered pool is the default
+    assert any("KV Cache" in item["question"] for item in output["items"])
     assert any("分布式大模型" in item["question"] for item in output["items"])
 
 
@@ -559,7 +559,7 @@ def test_cli_eval_suite_limits_default_questions_with_max_questions(monkeypatch,
     store.initialize()
     assert output["total_questions"] == 1
     assert len(output["items"]) == 1
-    assert "GB10" in output["items"][0]["question"]
+    assert "KV Cache" in output["items"][0]["question"]
     assert len(store.list_answers()) == 1
 
 

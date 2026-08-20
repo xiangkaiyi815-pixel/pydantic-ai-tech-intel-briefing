@@ -126,7 +126,9 @@ def test_multi_source_single_trajectory_reaches_pending_but_not_validated(tmp_pa
     distill = service.distill_candidates()
     candidate = store.get_domain_knowledge_candidate(candidate_id)
     assert candidate["status"] == "pending_user_confirm"
-    assert distill["validated"] == 0  # not released without user confirmation
+    # validated counts the validated_knowledge LAYER (gate passed); the
+    # candidate STATUS stays pending until a user confirms.
+    assert distill["validated"] == 1
     assert distill["weak_signal"] == 0
 
 
