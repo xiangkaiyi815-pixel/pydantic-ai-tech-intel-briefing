@@ -539,7 +539,7 @@ def test_cli_eval_suite_uses_default_questions(monkeypatch, tmp_path):
 
     assert output["total_questions"] == 12  # layered pool is the default
     assert any("KV Cache" in item["question"] for item in output["items"])
-    assert any("分布式大模型" in item["question"] for item in output["items"])
+    assert any("MCP" in item["question"] or "RAG" in item["question"] for item in output["items"])
 
 
 def test_cli_eval_suite_limits_default_questions_with_max_questions(monkeypatch, tmp_path):

@@ -3,18 +3,14 @@
 1. A dedicated synthesis timeout (longer than the general call timeout) so
    large briefings do not silently degrade to deterministic fallback.
 2. Fallback degradation is audited (gate + ledger + synthesis_source marker).
-3. Fallback detailed-summary headings are evidence-driven instead of
-   reusing canned suffixes that contradict the report contract.
+3. Fallback detailed-summary headings keep stable fixed suffixes.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-from search_assistant.briefing.service import (
-    DailyBriefingService,
-    _extract_evidence_core_phrase,
-)
+from search_assistant.briefing.service import DailyBriefingService
 from search_assistant.config import Settings
 from search_assistant.contracts import CollectedSource
 from search_assistant.memory.store import MemoryStore
@@ -105,55 +101,21 @@ def _source(title: str, snippet: str) -> CollectedSource:
     )
 
 
-def test_extract_evidence_core_phrase_prefers_whole_cjk_phrases():
-    sources = [
-        _source("AI编译器 算子融合 前端优化", "算子融合 图级重写"),
-        _source("算子融合 与 Kernel 层借力 后端优化", "算子融合 调度"),
-    ]
-    core = _extract_evidence_core_phrase(sources, exclude={"ai", "编译器"})
-    assert core
-    assert "子融" not in core  # no sliding-bigram fragments
-    assert "算子融" not in core
-
-
-def test_extract_evidence_core_phrase_filters_generic_words():
-    sources = [
-        _source("产业报告发布 政策规划", "白皮书 市场规模"),
-        _source("产业大会 政策解读", "白皮书 报告"),
-    ]
-    core = _extract_evidence_core_phrase(sources)
-    # Only generic/macro words appear, so no specific phrase is derived.
-    assert core == ""
-
-
-def test_display_generic_evidence_theme_name_uses_evidence():
-    sources = [
-        _source("AI编译器 算子融合 前端优化", "算子融合 图级重写"),
-        _source("算子融合 与 Kernel 层借力 后端优化", "算子融合 调度"),
-    ]
-    name = DailyBriefingService._display_generic_evidence_theme_name(
-        "AI 编译器", "技术底座、数据与开源生态", evidence=sources
-    )
-    assert "算子" in name
-    assert "技术底座" in name
-
-
-def test_display_generic_evidence_theme_name_falls_back_without_evidence():
+def test_display_generic_evidence_theme_name_uses_fixed_suffix():
+    # The fallback keeps stable, predictable headings instead of a
+    # hand-maintained evidence-word list.
     name = DailyBriefingService._display_generic_evidence_theme_name(
         "AI 编译器", "技术底座、数据与开源生态"
     )
     assert name == "AI 编译器的技术底座、数据与开源生态"
 
 
-def test_display_generic_evidence_theme_name_skips_topic_repetition():
-    sources = [
-        _source("Loop Engineering 深度解析", "Loop engineering 实战指南"),
-        _source("Loop engineering 真实实践", "Loop engineering 结论"),
-    ]
+def test_display_generic_evidence_theme_name_does_not_repeat_topic():
     name = DailyBriefingService._display_generic_evidence_theme_name(
-        "loop engineering", "技术底座、数据与开源生态", evidence=sources
+        "意图识别", "综合产业动态与待核验证据"
     )
-    assert "loop engineering 的loop" not in name  # no topic repetition
+    assert name == "意图识别的待核验证据线索"
+    assert "意图识别的意图识别" not in name
 
 
 class _EmptySearchClient:

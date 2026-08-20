@@ -895,134 +895,6 @@ def _source_slug_for_plan(platform: str, query: str) -> str:
     return "general-web"
 
 
-def _topic_tokens(topic: str) -> set[str]:
-    """Lowercased latin words + CJK prefixes of a topic, used to keep
-    evidence-driven fallback headings from repeating the topic itself.
-
-    CJK covers both the 4-char prefix (what ``_extract_evidence_core_phrase``
-    counts as ``full``) and the 2-char prefix (its ``pair``), so a topic like
-    "意图识别" excludes both "意图识别" and "意图" from headings.
-    """
-    tokens = set(re.findall(r"[a-z0-9]+", topic.lower()))
-    for run in re.findall(r"[\u4e00-\u9fff]{2,6}", topic):
-        tokens.add(run[:4])
-        tokens.add(run[:2])
-    return tokens
-
-
-def _is_generic_phrase_or_substring(phrase: str) -> bool:
-    """True when ``phrase`` is itself a generic evidence word or is a 2-char
-    substring of one (e.g. "白皮书" -> "白皮"/"皮书" are both generic)."""
-    if phrase in _EVIDENCE_GENERIC_PHRASES:
-        return True
-    return any(phrase in generic for generic in _EVIDENCE_GENERIC_PHRASES if len(generic) >= 2)
-
-
-def _extract_evidence_core_phrase(
-    sources: list["CollectedSource"],
-    exclude: set[str] | None = None,
-) -> str:
-    """Derive a short technical core phrase from a batch of evidence titles.
-
-    Used by the deterministic fallback so its detailed-summary headings are
-    evidence-driven ("…的算子融合：技术底座与开源生态") instead of repeating
-    the same canned suffix for every topic.  Returns "" when no specific
-    phrase can be extracted, in which case the caller falls back to the fixed
-    suffix.
-    """
-    exclude = exclude or set()
-    if not sources:
-        return ""
-    # Count technical tokens (latin words + CJK bigrams) across titles.
-    counts: dict[str, int] = {}
-    for source in sources:
-        text = f"{source.title} {source.snippet}".lower()
-        for match in re.findall(r"[a-z0-9][a-z0-9\-]{2,}", text):
-            if (
-                match in _STOP_WORDS
-                or match in exclude
-                or match in _EVIDENCE_GENERIC_PHRASES
-                or len(match) < 3
-            ):
-                continue
-            counts[match] = counts.get(match, 0) + 1
-        # CJK: prefer whole 2-4 char runs (e.g. "算子融合") over sliding
-        # bigrams ("子融") by counting only the 4-char and 2-char prefixes of
-        # each run — never the 3-char middle ("算子融") which splices across
-        # phrase boundaries.
-        cjk_runs = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
-        for run in cjk_runs:
-            full = run[:4]
-            if (
-                len(full) >= 4
-                and full not in _CJK_STOP_WORDS
-                and full not in exclude
-                and not _is_generic_phrase_or_substring(full)
-            ):
-                counts[full] = counts.get(full, 0) + 1
-            pair = run[:2]
-            if (
-                len(pair) >= 2
-                and pair not in _CJK_STOP_WORDS
-                and pair not in exclude
-                and not _is_generic_phrase_or_substring(pair)
-            ):
-                counts[pair] = counts.get(pair, 0) + 1
-    if not counts:
-        return ""
-    ranked = sorted(counts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
-    best = ranked[0][0]
-    # A single occurrence is too weak to name the section; let the suffix
-    # fallback handle it.
-    if counts[best] < 2:
-        return ""
-    # Combine the top two distinct tokens for a more specific phrase, but skip
-    # a second token that is a redundant prefix/suffix of the first (e.g.
-    # "算子融合" + "算子" -> just "算子融合").
-    second = None
-    for token, count in ranked[1:]:
-        if token in best or best in token:
-            continue
-        if count >= 2:
-            second = token
-            break
-    if second is not None:
-        return f"{best}、{second}"
-    return best
-
-
-_STOP_WORDS = frozenset(
-    {
-        "the", "and", "for", "with", "from", "this", "that", "what", "how",
-        "why", "when", "you", "your", "not", "are", "was", "has", "have",
-        "into", "onto", "about", "more", "most", "some", "such", "than",
-        "then", "they", "their", "there", "these", "those", "will", "would",
-        "can", "could", "should", "https", "http", "www", "com", "org",
-    }
-)
-
-_CJK_STOP_WORDS = frozenset(
-    {
-        "什么", "怎么", "如何", "为什么", "这个", "那个", "我们", "你们", "他们",
-        "以及", "还是", "不是", "没有", "可以", "需要", "能够", "应该", "已经",
-        "进行", "通过", "关于", "一个", "一种", "这个", "相关", "主要", "包括",
-    }
-)
-
-#: Macro / process words that name evidence categories rather than a concrete
-#: technical object.  They must not become evidence-driven fallback headings
-#: (e.g. "报告", "产业", "视频", "案例" would make every topic sound the same).
-_EVIDENCE_GENERIC_PHRASES = frozenset(
-    {
-        "报告", "白皮书", "产业", "行业", "市场", "案例", "视频", "教程", "课程",
-        "资料", "材料", "内容", "文章", "新闻", "评论", "讨论", "观点", "介绍",
-        "解析", "解读", "综述", "指南", "科普", "公开", "线索", "信号", "技术",
-        "智能", "模型", "框架", "系统", "平台", "产品", "应用", "方案", "项目",
-        "建设", "落地", "部署", "发布", "大会", "政策", "规划", "生态", "规模",
-    }
-)
-
-
 class DailyBriefingService:
     def __init__(
         self,
@@ -2418,7 +2290,7 @@ class DailyBriefingService:
                     continue
                 themes.append(
                     BriefingTheme(
-                        name=self._display_generic_evidence_theme_name(topic, name, evidence=evidence),
+                        name=self._display_generic_evidence_theme_name(topic, name),
                         analysis=self._fallback_theme_analysis(evidence, technology, importance, maturity),
                         what_is_happening=self._evidence_summary(evidence),
                         core_technology=technology,
@@ -2516,26 +2388,20 @@ class DailyBriefingService:
         )
 
     @staticmethod
-    def _display_generic_evidence_theme_name(
-        topic: str,
-        generic_name: str,
-        evidence: list[CollectedSource] | None = None,
-    ) -> str:
+    def _display_generic_evidence_theme_name(topic: str, generic_name: str) -> str:
+        """Render a generic evidence theme as '{topic}的{suffix}'.
+
+        The fallback path keeps stable, predictable headings.  Trying to make
+        them evidence-driven with a hand-maintained generic-word list proved
+        to be a maintenance trap (every new generic expression needed a new
+        entry, and the list could also filter out real technical words), so
+        the fallback uses fixed suffixes instead.  Report quality is handled
+        by avoiding the fallback in the first place (dedicated synthesis
+        timeout) and by auditing degradation (synthesis_source=fallback).
+        """
         clean_topic = " ".join(topic.split()).strip(" ：:，,。")
         if not clean_topic:
             clean_topic = "本主题"
-        # Evidence-driven heading: pull the most specific technical words from
-        # the batch so the fallback report does not reuse the same canned
-        # suffixes for every topic (which contradicts the report contract).
-        core = _extract_evidence_core_phrase(evidence or [], exclude=_topic_tokens(clean_topic))
-        if core:
-            angle = {
-                "技术底座、数据与开源生态": "技术底座与开源生态",
-                "应用落地与业务转型案例": "应用落地与业务案例",
-                "教育传播、公众讨论与弱证据线索": "传播讨论与证据边界",
-                "综合产业动态与待核验证据": "待核验线索",
-            }.get(generic_name, "证据线索")
-            return f"{clean_topic}的{core}：{angle}"
         suffixes = {
             "政策、规模与产业链信号": "政策、规模与产业链信号",
             "技术底座、数据与开源生态": "技术底座、数据与开源生态",
