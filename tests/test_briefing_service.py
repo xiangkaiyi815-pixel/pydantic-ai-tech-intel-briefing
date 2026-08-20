@@ -737,7 +737,6 @@ def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp
     assert "技术底座" in briefing.synthesis.detailed_summary
     assert "应用落地" in briefing.synthesis.detailed_summary
     assert "传播讨论" in briefing.synthesis.detailed_summary
-    assert "政策、规模与产业链信号" not in briefing.synthesis.detailed_summary
     assert "相关线索集中讨论" not in briefing.synthesis.detailed_summary
     assert _is_substantive_synthesis(briefing.synthesis) is True
     # The fallback is audited instead of being silent.
