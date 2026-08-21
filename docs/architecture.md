@@ -148,12 +148,15 @@ Phase one separates stable online execution from offline, reviewable evolution:
    against expert labels before use). Verdicts carry evidence locations and may
    abstain with `uncertain` instead of guessing. Failures are routed to
    reviewable experience items; release stays human-gated.
-5. Knowledge candidates accumulate evidence across independent trajectories:
-   a claim that reappears in a second briefing merges its sources into the same
-   candidate, and the validation gate requires at least two independent
-   trajectories plus at least two original sources before a candidate can reach
-   the `validated_knowledge` layer. The offline loop re-runs these gates
-   (distillation) and monitors the eval report and regressed candidates without
-   auto-promoting or auto-deprecating anything.
+5. Knowledge candidates accumulate evidence across qualified trajectories. The
+   validation gate now allows one high-quality briefing trajectory to produce a
+   reviewable candidate only when it also has independent source-domain
+   coverage, sufficient source authority, technical-not-marketing semantic
+   quality, and non-low confidence. Automatic distillation moves candidates
+   that pass every gate to `pending_user_confirm`, not straight to `validated`.
+   Only explicit user or human confirmation promotes a candidate to `validated`,
+   and only validated knowledge enters later planning or context. The offline
+   loop re-runs these gates (distillation) and monitors the eval report and
+   regressed candidates without auto-promoting or auto-deprecating anything.
 6. Learning reports expose trajectory and candidate status. They are reporting
    artifacts, not trusted evidence and not an automatic release mechanism.
