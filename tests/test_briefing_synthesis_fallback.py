@@ -81,7 +81,7 @@ def test_synthesis_source_marker_reflects_fallback(tmp_path):
     assert getattr(service, "last_synthesis_fallback", False) is True
 
 
-# -- fix 3: evidence-driven fallback headings ---------------------------------
+# -- fix 3: deterministic fallback headings -----------------------------------
 
 
 def _source(title: str, snippet: str) -> CollectedSource:
