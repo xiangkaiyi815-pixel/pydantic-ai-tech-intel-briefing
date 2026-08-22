@@ -12,6 +12,7 @@ from search_assistant.memory.store import MemoryStore
 from search_assistant.reports.service import ReportService
 from search_assistant.search.provider import SearchClient
 from search_assistant.skills.service import SkillDraftService
+from search_assistant.workflow.grounding import GroundingDecision, decide_grounding_policy
 from search_assistant.verification.policy import (
     extract_key_claims,
     requires_calibration,
@@ -28,6 +29,13 @@ class SearchAudit:
     sources: list[SourceEvidence]
     engines: list[str] = field(default_factory=list)
     skipped_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class GroundingEnforcement:
+    answer: str
+    unverified_claims: list[str] = field(default_factory=list)
+    fallback_used: bool = False
 
 
 class SearchAssistantWorkflow:
@@ -83,6 +91,7 @@ class SearchAssistantWorkflow:
             question_text = embedded_question
 
         classification = self._classify(question_text)
+        grounding_decision = decide_grounding_policy(question_text, classification)
         answer_strategy = self._answer_strategy(question_text, classification)
         memory_context = self._memory_context(message.user_id, message.chat_id)
         experience_context = self._experience_context(message.user_id, message.chat_id)
@@ -90,6 +99,7 @@ class SearchAssistantWorkflow:
         planning_context: dict[str, object] = {
             "question_id": question_id,
             "classification": classification,
+            "grounding_policy": grounding_decision.to_context(),
             "answer_strategy": answer_strategy,
             "memory": memory_context,
             "experience": experience_context,
@@ -101,6 +111,7 @@ class SearchAssistantWorkflow:
             "question_id": question_id,
             "question": question_text,
             "classification": classification,
+            "grounding_policy": grounding_decision.to_context(),
             "answer_strategy": answer_strategy,
             "memory": memory_context,
             "experience": experience_context,
@@ -111,19 +122,16 @@ class SearchAssistantWorkflow:
 
         calibration: dict[str, object] | None = None
         draft: str | None = None
-        low_relevance_issue = self._low_source_relevance_issue(question_text, classification, search_audit)
-        allow_foundational_fallback = self._allow_foundational_fallback(
+        low_relevance_issue = self._low_source_relevance_issue(
             question_text,
             classification,
-            low_relevance_issue,
+            search_audit,
+            grounding_decision,
         )
-        allow_foundational_refusal_repair = allow_foundational_fallback or self._is_foundational_fallback_candidate(
-            question_text,
-            classification,
-        )
+        allow_foundational_fallback = self._allow_foundational_fallback(grounding_decision, low_relevance_issue)
+        allow_foundational_refusal_repair = grounding_decision.category == "foundational"
         fallback_used = False
-        removed_unsupported_spec_claims: list[str] = []
-        hardware_deployment_gap_claim: str | None = None
+        grounding_policy_claims: list[str] = []
         if low_relevance_issue and not allow_foundational_fallback:
             final_answer = self._low_source_relevance_answer(low_relevance_issue)
             review: dict[str, object] | None = {
@@ -188,25 +196,22 @@ class SearchAssistantWorkflow:
                 final_answer = self._foundational_fallback_answer(question_text, low_relevance_issue)
                 fallback_used = True
             final_answer = self._remove_external_knowledge_sentences(final_answer)
-            final_answer, removed_unsupported_spec_claims = self._sanitize_unsupported_hardware_spec_numbers(
+            enforcement = self._enforce_grounding_policy(
                 final_answer,
+                question_text,
+                grounding_decision,
                 search_results,
             )
+            final_answer = enforcement.answer
+            fallback_used = fallback_used or enforcement.fallback_used
+            grounding_policy_claims = enforcement.unverified_claims
             final_answer = self._remove_malformed_partial_lines(final_answer)
-            if self._should_replace_unsupported_hardware_deployment_answer(question_text, final_answer, search_results):
-                hardware_deployment_gap_claim = (
-                    "Unsupported hardware deployment feasibility answer replaced: "
-                    "missing DeepSeek-V4 public model parameters or benchmark evidence."
-                )
-                final_answer = self._hardware_deployment_evidence_gap_answer(question_text, search_results)
             verified_claims, unverified_claims = self._verify_answer_claims(final_answer, classification, search_results)
             if low_relevance_issue and allow_foundational_fallback and low_relevance_issue not in unverified_claims:
                 unverified_claims.append(low_relevance_issue)
-            for removed_claim in removed_unsupported_spec_claims:
-                if removed_claim not in unverified_claims:
-                    unverified_claims.append(removed_claim)
-            if hardware_deployment_gap_claim and hardware_deployment_gap_claim not in unverified_claims:
-                unverified_claims.append(hardware_deployment_gap_claim)
+            for policy_claim in grounding_policy_claims:
+                if policy_claim not in unverified_claims:
+                    unverified_claims.append(policy_claim)
 
         visible_answer = self._append_search_record(final_answer, search_audit)
         package = AnswerPackage(
@@ -228,6 +233,7 @@ class SearchAssistantWorkflow:
                     for skill in active_skills
                 ],
                 "answer_strategy": answer_strategy,
+                "grounding_policy": grounding_decision.to_context(),
                 "runtime_metadata": {
                     "runtime_class": type(self.runtime).__name__,
                     "model": getattr(self.runtime, "model", None),
@@ -238,6 +244,7 @@ class SearchAssistantWorkflow:
                     "review_failed": review_failed,
                     "fallback_used": fallback_used,
                     "low_relevance_issue": low_relevance_issue,
+                    "grounding_category": grounding_decision.category,
                 },
             },
         )
@@ -587,11 +594,6 @@ class SearchAssistantWorkflow:
                 "memory assumption",
                 "memory assumptions",
                 "parallel",
-                "deepseek-v",
-                "gb10",
-                "h100",
-                "h200",
-                "b200",
                 "tok/s",
                 "tokens per second",
                 "hbm",
@@ -611,6 +613,33 @@ class SearchAssistantWorkflow:
                 "下一步",
             )
         ):
+            return "hard"
+        if self._has_specific_technical_entity(text) and any(
+            word in lowered or word in text
+            for word in (
+                "deploy",
+                "deployment",
+                "calculate",
+                "estimate",
+                "benchmark",
+                "throughput",
+                "tok/s",
+                "tokens per second",
+                "bandwidth",
+                "memory",
+                "部署",
+                "计算",
+                "估算",
+                "基准",
+                "实测",
+                "吞吐",
+                "带宽",
+                "内存",
+                "显存",
+            )
+        ):
+            return "hard"
+        if self._has_specific_technical_entity(text):
             return "hard"
         if any(
             word in lowered
@@ -865,24 +894,31 @@ class SearchAssistantWorkflow:
             "推理",
         )
         technical_terms = (
-            "h100",
-            "h200",
-            "b200",
-            "gb10",
             "gpu",
             "cxl",
             "hbm",
             "kv cache",
             "tensor core",
-            "deepseek",
             "model",
             "模型",
             "显存",
             "内存",
             "算力",
         )
-        return any(signal in lowered or signal in text for signal in mechanism_signals) and any(
-            term in lowered or term in text for term in technical_terms
+        has_mechanism_signal = any(signal in lowered or signal in text for signal in mechanism_signals)
+        has_technical_subject = any(term in lowered or term in text for term in technical_terms)
+        return has_mechanism_signal and (has_technical_subject or self._has_specific_technical_entity(text))
+
+    def _has_specific_technical_entity(self, text: str) -> bool:
+        return bool(
+            re.search(r"(?<![A-Za-z0-9])[A-Z]{1,8}\d{2,}[A-Za-z0-9-]*(?![A-Za-z0-9])", text)
+            or re.search(r"(?<![A-Za-z0-9])[A-Z]{2,}\s+[A-Z]?\d{2,}[A-Za-z0-9-]*(?![A-Za-z0-9])", text)
+            or re.search(
+                r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]+[-\s]?v\d+[A-Za-z0-9-]*(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            )
+            or re.search(r"(?<![A-Za-z0-9])[A-Za-z]+-\d+[A-Za-z0-9-]*(?![A-Za-z0-9])", text)
         )
 
     def _confidence(self, classification: Classification, has_unverified_claims: bool) -> str:
@@ -916,7 +952,11 @@ class SearchAssistantWorkflow:
             updates.append({"kind": "practice", "content": "Verification practice", "source_id": question_id})
         if any(word in lowered for word in ("api", "version", "版本")):
             updates.append({"kind": "topic", "content": "API reliability", "source_id": question_id})
-        if any(word in lowered for word in ("gb10", "dgx spark", "deepseek-v", "model deployment", "deploy a deepseek")):
+        if (
+            "model deployment" in lowered
+            or ("deploy" in lowered and "model" in lowered)
+            or ("部署" in lowered and "模型" in message.text)
+        ):
             updates.append(
                 {
                     "kind": "topic",
@@ -1043,7 +1083,7 @@ class SearchAssistantWorkflow:
     def _looks_like_malformed_partial_line(self, line: str) -> bool:
         if line.count("（") > line.count("）") or line.count("(") > line.count(")"):
             return True
-        return bool(re.search(r"(?:^|[\s，,（(])(?:CXL|GB|GT|TB|MB|DeepSeek|NVIDIA|vLLM|MoE)\s*\d+(?:\.\d*)?\.$", line))
+        return bool(re.search(r"(?:^|[\s，,（(])(?:[A-Z]{2,}|[A-Z][A-Za-z]+)\s*\d+(?:\.\d*)?\.$", line))
 
     def _is_distributed_model_understanding_question(self, question: str) -> bool:
         lowered = question.lower()
@@ -1222,7 +1262,23 @@ class SearchAssistantWorkflow:
             return len(matched) >= 3
         return len(answer.strip()) >= 120
 
-    def _sanitize_unsupported_hardware_spec_numbers(
+    def _enforce_grounding_policy(
+        self,
+        answer: str,
+        question: str,
+        decision: GroundingDecision,
+        sources: list[SourceEvidence],
+    ) -> GroundingEnforcement:
+        sanitized, removed_claims = self._sanitize_unsupported_precise_values(answer, sources)
+        if self._should_replace_unsupported_evidence_required_answer(question, sanitized, decision, sources):
+            issue = "Unsupported evidence-required answer replaced: missing required retrieval evidence."
+            return GroundingEnforcement(
+                answer=self._evidence_required_gap_answer(decision, sources),
+                unverified_claims=[*removed_claims, issue],
+            )
+        return GroundingEnforcement(answer=sanitized, unverified_claims=removed_claims)
+
+    def _sanitize_unsupported_precise_values(
         self,
         answer: str,
         sources: list[SourceEvidence],
@@ -1320,71 +1376,100 @@ class SearchAssistantWorkflow:
         sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
         return sanitized, removed
 
-    def _should_replace_unsupported_hardware_deployment_answer(
+    def _sanitize_unsupported_hardware_spec_numbers(
+        self,
+        answer: str,
+        sources: list[SourceEvidence],
+    ) -> tuple[str, list[str]]:
+        # Legacy compatibility wrapper. The active workflow calls
+        # _sanitize_unsupported_precise_values through Grounding Policy; do not
+        # add new rules here. Remove once external callers have migrated.
+        return self._sanitize_unsupported_precise_values(answer, sources)
+
+    def _should_replace_unsupported_evidence_required_answer(
         self,
         question: str,
         answer: str,
+        decision: GroundingDecision,
         sources: list[SourceEvidence],
     ) -> bool:
-        if not self._is_hardware_deployment_feasibility_question(question):
+        if decision.category not in {"evidence_required", "high_stakes"}:
             return False
-        if self._has_requested_model_parameter_evidence(question, sources):
+        if not decision.require_retrieval_sources:
             return False
-        return self._contains_hardware_deployment_positive_claim(answer)
+        if not sources:
+            return self._contains_evidence_required_positive_claim(answer)
+        if "deployment_feasibility" not in decision.required_evidence_families:
+            return False
+        if self._has_deployment_feasibility_evidence(question, decision, sources):
+            return False
+        return self._contains_evidence_required_positive_claim(answer)
 
-    def _is_hardware_deployment_feasibility_question(self, question: str) -> bool:
-        lowered = question.lower()
-        has_hardware = any(term in lowered for term in ("gb10", "dgx spark", "project digits", "nvidia gb10"))
-        has_model = "deepseek" in lowered or "deepseek" in question
-        has_deployment = any(
-            term in lowered
-            for term in (
-                "deploy",
-                "deployment",
-                "run",
-                "fit",
-                "calculate",
-                "memory assumption",
-                "full",
-                "full-precision",
-                "cluster",
-            )
-        ) or any(term in question for term in ("部署", "运行", "装下", "计算", "估算", "满血", "并联", "集群"))
-        return has_hardware and has_model and has_deployment
-
-    def _has_requested_model_parameter_evidence(self, question: str, sources: list[SourceEvidence]) -> bool:
-        lowered_question = question.lower()
-        version_match = re.search(r"deepseek[-\s]?v(\d+)", lowered_question)
-        requested_model = f"deepseek-v{version_match.group(1)}" if version_match else "deepseek"
-        requested_version = version_match.group(1) if version_match else None
+    def _has_deployment_feasibility_evidence(
+        self,
+        question: str,
+        decision: GroundingDecision,
+        sources: list[SourceEvidence],
+    ) -> bool:
+        model_entity = self._requested_model_entity(question, decision)
         for source in sources:
             if self._source_is_query_echo_without_page_content(source):
                 continue
-            source_text = f"{source.title} {source.snippet} {source.url}".lower()
-            if requested_version:
-                if not re.search(rf"deepseek[-\s]?v{re.escape(requested_version)}\b", source_text):
-                    continue
-            elif requested_model not in source_text and "deepseek" not in source_text:
+            source_text = f"{source.title} {source.snippet} {source.url}"
+            if model_entity and self._compact_spec_text(model_entity) not in self._compact_spec_text(source_text):
                 continue
-            if re.search(
-                r"\b\d+(?:\.\d+)?\s*(?:b|t)\b.{0,80}(?:total parameters|parameters|params|activated|active parameters|experts)",
-                source_text,
-            ):
-                return True
-            if re.search(
-                r"(?:total parameters|parameters|params|activated|active parameters|experts).{0,80}\b\d+(?:\.\d+)?\s*(?:b|t)\b",
-                source_text,
-            ):
-                return True
-            if re.search(r"(?:num_hidden_layers|hidden_size|num_attention_heads|num_experts|moe_intermediate_size)", source_text):
+            if self._has_model_parameter_or_benchmark_evidence(source_text):
                 return True
         return False
+
+    def _requested_model_entity(self, question: str, decision: GroundingDecision) -> str | None:
+        lowered_question = question.lower()
+        for entity in decision.specific_entities:
+            escaped = re.escape(entity)
+            if re.search(
+                rf"(?:model|模型|参数).{{0,40}}{escaped}|{escaped}.{{0,40}}(?:model|模型|参数)",
+                question,
+                flags=re.IGNORECASE,
+            ):
+                return entity
+        if ("model" in lowered_question or "模型" in question) and decision.specific_entities:
+            return decision.specific_entities[-1]
+        return None
+
+    def _has_model_parameter_or_benchmark_evidence(self, text: str) -> bool:
+        lowered = text.lower()
+        negative_patterns = (
+            r"does not disclose.{0,80}(?:parameter|benchmark|throughput)",
+            r"not disclose.{0,80}(?:parameter|benchmark|throughput)",
+            r"no .{0,40}(?:parameter|benchmark|throughput|performance)",
+            r"未.{0,20}(?:公开|确认|披露).{0,40}(?:参数|benchmark|基准|吞吐|性能)",
+            r"没有.{0,40}(?:参数|benchmark|基准|吞吐|性能)",
+        )
+        if any(re.search(pattern, lowered) or re.search(pattern, text) for pattern in negative_patterns):
+            return False
+        if re.search(
+            r"\b\d+(?:\.\d+)?\s*(?:b|t)\b.{0,80}(?:total parameters|parameters|params|activated|active parameters|experts)",
+            lowered,
+        ):
+            return True
+        if re.search(
+            r"(?:total parameters|parameters|params|activated|active parameters|experts).{0,80}\b\d+(?:\.\d+)?\s*(?:b|t)\b",
+            lowered,
+        ):
+            return True
+        if re.search(r"(?:num_hidden_layers|hidden_size|num_attention_heads|num_experts|moe_intermediate_size)", lowered):
+            return True
+        return bool(
+            re.search(r"\b\d+(?:\.\d+)?\s*(?:tok/s|tokens/s|token/s|ms)\b", lowered)
+            or re.search(r"(?:benchmark|throughput|latency|performance).{0,80}\b\d+(?:\.\d+)?", lowered)
+            or re.search(r"(?:基准|吞吐|延迟|性能).{0,40}\d+(?:\.\d+)?", text)
+        )
 
     def _source_is_query_echo_without_page_content(self, source: SourceEvidence) -> bool:
         snippet = source.snippet.lower()
         return "direct source selected for query" in snippet and "page content fetch was unavailable" in snippet
 
-    def _contains_hardware_deployment_positive_claim(self, answer: str) -> bool:
+    def _contains_evidence_required_positive_claim(self, answer: str) -> bool:
         positive_markers = (
             "can probably fit",
             "can fit",
@@ -1398,6 +1483,11 @@ class SearchAssistantWorkflow:
             "tokens/s",
             "single-stream decode",
             "throughput",
+            "is enough",
+            "sufficient",
+            "feasible",
+            "can confirm",
+            "confirmed",
             "有可能装下",
             "有可能在内存",
             "可能装下",
@@ -1415,6 +1505,9 @@ class SearchAssistantWorkflow:
             "可以运行",
             "能够运行",
             "推理吞吐",
+            "足够",
+            "可行",
+            "确认",
         )
         negated_claim_markers = (
             "not to claim",
@@ -1428,6 +1521,11 @@ class SearchAssistantWorkflow:
             "不要宣称",
             "不能宣称",
             "不应宣称",
+            "cannot confirm",
+            "cannot determine",
+            "无法确认",
+            "不能确认",
+            "无法判断",
         )
         segments = [segment.strip() for segment in re.split(r"[\n。；;.!?]+", answer) if segment.strip()]
         for segment in segments:
@@ -1439,10 +1537,14 @@ class SearchAssistantWorkflow:
             return True
         return False
 
-    def _hardware_deployment_evidence_gap_answer(self, question: str, sources: list[SourceEvidence]) -> str:
+    def _evidence_required_gap_answer(
+        self,
+        decision: GroundingDecision,
+        sources: list[SourceEvidence],
+    ) -> str:
         relevant_sources = sources[:5]
         lines = [
-            "I cannot confirm whether the requested GB10/DGX Spark cluster can deploy a full DeepSeek-V4-class model from the retrieved evidence.",
+            "I cannot confirm the requested evidence-required conclusion from the retrieved evidence.",
             "",
             "What the search evidence supports:",
         ]
@@ -1455,15 +1557,17 @@ class SearchAssistantWorkflow:
             [
                 "",
                 "What is still missing:",
-                "- DeepSeek-V4 public model parameters: total parameters, active parameters, MoE expert count, hidden size/layers, and precision or quantization target.",
-                "- A supported parallelism plan for more than two GB10/DGX Spark nodes.",
-                "- A benchmark or reproducible serving configuration for tok/s, latency, batch size, context length, and KV-cache memory.",
+                "- The requested model parameters or model-card facts needed for the calculation.",
+                "- A supported deployment or parallelism plan for the requested system count.",
+                "- A benchmark or reproducible serving configuration for throughput, latency, batch size, context length, and cache memory.",
                 "",
                 "Safe conclusion:",
-                "- The answer should stay at low confidence until those model and benchmark facts are found.",
-                "- It is fine to use the retrieved DGX Spark memory/interconnect facts as constraints, but not to claim the model can fit, can run, or can reach a tok/s range without the missing model and serving evidence.",
+                "- The answer should stay at low confidence until the missing source-backed facts are found.",
+                "- It is fine to use retrieved hardware or system facts as constraints, but not to claim fit, deployability, runtime behavior, or a throughput range without the missing model and benchmark evidence.",
             ]
         )
+        if decision.specific_entities:
+            lines.extend(["", f"Policy scope: {', '.join(decision.specific_entities)}"])
         return "\n".join(lines)
 
     def _compact_spec_text(self, text: str) -> str:
@@ -1488,6 +1592,7 @@ class SearchAssistantWorkflow:
         question: str,
         classification: Classification,
         audit: SearchAudit,
+        grounding_decision: GroundingDecision,
     ) -> str | None:
         if classification == "simple" or not audit.executed:
             return None
@@ -1495,9 +1600,10 @@ class SearchAssistantWorkflow:
         if not question_terms:
             return None
         if not audit.sources:
-            no_source_issue = "搜索未返回可用结果：本轮联网搜索没有可用来源，只能给出低置信的基础概念解释。"
-            if self._allow_foundational_fallback(question, classification, no_source_issue):
-                return no_source_issue
+            if grounding_decision.category == "foundational":
+                return "搜索未返回可用结果：本轮联网搜索没有可用来源，只能给出低置信的基础概念解释。"
+            if grounding_decision.require_retrieval_sources:
+                return "搜索未返回可用结果：本轮联网搜索没有可用来源，不能给出确定事实、精确数字或部署结论。"
             return None
 
         best_overlap = 0
@@ -1517,81 +1623,12 @@ class SearchAssistantWorkflow:
 
     def _allow_foundational_fallback(
         self,
-        question: str,
-        classification: Classification,
+        grounding_decision: GroundingDecision,
         low_relevance_issue: str | None,
     ) -> bool:
         if not low_relevance_issue:
             return False
-        return self._is_foundational_fallback_candidate(question, classification)
-
-    def _is_foundational_fallback_candidate(self, question: str, classification: Classification) -> bool:
-        if classification == "high_stakes":
-            return False
-        lowered = question.lower()
-        exact_or_current_markers = (
-            "latest",
-            "current",
-            "newest",
-            "today",
-            "as of",
-            "2026",
-            "benchmark",
-            "throughput number",
-            "tok/s number",
-            "tokens per second number",
-            "deploy",
-            "deployment",
-            "calculate",
-            "estimate",
-            "parameter",
-            "model card",
-            "最新",
-            "当前",
-            "今天",
-            "截至",
-            "目前",
-            "基准",
-            "实测",
-            "数字",
-            "多少",
-            "计算",
-            "估算",
-            "部署",
-            "满血",
-            "参数",
-            "模型卡",
-        )
-        if any(marker in lowered or marker in question for marker in exact_or_current_markers):
-            return False
-        foundational_markers = (
-            "can i understand",
-            "can be understood",
-            "is it fair to say",
-            "is it correct to think",
-            "how should i understand",
-            "what is",
-            "explain",
-            "concept",
-            "principle",
-            "mechanism",
-            "是否可以理解为",
-            "可以理解为",
-            "能否理解为",
-            "能不能理解为",
-            "是不是可以理解",
-            "如何理解",
-            "怎么理解",
-            "是什么",
-            "什么是",
-            "解释一下",
-            "介绍一下",
-            "基础",
-            "概念",
-            "原理",
-            "机制",
-        )
-        return any(marker in lowered or marker in question for marker in foundational_markers)
+        return grounding_decision.category == "foundational" and grounding_decision.allow_stable_model_knowledge
 
     def _has_strong_entity_match(self, question_terms: set[str], source_text: str) -> bool:
         for term in question_terms:
@@ -1605,10 +1642,6 @@ class SearchAssistantWorkflow:
         aliases = {
             "cxl": ["cxl", "compute express link"],
             "cx7": ["cx7", "connectx-7", "connectx 7"],
-            "gb10": ["gb10", "grace blackwell"],
-            "h100": ["h100", "hopper"],
-            "h200": ["h200", "hopper"],
-            "b200": ["b200", "blackwell"],
             "nvlink": ["nvlink"],
             "gr00t": ["gr00t"],
             "hbm": ["hbm", "hbm2e", "hbm3", "hbm3e", "high bandwidth memory"],
@@ -1617,9 +1650,7 @@ class SearchAssistantWorkflow:
         }
         if normalized in aliases:
             return aliases[normalized]
-        if re.fullmatch(r"deepseek-v\d+", normalized):
-            return [normalized, normalized.replace("-", " ")]
-        if re.fullmatch(r"[a-z]{2,6}\d*", normalized) and any(ch.isdigit() for ch in normalized):
+        if re.fullmatch(r"[a-z]{1,8}\d[a-z0-9-]*", normalized):
             return [normalized]
         return []
 
@@ -1665,15 +1696,9 @@ class SearchAssistantWorkflow:
             )
         ):
             aliases.extend(["physical ai", "world foundation", "world model", "embodied", "cosmos", "genie"])
-        if "deepseek" in lowered and any(
-            marker in lowered
-            for marker in ("modelscope", "魔搭", "hugging face", "huggingface", "github", "nvidia", "官方")
-        ):
-            aliases.extend(["modelscope", "huggingface", "hugging face", "github", "nvidia"])
         if self._is_accelerator_inference_bandwidth_question(lowered):
             aliases.extend(
                 [
-                    "h100",
                     "hbm",
                     "hbm3",
                     "memory bandwidth",
@@ -2796,15 +2821,8 @@ class SearchAssistantWorkflow:
 
     def _hardware_inference_search_query(self, text: str) -> str | None:
         lowered = text.lower()
-        if not self._is_accelerator_inference_bandwidth_question(lowered):
-            return None
-
-        accelerator = ""
-        for candidate in ("h100", "h200", "b200", "gb200", "b300"):
-            if candidate in lowered:
-                accelerator = candidate.upper()
-                break
-        if not accelerator:
+        accelerator = self._accelerator_like_entity(text)
+        if not accelerator or not self._is_accelerator_inference_bandwidth_question(lowered, accelerator):
             return None
 
         query_terms = [
@@ -2818,8 +2836,16 @@ class SearchAssistantWorkflow:
         ]
         return " ".join(query_terms)
 
-    def _is_accelerator_inference_bandwidth_question(self, lowered_text: str) -> bool:
-        has_accelerator = any(term in lowered_text for term in ("h100", "h200", "b200", "gb200", "b300"))
+    def _accelerator_like_entity(self, text: str) -> str | None:
+        match = re.search(r"(?<![A-Za-z0-9])[A-Z]{1,8}\d{2,}[A-Za-z0-9-]*(?![A-Za-z0-9])", text)
+        if match:
+            return match.group(0).upper()
+        return None
+
+    def _is_accelerator_inference_bandwidth_question(self, lowered_text: str, accelerator: str | None = None) -> bool:
+        has_accelerator = bool(accelerator) or bool(
+            re.search(r"(?<![a-z0-9])[a-z]{1,8}\d{2,}[a-z0-9-]*(?![a-z0-9])", lowered_text)
+        )
         has_throughput_signal = any(
             term in lowered_text
             for term in (
@@ -2881,12 +2907,7 @@ class SearchAssistantWorkflow:
         if not any(phrase in lowered_query for phrase in ("help me", "what is", "as of", "where are", "how does")):
             return query
 
-        cleaned = re.sub(
-            r"\bDeepSeek[-\s]?V(\d+)(?:[-\s]?(?:class|pro))?\b",
-            r"DeepSeek-V\1",
-            query,
-            flags=re.IGNORECASE,
-        )
+        cleaned = query
         cleaned = re.sub(r"[,.;:?!()\[\]{}\"']", " ", cleaned)
         raw_tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*|\d{4}|\d+", cleaned)
 
@@ -2924,10 +2945,6 @@ class SearchAssistantWorkflow:
             "whether",
             "with",
         }
-        expansions = {
-            "gb10": ["DGX", "Spark", "Project", "DIGITS"],
-        }
-
         tokens: list[str] = []
         years: list[str] = []
         for raw_token in raw_tokens:
@@ -2942,9 +2959,6 @@ class SearchAssistantWorkflow:
             if lower in stopwords or lower == "class":
                 continue
             tokens.append(token)
-            for expanded in expansions.get(lower, []):
-                if expanded not in tokens:
-                    tokens.append(expanded)
 
         compact = " ".join(tokens + years)
         return compact or query
@@ -2957,12 +2971,6 @@ class SearchAssistantWorkflow:
             return "AI"
         if lower == "cxl":
             return "CXL"
-        if lower == "gb10":
-            return "GB10"
         if lower == "gpus":
             return "GPUs"
-        if lower.startswith("deepseek-v"):
-            version = re.search(r"deepseek-v(\d+)", lower)
-            if version:
-                return f"DeepSeek-V{version.group(1)}"
         return token
