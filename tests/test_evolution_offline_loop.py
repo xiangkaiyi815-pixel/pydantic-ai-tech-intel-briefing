@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from search_assistant.contracts import (
     BriefingSynthesis,
@@ -242,6 +242,7 @@ def test_offline_loop_rollback_monitor_flags_regressed_candidate(tmp_path):
 
 
 def _briefing(briefing_id: str, url_prefix: str) -> DailyBriefing:
+    now = datetime.now(UTC)
     sources = [
         CollectedSource(
             id=f"source-{url_prefix}-{index}",
@@ -256,7 +257,7 @@ def _briefing(briefing_id: str, url_prefix: str) -> DailyBriefing:
             query="industrial AI workflow",
             relevance_score=0.9,
             importance_score=0.9,
-            retrieved_at=f"2026-08-0{index}T00:00:00Z",
+            retrieved_at=(now - timedelta(days=index)).isoformat().replace("+00:00", "Z"),
         )
         for index in range(1, 3)
     ]
@@ -266,7 +267,7 @@ def _briefing(briefing_id: str, url_prefix: str) -> DailyBriefing:
         user_id="user-1",
         chat_id="chat-1",
         topic="industrial AI",
-        run_date=date(2026, 8, 6),
+        run_date=now.date(),
         search_directions=["industrial AI workflow"],
         keywords=["industrial AI"],
         sources=sources,
@@ -290,5 +291,5 @@ def _briefing(briefing_id: str, url_prefix: str) -> DailyBriefing:
             landing_suggestions=["Start with review-only mode", "Record rollback outcomes"],
         ),
         markdown="# Industrial AI",
-        created_at="2026-08-06T00:00:00Z",
+        created_at=now.isoformat().replace("+00:00", "Z"),
     )

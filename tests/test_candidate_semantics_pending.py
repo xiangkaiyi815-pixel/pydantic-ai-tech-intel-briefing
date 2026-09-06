@@ -4,7 +4,7 @@ semantic merging."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from search_assistant.contracts import (
     BriefingSynthesis,
@@ -25,6 +25,7 @@ from search_assistant.evolution.service import (
 
 
 def _briefing(briefing_id: str, url_prefix: str, source_count: int = 2) -> DailyBriefing:
+    now = datetime.now(UTC)
     sources = [
         CollectedSource(
             id=f"source-{url_prefix}-{index}",
@@ -38,7 +39,7 @@ def _briefing(briefing_id: str, url_prefix: str, source_count: int = 2) -> Daily
             query="industrial AI workflow",
             relevance_score=0.9,
             importance_score=0.9,
-            retrieved_at=f"2026-08-0{index}T00:00:00Z",
+            retrieved_at=(now - timedelta(days=index)).isoformat().replace("+00:00", "Z"),
         )
         for index in range(1, source_count + 1)
     ]
@@ -48,7 +49,7 @@ def _briefing(briefing_id: str, url_prefix: str, source_count: int = 2) -> Daily
         user_id="user-1",
         chat_id="chat-1",
         topic="industrial AI",
-        run_date=date(2026, 8, 6),
+        run_date=now.date(),
         search_directions=["industrial AI workflow"],
         keywords=["industrial AI"],
         sources=sources,
@@ -72,7 +73,7 @@ def _briefing(briefing_id: str, url_prefix: str, source_count: int = 2) -> Daily
             landing_suggestions=["Start with review-only mode", "Record rollback outcomes"],
         ),
         markdown="# Industrial AI",
-        created_at="2026-08-06T00:00:00Z",
+        created_at=now.isoformat().replace("+00:00", "Z"),
     )
 
 

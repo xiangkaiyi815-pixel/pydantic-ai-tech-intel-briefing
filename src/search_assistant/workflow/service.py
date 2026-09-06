@@ -12,7 +12,13 @@ from search_assistant.memory.store import MemoryStore
 from search_assistant.reports.service import ReportService
 from search_assistant.search.provider import SearchClient
 from search_assistant.skills.service import SkillDraftService
-from search_assistant.workflow.grounding import GroundingDecision, decide_grounding_policy
+from search_assistant.workflow.grounding import (
+    GroundingDecision,
+    QuestionProfile,
+    build_question_profile,
+    classify_question_profile,
+    decide_grounding_policy,
+)
 from search_assistant.verification.policy import (
     extract_key_claims,
     requires_calibration,
@@ -32,10 +38,11 @@ class SearchAudit:
 
 
 @dataclass(frozen=True)
-class GroundingEnforcement:
+class GroundingReport:
     answer: str
     unverified_claims: list[str] = field(default_factory=list)
     fallback_used: bool = False
+    enforcement_actions: list[str] = field(default_factory=list)
 
 
 class SearchAssistantWorkflow:
@@ -90,8 +97,9 @@ class SearchAssistantWorkflow:
                 return self._answer_feedback_command(message, question_id)
             question_text = embedded_question
 
-        classification = self._classify(question_text)
-        grounding_decision = decide_grounding_policy(question_text, classification)
+        question_profile = build_question_profile(question_text)
+        classification = self._classify(question_profile)
+        grounding_decision = decide_grounding_policy(question_profile, classification)
         answer_strategy = self._answer_strategy(question_text, classification)
         memory_context = self._memory_context(message.user_id, message.chat_id)
         experience_context = self._experience_context(message.user_id, message.chat_id)
@@ -99,6 +107,7 @@ class SearchAssistantWorkflow:
         planning_context: dict[str, object] = {
             "question_id": question_id,
             "classification": classification,
+            "question_profile": question_profile.to_context(),
             "grounding_policy": grounding_decision.to_context(),
             "answer_strategy": answer_strategy,
             "memory": memory_context,
@@ -111,6 +120,7 @@ class SearchAssistantWorkflow:
             "question_id": question_id,
             "question": question_text,
             "classification": classification,
+            "question_profile": question_profile.to_context(),
             "grounding_policy": grounding_decision.to_context(),
             "answer_strategy": answer_strategy,
             "memory": memory_context,
@@ -129,9 +139,9 @@ class SearchAssistantWorkflow:
             grounding_decision,
         )
         allow_foundational_fallback = self._allow_foundational_fallback(grounding_decision, low_relevance_issue)
-        allow_foundational_refusal_repair = grounding_decision.category == "foundational"
         fallback_used = False
         grounding_policy_claims: list[str] = []
+        grounding_enforcement_actions: list[str] = []
         if low_relevance_issue and not allow_foundational_fallback:
             final_answer = self._low_source_relevance_answer(low_relevance_issue)
             review: dict[str, object] | None = {
@@ -144,7 +154,7 @@ class SearchAssistantWorkflow:
             verified_claims = []
             unverified_claims = [low_relevance_issue]
         else:
-            if allow_foundational_refusal_repair:
+            if grounding_decision.category == "foundational":
                 context["foundational_answer_policy"] = (
                     "For stable concept or understanding-check questions, do not refuse solely because "
                     "live search evidence is thin. Give the basic conceptual answer, keep uncertainty visible, "
@@ -185,27 +195,21 @@ class SearchAssistantWorkflow:
             )
             review_failed = bool(review and review.get("ran") and not review.get("approved", False))
             if review_failed:
-                if allow_foundational_refusal_repair:
-                    final_answer = self._foundational_fallback_answer(question_text, low_relevance_issue)
-                    fallback_used = True
-                else:
-                    final_answer = self._review_rejection_answer(review)
+                final_answer = self._review_rejection_answer(review)
             elif review and isinstance(review.get("revision"), str) and review["revision"].strip():
                 final_answer = review["revision"].strip()
-            if allow_foundational_refusal_repair and self._needs_foundational_concept_repair(question_text, final_answer):
-                final_answer = self._foundational_fallback_answer(question_text, low_relevance_issue)
-                fallback_used = True
-            final_answer = self._remove_external_knowledge_sentences(final_answer)
             enforcement = self._enforce_grounding_policy(
                 final_answer,
                 question_text,
                 grounding_decision,
                 search_results,
+                low_relevance_issue=low_relevance_issue,
+                review_failed=review_failed,
             )
             final_answer = enforcement.answer
             fallback_used = fallback_used or enforcement.fallback_used
             grounding_policy_claims = enforcement.unverified_claims
-            final_answer = self._remove_malformed_partial_lines(final_answer)
+            grounding_enforcement_actions = enforcement.enforcement_actions
             verified_claims, unverified_claims = self._verify_answer_claims(final_answer, classification, search_results)
             if low_relevance_issue and allow_foundational_fallback and low_relevance_issue not in unverified_claims:
                 unverified_claims.append(low_relevance_issue)
@@ -233,7 +237,13 @@ class SearchAssistantWorkflow:
                     for skill in active_skills
                 ],
                 "answer_strategy": answer_strategy,
+                "question_profile": question_profile.to_context(),
                 "grounding_policy": grounding_decision.to_context(),
+                "grounding_report": {
+                    "fallback_used": fallback_used,
+                    "unverified_claims": grounding_policy_claims,
+                    "enforcement_actions": grounding_enforcement_actions,
+                },
                 "runtime_metadata": {
                     "runtime_class": type(self.runtime).__name__,
                     "model": getattr(self.runtime, "model", None),
@@ -572,87 +582,8 @@ class SearchAssistantWorkflow:
         )
         return package
 
-    def _classify(self, text: str) -> Classification:
-        lowered = text.lower()
-        if any(
-            word in lowered
-            for word in ("medical", "legal", "financial", "investment", "safety", "医疗", "法律", "金融", "投资", "安全")
-        ):
-            return "high_stakes"
-        if any(
-            word in lowered
-            for word in (
-                "compare",
-                "migration",
-                "risks",
-                "architecture",
-                "debug",
-                "why",
-                "calculate",
-                "deploy",
-                "deployment",
-                "memory assumption",
-                "memory assumptions",
-                "parallel",
-                "tok/s",
-                "tokens per second",
-                "hbm",
-                "kv cache",
-                "memory bandwidth",
-                "bandwidth",
-                "比较",
-                "风险",
-                "架构",
-                "调试",
-                "为什么",
-                "带宽",
-                "吞吐",
-                "推理",
-                "学习方向",
-                "学习路线",
-                "下一步",
-            )
-        ):
-            return "hard"
-        if self._has_specific_technical_entity(text) and any(
-            word in lowered or word in text
-            for word in (
-                "deploy",
-                "deployment",
-                "calculate",
-                "estimate",
-                "benchmark",
-                "throughput",
-                "tok/s",
-                "tokens per second",
-                "bandwidth",
-                "memory",
-                "部署",
-                "计算",
-                "估算",
-                "基准",
-                "实测",
-                "吞吐",
-                "带宽",
-                "内存",
-                "显存",
-            )
-        ):
-            return "hard"
-        if self._has_specific_technical_entity(text):
-            return "hard"
-        if any(
-            word in lowered
-            for word in ("latest", "current", "newest", "today", "2026", "api", "version", "最新", "当前", "今天", "版本", "核验", "验证")
-        ):
-            return "research"
-        if any(word in lowered for word in ("搜索", "查询", "检索", "查找", "搜一下", "截至", "现在", "目前")):
-            return "research"
-        if any(word in lowered for word in ("是什么", "什么是", "解释一下", "介绍一下")):
-            return "research"
-        if re.search(r"\bwhat\s+is\b", lowered):
-            return "research"
-        return "simple"
+    def _classify(self, profile: QuestionProfile) -> Classification:
+        return classify_question_profile(profile)
 
     def _answer_strategy(self, text: str, classification: Classification) -> dict[str, object]:
         lowered = text.lower()
@@ -1009,32 +940,30 @@ class SearchAssistantWorkflow:
         return "\n".join(lines)
 
     def _foundational_fallback_answer(self, question: str, issue: str | None) -> str:
-        if self._is_distributed_model_understanding_question(question):
-            lines = [
-                "可以这么理解，但要加两个边界。",
-                "",
-                "基础解释:",
-                "- 分布式大模型推理通常可以看成多个计算节点协同完成一次推理，而不是单个节点独立跑完整工作。",
-                "- 每个节点负责“一部分推理工作”的含义取决于并行方式：可能是部分模型层、部分张量计算、部分专家、部分请求批次，或部分 KV/cache 与通信同步。",
-                "- 节点不是完全相对独立的孤岛。它们需要通过高速互联交换中间激活、同步结果、传递请求状态或聚合输出，所以互联带宽和延迟会直接影响效率。",
-                "- 因此，你的说法作为入门理解大体成立：多节点分工 + 节点间互联协同。但更精确地说，分布式推理是一套由并行策略、调度、通信和内存管理共同组成的系统。",
-                "",
-                "低置信说明: 本轮联网搜索证据弱，以上只作为稳定概念层面的解释；它不能替代某个具体模型、硬件集群或 tok/s 性能结论。",
-            ]
-        else:
-            lines = [
-                "先给低置信的基础概念回答：这个问题不应该只因为搜索证据弱就被阻断。",
-                "",
-                "基础解释:",
-                "- 如果这是在确认一个概念理解，可以先把你的表述当作一个工作假设来拆解：它是否说明了主体、分工方式、协作关系和边界条件。",
-                "- 只要问题不涉及最新事实、具体数字、厂商规格或高风险决策，就可以先给稳定概念层面的解释，再明确哪些部分还需要搜索核实。",
-                "- 当前可给出的只是概念框架，不应扩展成未经核实的事实结论。",
-                "",
-                "低置信说明: 本轮联网搜索证据弱，以上只作为基础解释；具体事实、参数和性能仍需重新检索并核验。",
-            ]
+        focus = self._concept_focus_phrase(question)
+        lines = [
+            "可以这么理解，但要保留低置信边界：这个问题不应该只因为搜索证据弱就被阻断。",
+            "",
+            "基础解释:",
+            f"- 先把问题聚焦在“{focus}”这个概念或理解关系上，而不是扩展成未经核实的事实结论。",
+            "- 可以先区分主体、组成部分、工作方式、相互关系和边界条件，再说明哪些部分只是稳定概念，哪些部分需要来源支持。",
+            "- 只要问题不涉及最新事实、具体数字、厂商规格、版本事实或高风险决策，就允许使用稳定模型知识给出概念层面的解释。",
+            "- 如果问题后续转向参数、性能、发布时间、兼容性或部署可行性，就必须重新检索并核验证据。",
+            "",
+            "低置信说明: 本轮联网搜索证据弱，以上只作为基础解释；具体事实、参数、版本、性能和部署结论仍需重新检索并核验。",
+        ]
         if issue:
             lines.extend(["", f"搜索校准: {issue}"])
         return "\n".join(lines)
+
+    def _concept_focus_phrase(self, question: str) -> str:
+        cleaned = question.strip()
+        cleaned = re.sub(r"^\s*(?:请|请问|麻烦|帮我)?(?:能否|能不能|可不可以)?(?:解释|介绍|说明)(?:一下)?[:：]?\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*(?:what\s+is|can\s+you\s+explain|explain)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[？?。!！]+$", "", cleaned).strip()
+        if not cleaned:
+            return "问题中的核心概念"
+        return cleaned[:80]
 
     def _remove_external_knowledge_sentences(self, answer: str) -> str:
         marker_pattern = (
@@ -1155,7 +1084,7 @@ class SearchAssistantWorkflow:
         has_refusal = any(term in lowered or term in answer for term in refusal_terms)
         return has_source_issue and has_refusal
 
-    def _needs_foundational_concept_repair(self, question: str, answer: str) -> bool:
+    def _needs_foundational_policy_fallback(self, question: str, answer: str) -> bool:
         if self._looks_like_source_insufficiency_refusal(answer):
             return True
         if not self._looks_like_source_insufficiency_stall(answer):
@@ -1268,15 +1197,41 @@ class SearchAssistantWorkflow:
         question: str,
         decision: GroundingDecision,
         sources: list[SourceEvidence],
-    ) -> GroundingEnforcement:
-        sanitized, removed_claims = self._sanitize_unsupported_precise_values(answer, sources)
-        if self._should_replace_unsupported_evidence_required_answer(question, sanitized, decision, sources):
+        low_relevance_issue: str | None = None,
+        review_failed: bool = False,
+    ) -> GroundingReport:
+        actions: list[str] = []
+        if decision.category == "foundational" and (
+            review_failed or self._needs_foundational_policy_fallback(question, answer)
+        ):
+            actions.append("foundational_policy_fallback")
+            return GroundingReport(
+                answer=self._foundational_fallback_answer(question, low_relevance_issue),
+                fallback_used=True,
+                enforcement_actions=actions,
+            )
+
+        sanitized = self._remove_external_knowledge_sentences(answer)
+        if sanitized != answer:
+            actions.append("removed_external_knowledge_sentences")
+        removed_claims: list[str] = []
+        if decision.precise_numbers_require_sources:
+            sanitized, removed_claims = self._sanitize_unsupported_precise_values(sanitized, sources)
+            if removed_claims:
+                actions.append("sanitized_unsupported_precise_values")
+        if self._violates_evidence_required_policy(question, sanitized, decision, sources):
             issue = "Unsupported evidence-required answer replaced: missing required retrieval evidence."
-            return GroundingEnforcement(
+            actions.append("evidence_required_gap_replacement")
+            return GroundingReport(
                 answer=self._evidence_required_gap_answer(decision, sources),
                 unverified_claims=[*removed_claims, issue],
+                fallback_used=True,
+                enforcement_actions=actions,
             )
-        return GroundingEnforcement(answer=sanitized, unverified_claims=removed_claims)
+        cleaned = self._remove_malformed_partial_lines(sanitized)
+        if cleaned != sanitized:
+            actions.append("removed_malformed_partial_lines")
+        return GroundingReport(answer=cleaned, unverified_claims=removed_claims, enforcement_actions=actions)
 
     def _sanitize_unsupported_precise_values(
         self,
@@ -1386,7 +1341,7 @@ class SearchAssistantWorkflow:
         # add new rules here. Remove once external callers have migrated.
         return self._sanitize_unsupported_precise_values(answer, sources)
 
-    def _should_replace_unsupported_evidence_required_answer(
+    def _violates_evidence_required_policy(
         self,
         question: str,
         answer: str,
@@ -1543,6 +1498,7 @@ class SearchAssistantWorkflow:
         sources: list[SourceEvidence],
     ) -> str:
         relevant_sources = sources[:5]
+        missing_items = self._missing_evidence_items(decision)
         lines = [
             "I cannot confirm the requested evidence-required conclusion from the retrieved evidence.",
             "",
@@ -1557,18 +1513,36 @@ class SearchAssistantWorkflow:
             [
                 "",
                 "What is still missing:",
-                "- The requested model parameters or model-card facts needed for the calculation.",
-                "- A supported deployment or parallelism plan for the requested system count.",
-                "- A benchmark or reproducible serving configuration for throughput, latency, batch size, context length, and cache memory.",
+                *missing_items,
                 "",
                 "Safe conclusion:",
                 "- The answer should stay at low confidence until the missing source-backed facts are found.",
-                "- It is fine to use retrieved hardware or system facts as constraints, but not to claim fit, deployability, runtime behavior, or a throughput range without the missing model and benchmark evidence.",
+                "- It is fine to use retrieved facts as constraints, but not to state the requested conclusion more strongly than the evidence allows.",
             ]
         )
         if decision.specific_entities:
             lines.extend(["", f"Policy scope: {', '.join(decision.specific_entities)}"])
         return "\n".join(lines)
+
+    def _missing_evidence_items(self, decision: GroundingDecision) -> list[str]:
+        families = set(decision.required_evidence_families)
+        items: list[str] = []
+        if "current_fact" in families:
+            items.append("- A current authoritative source for the requested fact.")
+        if "exact_values" in families:
+            items.append("- Source-backed exact values or specifications for the requested numeric claim.")
+        if "vendor_or_version_claims" in families:
+            items.append("- Vendor, project, release, model-card, or version documentation that directly covers the requested entity.")
+        if "deployment_feasibility" in families:
+            items.append("- The requested model parameters or model-card facts needed for the calculation.")
+            items.append("- A supported deployment or parallelism plan for the requested system count.")
+        if "model_parameters_or_benchmarks" in families:
+            items.append("- A benchmark or reproducible serving configuration for throughput, latency, batch size, context length, and cache memory.")
+        if "authoritative_sources" in families:
+            items.append("- Authoritative sources sufficient for a high-risk conclusion.")
+        if not items:
+            items.append("- Retrieval sources that directly support the requested claim.")
+        return items
 
     def _compact_spec_text(self, text: str) -> str:
         return re.sub(r"\s+", "", text).lower()

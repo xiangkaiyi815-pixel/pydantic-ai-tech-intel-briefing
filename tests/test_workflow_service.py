@@ -9,7 +9,49 @@ from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
 from search_assistant.skills.service import SkillDraftService
 from search_assistant.runtime import FakeAgentRuntime
+from search_assistant.workflow.grounding import (
+    build_question_profile,
+    classify_question_profile,
+    decide_grounding_policy,
+)
 from search_assistant.workflow.service import SearchAssistantWorkflow
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_category", "expected_classification", "expected_claim_type"),
+    [
+        ("能否解释向量数据库", "foundational", "research", "concept"),
+        ("Can you explain cache coherence?", "foundational", "research", "concept"),
+        ("Redis 最新版本是什么", "evidence_required", "research", "current_fact"),
+        ("某型号具体带宽是多少", "evidence_required", "hard", "precise_number"),
+        ("4 张某加速卡能否部署某模型", "evidence_required", "hard", "deployment_feasibility"),
+    ],
+)
+def test_question_profile_drives_classification_and_grounding_policy(
+    question,
+    expected_category,
+    expected_classification,
+    expected_claim_type,
+):
+    profile = build_question_profile(question)
+    classification = classify_question_profile(profile)
+    decision = decide_grounding_policy(profile, classification)
+
+    assert classification == expected_classification
+    assert decision.category == expected_category
+    assert expected_claim_type in profile.requested_claim_types
+    assert decision.allow_stable_model_knowledge is (expected_category == "foundational")
+    assert decision.require_retrieval_sources is (expected_category != "foundational")
+    assert decision.precise_numbers_require_sources is True
+    assert decision.vendor_version_claims_require_sources is True
+
+
+def test_broad_can_or_nengfou_does_not_make_explanation_a_deployment_question():
+    chinese_profile = build_question_profile("能否解释向量数据库")
+    english_profile = build_question_profile("Can you explain cache coherence?")
+
+    assert "deployment_feasibility" not in chinese_profile.requested_claim_types
+    assert "deployment_feasibility" not in english_profile.requested_claim_types
 
 
 def test_hard_question_runs_calibration_and_persists_answer(tmp_path):
@@ -520,7 +562,7 @@ def test_foundational_distributed_model_question_still_answers_when_review_rejec
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_distributed_model_question_repairs_refusal_revision_under_fallback(tmp_path):
+def test_foundational_distributed_model_question_uses_policy_fallback_for_refusal_revision(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索结果相关性不足：当前来源不足，不能回答。")
@@ -545,7 +587,7 @@ def test_foundational_distributed_model_question_repairs_refusal_revision_under_
     assert "互联" in package.answer_text
 
 
-def test_foundational_distributed_model_question_repairs_source_refusal_even_with_relevant_sources(tmp_path):
+def test_foundational_distributed_model_question_uses_policy_fallback_even_with_relevant_sources(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索内容不足：当前来源不足，不能回答。")
@@ -583,11 +625,11 @@ def test_foundational_distributed_model_question_repairs_source_refusal_even_wit
     assert package.confidence == "low"
     assert "当前来源不足，不能回答" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_retrieval_insufficiency_refusal_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_retrieval_insufficiency_refusal(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="根据当前检索结果，无法确认这个理解是否成立，建议补充更相关来源后再判断。")
@@ -613,7 +655,7 @@ def test_foundational_question_repairs_retrieval_insufficiency_refusal_wording(t
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_source_stall_without_explicit_refusal_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_source_stall_without_explicit_refusal(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索内容不足：建议补充更相关来源后再判断。")
@@ -639,7 +681,7 @@ def test_foundational_question_repairs_source_stall_without_explicit_refusal_wor
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_source_stall_even_when_revision_mentions_concepts(tmp_path):
+def test_foundational_question_uses_policy_fallback_even_when_revision_mentions_concepts(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(
@@ -665,12 +707,12 @@ def test_foundational_question_repairs_source_stall_even_when_revision_mentions_
     assert "不建议直接判断" not in package.answer_text
     assert "建议补充更相关来源后再回答" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "低置信说明" in package.answer_text
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_soft_evidence_deferral_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_soft_evidence_deferral_wording(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="现有证据不够充分，暂时不能判断。")
@@ -692,7 +734,7 @@ def test_foundational_question_repairs_soft_evidence_deferral_wording(tmp_path):
 
     assert "现有证据不够充分，暂时不能判断" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "低置信说明" in package.answer_text
 
 

@@ -495,6 +495,7 @@ def _briefing(
     briefing_id: str = "briefing-1",
     url_prefix: str | None = None,
 ) -> DailyBriefing:
+    now = datetime.now(UTC)
     prefix = url_prefix or "industrial-ai"
     sources = [
         CollectedSource(
@@ -510,7 +511,7 @@ def _briefing(
             query="industrial AI workflow",
             relevance_score=0.9,
             importance_score=0.9,
-            retrieved_at=f"2026-08-0{index}T00:00:00Z",
+            retrieved_at=(now - timedelta(days=index)).isoformat().replace("+00:00", "Z"),
         )
         for index in range(1, source_count + 1)
     ]
@@ -520,7 +521,7 @@ def _briefing(
         user_id="user-1",
         chat_id="chat-1",
         topic=topic,
-        run_date=date(2026, 8, 6),
+        run_date=now.date(),
         search_directions=["industrial AI workflow"],
         keywords=["industrial AI"],
         sources=sources,
@@ -544,5 +545,5 @@ def _briefing(
             landing_suggestions=["Start with review-only mode", "Record rollback outcomes"],
         ),
         markdown="# Industrial AI",
-        created_at="2026-08-06T00:00:00Z",
+        created_at=now.isoformat().replace("+00:00", "Z"),
     )
