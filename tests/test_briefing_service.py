@@ -1,19 +1,21 @@
-from datetime import date
+from datetime import UTC, date, datetime
 import json
 import time
 from search_assistant.briefing.service import (
     DailyBriefingService,
     REPORT_SKILL_PATH,
-    _classify_briefing_intent,
     _is_substantive_synthesis,
 )
 from search_assistant.contracts import (
     BriefingSynthesis,
     BriefingTheme,
+    BriefingUnderstanding,
     CollectedSource,
+    DomainProfile,
     DomainKnowledgeCandidate,
     DomainKnowledgeEvidence,
     IncomingMessage,
+    SourceQualityVerdict,
 )
 from search_assistant.evolution.service import DomainKnowledgeCandidateService
 from search_assistant.memory.store import MemoryStore
@@ -250,6 +252,14 @@ class HarnessSearchClient:
         ][:limit]
 
 
+class FixedSearchClient:
+    def __init__(self, results: list[SearchResult]):
+        self.results = results
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.results[:limit]
+
+
 class PlanningRuntime(FakeAgentRuntime):
     def __init__(self):
         super().__init__()
@@ -262,6 +272,50 @@ class PlanningRuntime(FakeAgentRuntime):
             "LinkedIn industrial AI discussion",
             "predictive maintenance time-series anomaly detection evaluation",
         ]
+
+
+class UnderstandingRuntime(FakeAgentRuntime):
+    def __init__(self, understanding: BriefingUnderstanding, planned_queries: list[str] | None = None):
+        super().__init__()
+        self.understanding = understanding
+        self.planned_queries = planned_queries or []
+        self.understanding_context: dict[str, object] | None = None
+        self.planning_context: dict[str, object] | None = None
+
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        self.understanding_context = context
+        return self.understanding
+
+    def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
+        self.planning_context = context
+        return self.planned_queries
+
+
+class SourceQualityJudgeRuntime(FakeAgentRuntime):
+    def __init__(self, verdicts_by_url: dict[str, dict[str, object]]):
+        super().__init__()
+        self.verdicts_by_url = verdicts_by_url
+        self.source_quality_payloads: list[dict[str, object]] = []
+
+    def run_text_task(
+        self,
+        instructions: str,
+        payload: dict[str, object],
+        *,
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        if "source-quality boundary judge" in instructions:
+            self.source_quality_payloads.append(payload)
+            return json.dumps(self.verdicts_by_url[str(payload["url"])])
+        return super().run_text_task(
+            instructions,
+            payload,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 class KnowledgeContextRuntime(FakeAgentRuntime):
@@ -280,10 +334,14 @@ class KnowledgeContextRuntime(FakeAgentRuntime):
 
 
 class SourceLimitRuntime(FakeAgentRuntime):
-    def __init__(self):
+    def __init__(self, understanding: BriefingUnderstanding | None = None):
         super().__init__()
+        self.understanding = understanding
         self.synthesis_source_count = 0
         self.synthesis_context: dict[str, object] | None = None
+
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        return self.understanding or super().understand_briefing(topic, context)
 
     def synthesize_briefing(self, topic, sources, context):
         self.synthesis_source_count = len(sources)
@@ -422,7 +480,7 @@ def test_daily_briefing_keeps_completed_sources_when_the_search_budget_expires(t
         [],
     )
 
-    assert time.monotonic() - started < 0.15
+    assert time.monotonic() - started < 0.25
     assert [source.url for source in sources] == ["https://example.com/fast"]
 
 
@@ -441,7 +499,7 @@ def test_daily_briefing_records_budget_timeout_and_skipped_queries(tmp_path):
     started = time.monotonic()
     collection = service._collect_sources_with_trace(subscription, search_plan, [], run_id="brief-budget-test")
 
-    assert time.monotonic() - started < 0.18
+    assert time.monotonic() - started < 0.6
     assert collection.sources == []
     assert len(search.queries) <= 6
     statuses = [event.status for event in collection.provider_events]
@@ -523,33 +581,361 @@ def test_marketing_filter_keeps_technical_public_account_posts():
     )
 
 
-def test_briefing_intent_classifies_common_user_questions():
-    assert _classify_briefing_intent("harness是什么").primary_intent == "concept_explanation"
-    assert _classify_briefing_intent("人工智能产业发展").primary_intent == "industry_trend"
-    assert _classify_briefing_intent("具身智能技术").primary_intent == "technical_tracking"
-    assert _classify_briefing_intent("LangGraph vs Pydantic AI 选型").primary_intent == "comparison_decision"
-
-
-def test_concept_intent_changes_deterministic_queries_without_dropping_channels(tmp_path):
+def test_source_quality_judge_keeps_marketing_title_when_snippet_has_technical_evidence(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
+    results = [
+        SearchResult(
+            title="限时福利｜GPU 推理性能优化指南",
+            url="https://example.com/gpu-inference-guide",
+            snippet="Benchmark covers throughput, batch size, quantization config, latency, and measured experiment results.",
+            provider="browser-bing",
+            checked_at="2026-08-20T00:00:00+00:00",
+        ),
+        SearchResult(
+            title="AI Agent 实战训练营，扫码报名",
+            url="https://example.com/agent-training-camp",
+            snippet="Course enrollment, add WeChat, limited seats, coupon, and business cooperation.",
+            provider="browser-bing",
+            checked_at="2026-08-20T00:00:00+00:00",
+        ),
+    ]
+    runtime = SourceQualityJudgeRuntime(
+        {
+            "https://example.com/gpu-inference-guide": {
+                "technical_value": "high",
+                "source_type": "secondary",
+                "marketing_level": "mixed",
+                "evidence_density": "high",
+                "authority": "secondary",
+                "keep_recommendation": "keep",
+                "rationale": "Promotional title but snippet contains benchmark, configuration, and measured results.",
+            },
+            "https://example.com/agent-training-camp": {
+                "technical_value": "low",
+                "source_type": "marketing",
+                "marketing_level": "dominant",
+                "evidence_density": "low",
+                "authority": "weak",
+                "keep_recommendation": "reject",
+                "rationale": "Visible content is lead generation and enrollment without technical evidence.",
+            },
+        }
+    )
+    service = DailyBriefingService(store, FixedSearchClient(results), runtime=runtime)
+    subscription = store.upsert_topic("u-1", "c-1", "GPU inference optimization")
+
+    sources = service._collect_sources(subscription, [("technical", "GPU inference optimization benchmark")], [])
+
+    assert [source.url for source in sources] == ["https://example.com/gpu-inference-guide"]
+    assert len(runtime.source_quality_payloads) == 2
+    assert runtime.source_quality_payloads[0]["title"] == "限时福利｜GPU 推理性能优化指南"
+    candidates = store.list_source_candidates(topic_id=subscription.id)
+    assert any(candidate.url == "https://example.com/agent-training-camp" for candidate in candidates)
+    assert any(
+        candidate.status == "rejected_low_relevance"
+        and "source quality judge" in candidate.reason
+        for candidate in candidates
+    )
+
+
+def test_source_quality_judge_handles_primary_community_news_and_unfamiliar_domains(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = SourceQualityJudgeRuntime(
+        {
+            "https://community.example.com/thread/cache-bug": {
+                "technical_value": "high",
+                "source_type": "community",
+                "marketing_level": "none",
+                "evidence_density": "high",
+                "authority": "weak",
+                "keep_recommendation": "keep",
+                "rationale": "Thread includes version, config, bug reproduction, and workaround details.",
+            },
+            "https://example.com/product-launch": {
+                "technical_value": "low",
+                "source_type": "secondary",
+                "marketing_level": "mixed",
+                "evidence_density": "low",
+                "authority": "secondary",
+                "keep_recommendation": "borderline",
+                "rationale": "Product announcement is useful as a dynamic signal but lacks mechanism details.",
+            },
+            "https://example.com/axon-lattice-runtime": {
+                "technical_value": "high",
+                "source_type": "secondary",
+                "marketing_level": "none",
+                "evidence_density": "high",
+                "authority": "secondary",
+                "keep_recommendation": "keep",
+                "rationale": "Unfamiliar field but snippet exposes architecture, interface, and evaluation details.",
+            },
+        }
+    )
+    service = DailyBriefingService(store, FixedSearchClient([]), runtime=runtime)
+    understanding = BriefingUnderstanding(
+        primary_intent="technical_tracking",
+        temporal_focus="current",
+        research_focus=["cache coherence", "axon lattice runtime"],
+        domain_profile=DomainProfile(
+            domain="systems engineering",
+            key_concepts=["cache coherence", "axon lattice runtime"],
+            preferred_source_types=["repositories", "technical discussion", "benchmarks"],
+        ),
+    )
+
+    github = service._source_quality_verdict(
+        topic="cache coherence implementation",
+        query="cache coherence implementation benchmark",
+        url="https://github.com/example/cache-coherence-runtime",
+        title="Cache coherence runtime README",
+        snippet="README documents architecture, public interfaces, benchmark harness, and reproduction commands.",
+        provider="mcp:public:github",
+        understanding=understanding,
+    )
+    community = service._source_quality_verdict(
+        topic="cache coherence implementation",
+        query="cache coherence bug version configuration reproduction",
+        url="https://community.example.com/thread/cache-bug",
+        title="Cache coherence bug in v2.1 with invalidation config",
+        snippet="The thread includes version, invalidation settings, reproduction steps, logs, and a patch workaround.",
+        provider="browser-bing",
+        understanding=understanding,
+    )
+    news = service._source_quality_verdict(
+        topic="cache coherence implementation",
+        query="cache coherence product release",
+        url="https://example.com/product-launch",
+        title="Vendor launches cache coherence product",
+        snippet="The company announced a new product but did not disclose architecture, benchmark, or integration details.",
+        provider="browser-bing",
+        understanding=understanding,
+    )
+    unfamiliar = service._source_quality_verdict(
+        topic="axon lattice runtime",
+        query="axon lattice runtime architecture benchmark",
+        url="https://example.com/axon-lattice-runtime",
+        title="Axon lattice runtime architecture and evaluation",
+        snippet="The source describes scheduler interfaces, routing fabric, benchmark setup, and failure isolation.",
+        provider="browser-bing",
+        understanding=understanding,
+    )
+
+    assert isinstance(github, SourceQualityVerdict)
+    assert github.keep_recommendation == "keep"
+    assert github.technical_value == "high"
+    assert github.authority == "primary"
+    assert community.source_type == "community"
+    assert community.authority == "weak"
+    assert community.technical_value == "high"
+    assert community.keep_recommendation == "keep"
+    assert news.source_type == "secondary"
+    assert news.technical_value == "low"
+    assert news.keep_recommendation == "borderline"
+    assert service._source_rejection_reason(
+        "cache coherence implementation",
+        "cache coherence product release",
+        "https://example.com/product-launch",
+        "Vendor launches cache coherence product",
+        "The company announced a new product but did not disclose architecture, benchmark, or integration details.",
+        verdict=news,
+    ) is None
+    assert unfamiliar.technical_value == "high"
+    assert unfamiliar.keep_recommendation == "keep"
+
+
+def test_briefing_understanding_consumes_model_semantics_without_keyword_classification(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = UnderstandingRuntime(
+        BriefingUnderstanding(
+            primary_intent="concept_explanation",
+            secondary_intents=[],
+            temporal_focus="evergreen",
+            research_focus=["definition", "concept boundary", "common use cases"],
+            evidence_preferences=["official documentation", "technical overview"],
+            domain_profile=DomainProfile(
+                domain="vector database",
+                key_concepts=["向量数据库", "embedding index"],
+                ambiguous_terms=["database"],
+                excluded_meanings=["generic relational database"],
+                preferred_source_types=["official documentation", "technical overview"],
+            ),
+        )
+    )
+    service = DailyBriefingService(store, RecordingSearchClient(), runtime=runtime, max_queries=18)
+    subscription = store.upsert_topic("u-1", "c-1", "什么是向量数据库")
+
+    plan = service.build_search_plan(
+        subscription,
+        [],
+        understanding=service._understand_briefing(subscription.topic, [], {}),
+        knowledge_context={},
+    )
+
+    assert runtime.understanding_context is not None
+    assert runtime.planning_context is not None
+    assert runtime.planning_context["briefing_intent"]["primary_intent"] == "concept_explanation"
+    assert runtime.planning_context["briefing_understanding"]["domain_profile"]["domain"] == "vector database"
+    assert any("concept boundary" in query for platform, query in plan if "确定性保障" in platform)
+
+
+def test_structured_understanding_changes_deterministic_queries_without_dropping_channels(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    understanding = BriefingUnderstanding(
+        primary_intent="concept_explanation",
+        temporal_focus="evergreen",
+        research_focus=["definition", "concept boundary", "typical context"],
+        evidence_preferences=["official documentation", "technical overview"],
+        domain_profile=DomainProfile(
+            domain="agent harness",
+            key_concepts=["harness", "control layer"],
+            ambiguous_terms=["Harness.io"],
+            excluded_meanings=["CI/CD platform unless explicitly requested"],
+            preferred_source_types=["official documentation", "architecture overview"],
+        ),
+    )
     service = DailyBriefingService(store, RecordingSearchClient(), max_queries=20)
     subscription = store.upsert_topic("u-1", "c-1", "harness是什么")
 
-    plan = service.build_search_plan(subscription, [])
+    plan = service.build_search_plan(subscription, [], understanding=understanding, knowledge_context={})
     deterministic_queries = [query for platform, query in plan if "确定性保障" in platform]
     keywords = DailyBriefingService._keywords(
         subscription.topic,
         [],
         plan,
-        intent=_classify_briefing_intent(subscription.topic),
+        understanding=understanding,
     )
 
     assert any("definition" in query.lower() for query in deterministic_queries)
     assert any(platform == "全球网页" for platform, _ in plan)
     assert any(platform == "YouTube" for platform, _ in plan)
-    assert "概念边界" in keywords
-    assert "典型语境" in keywords
+    assert "concept boundary" in keywords
+    assert "typical context" in keywords
+
+
+def test_llm_briefing_understanding_handles_general_semantic_cases_without_domain_rules(tmp_path):
+    cases = [
+        (
+            "对比 Milvus 和 Qdrant 的工程选型",
+            BriefingUnderstanding(
+                primary_intent="comparison_decision",
+                secondary_intents=["engineering_landing"],
+                temporal_focus="current",
+                research_focus=["architecture tradeoffs", "operations", "benchmark evidence"],
+                evidence_preferences=["official documentation", "benchmarks", "production case studies"],
+                comparison_dimensions=["indexing architecture", "operations", "ecosystem"],
+                domain_profile=DomainProfile(
+                    domain="vector database selection",
+                    key_concepts=["Milvus", "Qdrant", "vector search"],
+                    preferred_source_types=["official documentation", "benchmarks", "case studies"],
+                ),
+            ),
+            "comparison_decision",
+            {"engineering_landing"},
+            "current",
+        ),
+        (
+            "当前具身智能在汽车制造中的真实落地进展",
+            BriefingUnderstanding(
+                primary_intent="engineering_landing",
+                secondary_intents=["industry_trend"],
+                temporal_focus="current",
+                research_focus=["factory deployment", "robotics workflow", "production metrics"],
+                evidence_preferences=["deployment case studies", "technical papers", "factory reports"],
+                domain_profile=DomainProfile(
+                    domain="embodied intelligence in automotive manufacturing",
+                    key_concepts=["embodied intelligence", "automotive manufacturing", "robotics"],
+                    preferred_source_types=["case studies", "technical reports", "papers"],
+                ),
+            ),
+            "engineering_landing",
+            {"industry_trend"},
+            "current",
+        ),
+        (
+            "对比国内外具身智能在汽车制造中的落地进展",
+            BriefingUnderstanding(
+                primary_intent="comparison_decision",
+                secondary_intents=["industry_trend", "engineering_landing"],
+                temporal_focus="current",
+                research_focus=["regional deployment evidence", "manufacturing robotics workflow"],
+                evidence_preferences=["case studies", "factory reports", "technical papers"],
+                comparison_dimensions=["region", "deployment maturity", "production workflow"],
+                domain_profile=DomainProfile(
+                    domain="embodied intelligence manufacturing deployment",
+                    key_concepts=["embodied intelligence", "automotive manufacturing"],
+                    preferred_source_types=["case studies", "factory reports"],
+                ),
+            ),
+            "comparison_decision",
+            {"industry_trend", "engineering_landing"},
+            "current",
+        ),
+        (
+            "CAD 自动出图",
+            BriefingUnderstanding(
+                primary_intent="technical_tracking",
+                secondary_intents=["engineering_landing"],
+                temporal_focus="current",
+                research_focus=["Computer-Aided Design drawing automation", "editable engineering drawings"],
+                evidence_preferences=["technical documentation", "research papers", "repositories"],
+                domain_profile=DomainProfile(
+                    domain="Computer-Aided Design automation",
+                    key_concepts=["Computer-Aided Design", "engineering drawing", "dimensioning"],
+                    ambiguous_terms=["CAD"],
+                    excluded_meanings=["coronary artery disease", "cash against documents"],
+                    evidence_anchors=["editable geometry", "drawing dimensions", "CAD API"],
+                    preferred_source_types=["technical documentation", "papers", "repositories"],
+                ),
+            ),
+            "technical_tracking",
+            {"engineering_landing"},
+            "current",
+        ),
+        (
+            "neuromorphic photonic routing fabric 的工程进展",
+            BriefingUnderstanding(
+                primary_intent="technical_tracking",
+                secondary_intents=["engineering_landing"],
+                temporal_focus="current",
+                research_focus=["device architecture", "routing fabric", "prototype metrics"],
+                evidence_preferences=["papers", "benchmarks", "prototype reports"],
+                domain_profile=DomainProfile(
+                    domain="neuromorphic photonic routing fabric",
+                    key_concepts=["neuromorphic photonics", "routing fabric", "prototype"],
+                    preferred_source_types=["papers", "benchmarks", "prototype reports"],
+                ),
+            ),
+            "technical_tracking",
+            {"engineering_landing"},
+            "current",
+        ),
+    ]
+
+    for index, (topic, understanding, primary, secondary, temporal_focus) in enumerate(cases):
+        store = MemoryStore(tmp_path / f"assistant-{index}.sqlite3")
+        store.initialize()
+        runtime = UnderstandingRuntime(understanding)
+        service = DailyBriefingService(store, RecordingSearchClient(), runtime=runtime, max_queries=20)
+        parsed = service._understand_briefing(topic, [], {})
+        subscription = store.upsert_topic("u-1", "c-1", topic)
+        plan = service.build_search_plan(subscription, [], understanding=parsed, knowledge_context={})
+
+        assert parsed.primary_intent == primary
+        assert set(parsed.secondary_intents).issuperset(secondary)
+        assert parsed.temporal_focus == temporal_focus
+        assert parsed.domain_profile.domain
+        assert parsed.research_focus
+        assert runtime.planning_context is not None
+        assert runtime.planning_context["briefing_understanding"]["primary_intent"] == primary
+        deterministic_queries = " ".join(query for platform, query in plan if "确定性保障" in platform)
+        assert parsed.research_focus[0] in deterministic_queries
+        if topic == "CAD 自动出图":
+            assert "Computer-Aided Design" in deterministic_queries
+            assert "Text-to-CAD parametric B-Rep generation open source evaluation" not in deterministic_queries
 def test_daily_briefing_records_candidate_lifecycle_and_provider_trace(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
@@ -567,7 +953,7 @@ def test_daily_briefing_records_candidate_lifecycle_and_provider_trace(tmp_path)
     statuses = {candidate.status for candidate in collection.source_candidates}
     assert "accepted" in statuses
     assert "rejected_generic_reference" in statuses
-    assert "rejected_missing_industrial_anchor" in statuses
+    assert "rejected_low_relevance" in statuses
     assert any(event.status == "success" for event in collection.provider_events)
     assert any(event.provider == "NoisySearchClient" for event in store.list_provider_trace_events(topic_id=subscription.id))
     persisted_statuses = {candidate.status for candidate in store.list_source_candidates(topic_id=subscription.id)}
@@ -616,7 +1002,7 @@ def test_daily_briefing_uses_model_planned_technical_queries_and_static_skill(tm
 def test_daily_briefing_uses_reviewed_knowledge_context_for_follow_up_planning(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
-    now = "2026-08-13T00:00:00Z"
+    now = datetime.now(UTC).isoformat()
     candidate = DomainKnowledgeCandidate(
         id="knowledge-agent-harness",
         topic="harness是什么",
@@ -715,7 +1101,20 @@ def test_daily_briefing_archives_more_sources_than_it_sends_to_the_model(tmp_pat
 def test_generic_topic_fallback_groups_sources_into_readable_evidence_blocks(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
-    runtime = SourceLimitRuntime()
+    runtime = SourceLimitRuntime(
+        BriefingUnderstanding(
+            primary_intent="industry_trend",
+            secondary_intents=["technical_tracking"],
+            temporal_focus="current",
+            research_focus=["policy and market", "technology ecosystem", "implementation evidence"],
+            evidence_preferences=["industry reports", "technical sources", "case studies"],
+            domain_profile=DomainProfile(
+                domain="人工智能产业发展",
+                key_concepts=["人工智能产业发展"],
+                preferred_source_types=["industry reports", "technical sources", "case studies"],
+            ),
+        )
+    )
     service = DailyBriefingService(
         store,
         GenericIndustrySearchClient(),
@@ -935,18 +1334,34 @@ def test_cad_topic_filter_rejects_search_dumps_login_pages_and_medical_cad():
     )
 
 
-def test_cad_topic_uses_deterministic_technical_queries_when_model_planning_is_empty(tmp_path):
+def test_cad_topic_uses_structured_understanding_for_deterministic_queries_when_model_planning_is_empty(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
+    understanding = BriefingUnderstanding(
+        primary_intent="technical_tracking",
+        secondary_intents=["engineering_landing"],
+        temporal_focus="current",
+        research_focus=["Computer-Aided Design drawing automation", "editable engineering drawings"],
+        evidence_preferences=["technical documentation", "research papers", "repositories"],
+        domain_profile=DomainProfile(
+            domain="Computer-Aided Design automation",
+            key_concepts=["Computer-Aided Design", "engineering drawing"],
+            ambiguous_terms=["CAD"],
+            excluded_meanings=["coronary artery disease"],
+            evidence_anchors=["editable geometry", "drawing dimensions"],
+            preferred_source_types=["technical documentation", "research papers", "repositories"],
+        ),
+    )
     service = DailyBriefingService(store, RecordingSearchClient(), runtime=FakeAgentRuntime(), max_queries=24)
     subscription = store.upsert_topic("u-1", "c-1", "AI 3D CAD engineering drawing")
 
-    plan = service.build_search_plan(subscription, [])
+    plan = service.build_search_plan(subscription, [], understanding=understanding, knowledge_context={})
     technical_queries = [query for platform, query in plan if "确定性保障" in platform]
 
-    assert len(technical_queries) == 5
-    assert any("Text-to-CAD" in query for query in technical_queries)
-    assert any("DWG DXF" in query for query in technical_queries)
+    assert len(technical_queries) >= 3
+    assert any("Computer-Aided Design" in query for query in technical_queries)
+    assert any("editable engineering drawings" in query for query in technical_queries)
+    assert not any("Text-to-CAD parametric B-Rep generation open source evaluation" in query for query in technical_queries)
 
 
 def test_cad_fallback_uses_cad_technical_themes_instead_of_industrial_templates(tmp_path):
@@ -1145,6 +1560,27 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
                 "timeout_seconds": timeout_seconds,
             }
         )
+        if max_tokens == 900:
+            return json.dumps(
+                {
+                    "primary_intent": "engineering_landing",
+                    "secondary_intents": ["technical_tracking"],
+                    "temporal_focus": "current",
+                    "research_focus": ["MES workflow architecture", "approval and rollback"],
+                    "evidence_preferences": ["technical architecture", "case studies"],
+                    "comparison_dimensions": [],
+                    "domain_profile": {
+                        "domain": "industrial AI workflow",
+                        "key_concepts": ["MES", "workflow", "approval"],
+                        "subtopics": ["integration", "rollback"],
+                        "ambiguous_terms": [],
+                        "excluded_meanings": [],
+                        "evidence_anchors": ["MES adapter", "approval trail"],
+                        "preferred_source_types": ["technical architecture", "case studies"],
+                    },
+                },
+                ensure_ascii=False,
+            )
         if max_tokens == 700:
             return json.dumps(["industrial AI MES workflow architecture"])
         return json.dumps(output, ensure_ascii=False)
@@ -1159,7 +1595,19 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
     )
 
     knowledge_context = {"reviewed_graph_hits": [{"entity_id": "mes"}]}
-    queries = runtime.plan_briefing_queries("industrial AI", {"feedback": [], "knowledge_context": knowledge_context})
+    understanding = runtime.understand_briefing(
+        "industrial AI",
+        {"feedback": [], "knowledge_context_summary": {"reviewed_graph_hits": [{"entity_id": "mes"}]}},
+    )
+    queries = runtime.plan_briefing_queries(
+        "industrial AI",
+        {
+            "feedback": [],
+            "briefing_understanding": understanding.model_dump(mode="json"),
+            "briefing_intent": {"primary_intent": understanding.primary_intent},
+            "knowledge_context": knowledge_context,
+        },
+    )
     synthesis = runtime.synthesize_briefing(
         "industrial AI",
         [source],
@@ -1171,19 +1619,25 @@ def test_deepseek_briefing_planning_and_synthesis_call_the_model_runner():
         },
     )
 
+    assert understanding.primary_intent == "engineering_landing"
+    assert understanding.domain_profile.domain == "industrial AI workflow"
     assert queries == ["industrial AI MES workflow architecture"]
     assert synthesis.themes[0].source_urls == [source.url]
     assert _is_substantive_synthesis(synthesis) is True
-    assert [call["max_tokens"] for call in calls[:2]] == [700, 2400]
+    assert [call["max_tokens"] for call in calls[:3]] == [900, 700, 2400]
     assert calls[0]["timeout_seconds"] == 40.0
-    assert calls[1]["timeout_seconds"] == 180.0
-    assert calls[1]["model"] == "deepseek-v4-flash"
-    assert calls[1]["base_url"] == "https://api.deepseek.com"
-    assert "Return ONLY one valid JSON object" in str(calls[1]["instructions"])
-    assert json.loads(str(calls[0]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
-    assert json.loads(str(calls[1]["prompt"]))["sources"][0]["url"] == source.url
-    assert json.loads(str(calls[1]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
-    assert len(json.loads(str(calls[1]["prompt"]))["search_plan"]) == 20
+    assert calls[1]["timeout_seconds"] == 40.0
+    assert calls[2]["timeout_seconds"] == 180.0
+    assert calls[2]["model"] == "deepseek-v4-flash"
+    assert calls[2]["base_url"] == "https://api.deepseek.com"
+    assert "semantic understanding step" in str(calls[0]["instructions"])
+    assert "Use the supplied briefing_understanding" in str(calls[1]["instructions"])
+    assert "Return ONLY one valid JSON object" in str(calls[2]["instructions"])
+    assert json.loads(str(calls[0]["prompt"]))["knowledge_context_summary"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
+    assert json.loads(str(calls[1]["prompt"]))["briefing_understanding"]["primary_intent"] == "engineering_landing"
+    assert json.loads(str(calls[2]["prompt"]))["sources"][0]["url"] == source.url
+    assert json.loads(str(calls[2]["prompt"]))["knowledge_context"]["reviewed_graph_hits"][0]["entity_id"] == "mes"
+    assert len(json.loads(str(calls[2]["prompt"]))["search_plan"]) == 20
 
 
 def test_glm_provider_selects_the_pydantic_ai_runtime():

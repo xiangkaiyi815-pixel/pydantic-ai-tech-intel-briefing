@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from search_assistant.contracts import BriefingSynthesis, CollectedSource
+from search_assistant.contracts import (
+    BriefingSynthesis,
+    BriefingUnderstanding,
+    CollectedSource,
+    default_briefing_understanding,
+)
 
 
 class FakeAgentRuntime:
@@ -44,6 +49,9 @@ class FakeAgentRuntime:
 
     def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
         return []
+
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        return default_briefing_understanding(topic)
 
     def generate_answer(self, question: str, context: dict[str, object]) -> str:
         self.answer_calls += 1

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
-from search_assistant.contracts import BriefingSynthesis, CollectedSource
+from search_assistant.contracts import BriefingSynthesis, BriefingUnderstanding, CollectedSource
 
 
 AgentRunner = Callable[[str, str, str, str, str, float, int, float], str]
@@ -41,6 +41,9 @@ class AgentRuntime(TextModelRuntime, Protocol):
 
 
 class BriefingRuntime(TextModelRuntime, Protocol):
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        ...
+
     def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
         ...
 

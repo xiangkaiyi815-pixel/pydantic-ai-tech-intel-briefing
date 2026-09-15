@@ -8,7 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 from search_assistant.config import Settings
-from search_assistant.contracts import BriefingSynthesis, CollectedSource
+from search_assistant.contracts import (
+    BriefingSynthesis,
+    BriefingUnderstanding,
+    CollectedSource,
+    normalize_briefing_understanding,
+)
 from search_assistant.runtime.base import AgentRunner, AgentRuntime, ModelRuntimeError
 from search_assistant.runtime.fake import FakeAgentRuntime
 
@@ -82,14 +87,48 @@ class PydanticAIModelRuntime:
         content = self._run_agent_with_max_tokens(instructions, payload, temperature=0.0, max_tokens=600)
         return _parse_search_query_plan(content)
 
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        instructions = (
+            "You are the semantic understanding step for a Chinese technology-intelligence briefing. "
+            "Read the topic, recent feedback, and reviewed knowledge-context summary, then return one "
+            "structured JSON object. Do not plan searches, choose providers, set budgets, or use site filters. "
+            "Do not rely on fixed keyword templates; interpret the user's actual research meaning, entities, "
+            "ambiguities, temporal scope, and evidence needs. "
+            "primary_intent must be one of: concept_explanation, technical_tracking, industry_trend, "
+            "engineering_landing, comparison_decision. secondary_intents may contain any of the same values. "
+            "temporal_focus must be one of: evergreen, current, historical, near_future, unspecified. "
+            "domain_profile must include domain, key_concepts, subtopics, ambiguous_terms, excluded_meanings, "
+            "evidence_anchors, and preferred_source_types. "
+            "Return ONLY JSON with keys: primary_intent, secondary_intents, temporal_focus, research_focus, "
+            "evidence_preferences, comparison_dimensions, domain_profile."
+        )
+        content = self.agent_runner(
+            self.model,
+            self.api_key,
+            self.base_url,
+            instructions,
+            json.dumps(
+                {
+                    "topic": topic,
+                    "feedback": context.get("feedback", [])[:3],
+                    "knowledge_context_summary": context.get("knowledge_context_summary", {}),
+                },
+                ensure_ascii=False,
+            ),
+            0.0,
+            900,
+            self.briefing_planning_timeout_seconds,
+        )
+        return _parse_briefing_understanding(content, topic)
+
     def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
         instructions = (
-            "You are a Chinese technology-intelligence retrieval planner. Generate 4 to 8 complete "
-            "technical search queries for the topic, covering different technical routes, system architecture, "
-            "data and workflow, evaluation metrics, deployment cases, and primary/open-source material. "
+            "You are a Chinese technology-intelligence retrieval planner. Use the supplied "
+            "briefing_understanding as the semantic source of truth; do not reinterpret the raw topic or "
+            "reclassify the user's intent. Generate 4 to 8 complete technical search queries for the topic, "
+            "covering the supplied research_focus, evidence_preferences, comparison_dimensions, and domain_profile. "
             "Queries may mix Chinese and English when useful. Do not include platform names, site: filters, "
-            "title fragments, conversational filler, or quoted user feedback. User feedback is only evidence "
-            "for inferring a technical direction. If knowledge_context is present, use reviewed graph hits and "
+            "title fragments, conversational filler, or quoted user feedback. If knowledge_context is present, use reviewed graph hits and "
             "validated candidates to add focused follow-up queries, but never treat weak signals as facts. "
             "Return only a JSON array of strings."
         )
@@ -112,6 +151,9 @@ class PydanticAIModelRuntime:
                         ],
                     },
                     "briefing_intent": context.get("briefing_intent"),
+                    "briefing_understanding": context.get("briefing_understanding"),
+                    "domain_profile": context.get("domain_profile"),
+                    "research_focus": context.get("research_focus", []),
                     "knowledge_context": context.get("knowledge_context", {}),
                 },
                 ensure_ascii=False,
@@ -550,6 +592,17 @@ def _answer_generation_temperature(context: dict[str, object]) -> float:
     if mode == "technical_explanation":
         return 0.24
     return 0.2
+
+
+def _parse_briefing_understanding(content: str, topic: str) -> BriefingUnderstanding:
+    stripped = _strip_markdown_code_fence(content.strip())
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = _try_parse_embedded_json_object(stripped)
+    if not isinstance(parsed, dict):
+        raise ModelRuntimeError("Model briefing understanding did not return a JSON object")
+    return normalize_briefing_understanding(topic, parsed)
 
 
 def _parse_search_query_plan(content: str) -> list[str]:

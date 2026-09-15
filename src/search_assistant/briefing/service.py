@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+import json
 from pathlib import Path
 import re
 import time
@@ -14,11 +15,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from search_assistant.contracts import (
     BriefingSynthesis,
     BriefingTheme,
+    BriefingUnderstanding,
     CollectedSource,
     DailyBriefing,
     ProviderTraceEvent,
     SourceCandidate,
+    SourceQualityVerdict,
     TopicSubscription,
+    default_briefing_understanding,
+    default_source_quality_verdict,
+    normalize_briefing_understanding,
+    normalize_source_quality_verdict,
 )
 from search_assistant.evolution.service import (
     DomainKnowledgeCandidateService,
@@ -44,6 +51,20 @@ from search_assistant.search.source_registry import (
 
 
 class BriefingRuntime(Protocol):
+    def run_text_task(
+        self,
+        instructions: str,
+        payload: dict[str, object],
+        *,
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        ...
+
+    def understand_briefing(self, topic: str, context: dict[str, object]) -> BriefingUnderstanding:
+        ...
+
     def plan_briefing_queries(self, topic: str, context: dict[str, object]) -> list[str]:
         ...
 
@@ -106,6 +127,46 @@ REPORT_CONTRACT = {
 REPORT_SKILL_PATH = Path(__file__).resolve().parents[3] / "skills" / "content-collection-report" / "SKILL.md"
 
 
+SOURCE_QUALITY_JUDGE_INSTRUCTIONS = (
+    "You are a source-quality boundary judge for a technology-intelligence briefing. "
+    "Judge only from the supplied title, snippet, url/domain, provider, query, topic, and briefing_understanding_summary. "
+    "Do not use outside knowledge, do not browse, and do not decide provider permissions, budgets, or final ranking. "
+    "Return ONLY one valid JSON object with keys: technical_value, source_type, marketing_level, "
+    "evidence_density, authority, keep_recommendation, rationale. "
+    "technical_value must be high, medium, or low. source_type must be primary, secondary, community, "
+    "marketing, aggregator, or unknown. marketing_level must be none, mixed, or dominant. "
+    "evidence_density must be high, medium, or low. authority must be primary, secondary, or weak. "
+    "keep_recommendation must be keep, borderline, or reject. "
+    "Important boundaries: a marketing-style title alone is not a rejection when the snippet contains concrete "
+    "technical mechanisms, data, benchmarks, configurations, or reproduction details; weak authority does not "
+    "mean invalid; mixed marketing does not erase technical value; community discussions can have high technical "
+    "value when they include versions, bugs, configuration, or reproducible evidence. Pure lead-generation, "
+    "training enrollment, empty press copy, and aggregation/search pages should be rejected or borderline with low "
+    "technical value depending on the visible evidence."
+)
+
+
+def _parse_source_quality_verdict(raw: str) -> SourceQualityVerdict | None:
+    stripped = raw.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        stripped = fence.group(1).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    return normalize_source_quality_verdict(parsed)
+
+
 @dataclass(frozen=True)
 class BriefingIntentProfile:
     primary_intent: str
@@ -123,8 +184,6 @@ class BriefingIntentProfile:
             "summary": self.summary,
             "search_focus": list(self.search_focus),
             "synthesis_focus": list(self.synthesis_focus),
-            "keyword_hints": list(self.keyword_hints),
-            "query_templates": list(self.query_templates),
         }
 
 
@@ -200,6 +259,60 @@ _INTENT_PROFILES: dict[str, BriefingIntentProfile] = {
 _DEFAULT_BRIEFING_INTENT = _INTENT_PROFILES["technical_tracking"]
 
 
+def _intent_profile_from_understanding(understanding: BriefingUnderstanding) -> BriefingIntentProfile:
+    return _INTENT_PROFILES.get(understanding.primary_intent, _DEFAULT_BRIEFING_INTENT)
+
+
+def _understanding_from_legacy_intent(topic: str, intent: BriefingIntentProfile) -> BriefingUnderstanding:
+    return normalize_briefing_understanding(
+        topic,
+        {
+            "primary_intent": intent.primary_intent,
+            "secondary_intents": [],
+            "temporal_focus": "current",
+            "research_focus": list(intent.search_focus) or [topic],
+            "evidence_preferences": [
+                "official documentation",
+                "technical architecture",
+                "papers and benchmarks",
+                "open source repositories",
+                "deployment evidence",
+            ],
+            "comparison_dimensions": list(intent.synthesis_focus),
+            "domain_profile": {
+                "domain": topic,
+                "key_concepts": [topic],
+                "subtopics": list(intent.search_focus),
+                "ambiguous_terms": [],
+                "excluded_meanings": [],
+                "evidence_anchors": [],
+                "preferred_source_types": [
+                    "official documentation",
+                    "research papers",
+                    "benchmarks",
+                    "repositories",
+                    "case studies",
+                ],
+            },
+        },
+    )
+
+
+def _briefing_understanding_metadata(understanding: BriefingUnderstanding) -> dict[str, object]:
+    profile = understanding.domain_profile
+    return {
+        "primary_intent": understanding.primary_intent,
+        "secondary_intents": understanding.secondary_intents,
+        "temporal_focus": understanding.temporal_focus,
+        "domain": profile.domain,
+        "research_focus_count": len(understanding.research_focus),
+        "evidence_anchor_count": len(profile.evidence_anchors),
+        "comparison_dimension_count": len(understanding.comparison_dimensions),
+    }
+
+
+# Legacy compatibility only. The daily briefing main path uses
+# BriefingUnderstanding from the runtime and must not call this keyword matcher.
 def _has_intent_marker(text: str, compact_text: str, markers: tuple[str, ...]) -> bool:
     for marker in markers:
         normalized_marker = marker.lower()
@@ -664,6 +777,13 @@ _SEARCH_DUMP_MARKERS = (
     "\"isencoding\"",
     "-->",
 )
+_PROMPT_INJECTION_MARKERS = (
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "system prompt",
+    "developer message",
+    "follow these instructions instead",
+)
 _CAD_MEDICAL_MARKERS = (
     "coronary artery disease",
     "cardiovascular disease",
@@ -815,18 +935,58 @@ def _has_cad_anchor(title: str, snippet: str) -> bool:
 
 def _deterministic_technical_queries(
     topic: str,
+    understanding: BriefingUnderstanding | None = None,
     intent: BriefingIntentProfile | None = None,
 ) -> list[str]:
-    if _is_cad_topic(topic):
-        return [
-            "Text-to-CAD parametric B-Rep generation open source evaluation",
-            "AI engineering drawing generation 3D to 2D projection dimensioning CAD",
-            "2D engineering drawing vectorization DWG DXF OCR CAD workflow",
-            "CAD copilot sketch constraint solving feature modeling architecture",
-            "B-Rep topology validation geometric constraints manufacturability generated CAD",
-        ]
-    profile = intent or _DEFAULT_BRIEFING_INTENT
-    return [template.format(topic=topic) for template in profile.query_templates]
+    if isinstance(understanding, BriefingIntentProfile):
+        intent = understanding
+        understanding = None
+    if understanding is None:
+        understanding = (
+            _understanding_from_legacy_intent(topic, intent)
+            if intent is not None
+            else default_briefing_understanding(topic)
+        )
+    profile = understanding.domain_profile
+    candidate_terms = [
+        topic,
+        *understanding.research_focus,
+        profile.domain,
+        *profile.key_concepts,
+        *profile.subtopics,
+        *profile.evidence_anchors,
+    ]
+    focus_terms: list[str] = []
+    for candidate in candidate_terms:
+        term = " ".join(str(candidate or "").split())
+        if term and _is_meaningful_query(term) and term.lower() not in {item.lower() for item in focus_terms}:
+            focus_terms.append(term[:120])
+        if len(focus_terms) >= 5:
+            break
+
+    queries: list[str] = []
+    for focus in focus_terms:
+        if focus.lower() == topic.lower():
+            queries.append(f"{topic} technical evidence architecture implementation")
+        else:
+            queries.append(f"{topic} {focus} evidence")
+    for dimension in understanding.comparison_dimensions[:2]:
+        if _is_meaningful_query(dimension):
+            queries.append(f"{topic} {dimension} comparison tradeoffs")
+    for preference in understanding.evidence_preferences[:3]:
+        if _is_meaningful_query(preference):
+            queries.append(f"{topic} {preference} evidence")
+    if understanding.temporal_focus in {"current", "near_future"}:
+        queries.append(f"{topic} current deployment evidence")
+
+    cleaned: list[str] = []
+    for query in queries:
+        normalized = " ".join(query.split())[:180]
+        if normalized and normalized.lower() not in {item.lower() for item in cleaned}:
+            cleaned.append(normalized)
+        if len(cleaned) >= 3:
+            break
+    return cleaned or [f"{topic} technical evidence architecture implementation"]
 
 
 def _duration_ms(started: float) -> float:
@@ -934,12 +1094,17 @@ class DailyBriefingService:
             subscription = self.store.upsert_topic(user_id, chat_id, topic)
             self._ensure_project_state()
             feedback = self.store.list_topic_feedback(subscription.id)
-            briefing_intent = _classify_briefing_intent(subscription.topic, feedback)
             knowledge_context = self._knowledge_context(subscription.topic)
+            briefing_understanding = self._understand_briefing(
+                subscription.topic,
+                feedback,
+                knowledge_context,
+            )
+            briefing_intent = _intent_profile_from_understanding(briefing_understanding)
             search_plan = self.build_search_plan(
                 subscription,
                 feedback,
-                intent=briefing_intent,
+                understanding=briefing_understanding,
                 knowledge_context=knowledge_context,
             )
             self._record_trace_event(
@@ -951,6 +1116,7 @@ class DailyBriefingService:
                     "topic": subscription.topic,
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
+                    "briefing_understanding": _briefing_understanding_metadata(briefing_understanding),
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
@@ -963,6 +1129,7 @@ class DailyBriefingService:
                 payload={
                     "topic_id": subscription.id,
                     "briefing_intent": briefing_intent.model_dump(),
+                    "briefing_understanding": briefing_understanding.model_dump(mode="json"),
                     "query_count": len(search_plan),
                     "feedback_count": len(feedback),
                     "queries": [query for _, query in search_plan[:8]],
@@ -976,6 +1143,7 @@ class DailyBriefingService:
                 search_plan,
                 feedback,
                 run_id=run_id,
+                understanding=briefing_understanding,
             )
             sources = collection.sources
             ranked_sources = sorted(sources, key=lambda source: source.importance_score, reverse=True)[
@@ -1057,7 +1225,13 @@ class DailyBriefingService:
                 topic=subscription.topic,
                 run_date=resolved_date,
                 search_directions=[f"{platform}: {query}" for platform, query in search_plan],
-                keywords=self._keywords(subscription.topic, feedback, search_plan, intent=briefing_intent),
+                keywords=self._keywords(
+                    subscription.topic,
+                    feedback,
+                    search_plan,
+                    intent=briefing_intent,
+                    understanding=briefing_understanding,
+                ),
                 sources=ranked_sources,
                 source_candidates=collection.source_candidates,
                 provider_events=collection.provider_events,
@@ -1121,6 +1295,7 @@ class DailyBriefingService:
                     "topic_id": subscription.id,
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
+                    "briefing_understanding": _briefing_understanding_metadata(briefing_understanding),
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
@@ -1141,6 +1316,7 @@ class DailyBriefingService:
                     "status": "completed",
                     "intent": briefing_intent.primary_intent,
                     "intent_label": briefing_intent.label,
+                    "briefing_understanding": _briefing_understanding_metadata(briefing_understanding),
                     "knowledge_context": self._knowledge_context_metadata(knowledge_context),
                     "query_count": len(search_plan),
                     "source_count": len(ranked_sources),
@@ -1177,14 +1353,75 @@ class DailyBriefingService:
             )
             raise
 
+    def _understand_briefing(
+        self,
+        topic: str,
+        feedback: list[dict[str, object]],
+        knowledge_context: dict[str, object],
+    ) -> BriefingUnderstanding:
+        context = {
+            "feedback": feedback[:5],
+            "knowledge_context_summary": self._knowledge_context_for_understanding(knowledge_context),
+        }
+        if self.runtime is not None:
+            try:
+                return normalize_briefing_understanding(
+                    topic,
+                    self.runtime.understand_briefing(topic, context),
+                )
+            except Exception:
+                pass
+        return default_briefing_understanding(topic)
+
+    @staticmethod
+    def _knowledge_context_for_understanding(knowledge_context: dict[str, object]) -> dict[str, object]:
+        return {
+            "policy": knowledge_context.get("policy"),
+            "reviewed_graph_hits": [
+                {
+                    "entity_id": str(item.get("entity_id") or ""),
+                    "entity_name": str(item.get("entity_name") or ""),
+                    "summary": str(item.get("summary") or item.get("description") or "")[:240],
+                }
+                for item in (knowledge_context.get("reviewed_graph_hits") or [])[:4]
+                if isinstance(item, dict)
+            ],
+            "validated_candidates": [
+                {
+                    "topic": str(item.get("topic") or ""),
+                    "claim": str(item.get("claim") or "")[:240],
+                    "knowledge_layer": str(item.get("knowledge_layer") or ""),
+                }
+                for item in (knowledge_context.get("validated_candidates") or [])[:3]
+                if isinstance(item, dict)
+            ],
+            "procedural_rules": [
+                {
+                    "kind": str(item.get("kind") or ""),
+                    "content": str(item.get("content") or "")[:240],
+                }
+                for item in (knowledge_context.get("procedural_rules") or [])[:3]
+                if isinstance(item, dict)
+            ],
+        }
+
     def build_search_plan(
         self,
         subscription: TopicSubscription,
         feedback: list[dict[str, object]],
         intent: BriefingIntentProfile | None = None,
+        understanding: BriefingUnderstanding | None = None,
         knowledge_context: dict[str, object] | None = None,
     ) -> list[tuple[str, str]]:
-        briefing_intent = intent or _classify_briefing_intent(subscription.topic, feedback)
+        if understanding is None:
+            understanding = (
+                _understanding_from_legacy_intent(subscription.topic, intent)
+                if intent is not None
+                else default_briefing_understanding(subscription.topic)
+            )
+        else:
+            understanding = normalize_briefing_understanding(subscription.topic, understanding)
+        briefing_intent = _intent_profile_from_understanding(understanding)
         knowledge_context = knowledge_context or self._knowledge_context(subscription.topic)
         generated_plans: list[tuple[str, str]] = []
         if self.runtime is not None:
@@ -1195,6 +1432,9 @@ class DailyBriefingService:
                         "feedback": feedback[:5],
                         "channels": [platform for platform, _ in CHANNEL_QUERIES],
                         "briefing_intent": briefing_intent.model_dump(),
+                        "briefing_understanding": understanding.model_dump(mode="json"),
+                        "domain_profile": understanding.domain_profile.model_dump(mode="json"),
+                        "research_focus": understanding.research_focus,
                         "knowledge_context": knowledge_context,
                         "report_skill": _load_report_skill(),
                         "source_recipe": source_recipe_summary(subscription.source_recipe),
@@ -1205,7 +1445,7 @@ class DailyBriefingService:
             generated_plans.extend(("技术路线", query) for query in _clean_planned_queries(generated))
         deterministic_plans = [
             ("技术路线（确定性保障）", query)
-            for query in _deterministic_technical_queries(subscription.topic, briefing_intent)
+            for query in _deterministic_technical_queries(subscription.topic, understanding=understanding)
         ]
         feedback_plans: list[tuple[str, str]] = []
         for item in feedback[:3]:
@@ -1589,12 +1829,14 @@ class DailyBriefingService:
         search_plan: list[tuple[str, str]],
         feedback: list[dict[str, object]],
         run_id: str | None = None,
+        understanding: BriefingUnderstanding | None = None,
     ) -> list[CollectedSource]:
         return self._collect_sources_with_trace(
             subscription,
             search_plan,
             feedback,
             run_id=run_id,
+            understanding=understanding,
         ).sources
 
     def _collect_sources_with_trace(
@@ -1603,7 +1845,9 @@ class DailyBriefingService:
         search_plan: list[tuple[str, str]],
         feedback: list[dict[str, object]],
         run_id: str | None = None,
+        understanding: BriefingUnderstanding | None = None,
     ) -> BriefingCollectionTrace:
+        understanding = understanding or default_briefing_understanding(subscription.topic)
         by_url: dict[str, CollectedSource] = {}
         query_results: list[tuple[int, str, str, SearchOutcome]] = []
         source_candidates: list[SourceCandidate] = []
@@ -1829,14 +2073,31 @@ class DailyBriefingService:
                     self._relevance_score(subscription.topic, title, snippet),
                     self._query_relevance_score(query, title, snippet),
                 )
+                quality_verdict = self._source_quality_verdict(
+                    topic=subscription.topic,
+                    query=query,
+                    url=normalized_url,
+                    title=title,
+                    snippet=snippet,
+                    provider=result.provider,
+                    understanding=understanding,
+                )
                 importance_score = self._importance_score(
                     subscription.topic,
                     query,
                     title,
                     snippet,
                     result.provider,
+                    verdict=quality_verdict,
                 )
-                rejection = self._source_rejection_reason(subscription.topic, query, normalized_url, title, snippet)
+                rejection = self._source_rejection_reason(
+                    subscription.topic,
+                    query,
+                    normalized_url,
+                    title,
+                    snippet,
+                    verdict=quality_verdict,
+                )
                 if rejection is not None:
                     rejected = self._source_candidate(
                         subscription=subscription,
@@ -2668,10 +2929,18 @@ class DailyBriefingService:
         feedback: list[dict[str, object]],
         search_plan: list[tuple[str, str]],
         intent: BriefingIntentProfile | None = None,
+        understanding: BriefingUnderstanding | None = None,
     ) -> list[str]:
         candidates = [topic]
-        if intent is not None:
-            candidates.extend(intent.keyword_hints)
+        if understanding is not None:
+            profile = understanding.domain_profile
+            candidates.extend(understanding.research_focus)
+            candidates.extend(profile.key_concepts)
+            candidates.extend(profile.subtopics)
+            candidates.extend(profile.evidence_anchors)
+            candidates.extend(profile.preferred_source_types)
+        elif intent is not None:
+            candidates.extend(intent.search_focus)
         candidates.extend(
             query
             for platform, query in search_plan
@@ -2727,6 +2996,169 @@ class DailyBriefingService:
         haystack = f"{title} {snippet}".lower()
         return float(sum(1 for term in dict.fromkeys(terms) if term in haystack))
 
+    def _source_quality_verdict(
+        self,
+        *,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+        provider: str,
+        understanding: BriefingUnderstanding,
+    ) -> SourceQualityVerdict:
+        prefilter = self._deterministic_source_prefilter_rejection(url, title, snippet)
+        if prefilter is not None:
+            return SourceQualityVerdict(
+                technical_value="low",
+                source_type="aggregator" if prefilter[0] == "rejected_search_page_dump" else "unknown",
+                marketing_level="none",
+                evidence_density="low",
+                authority="weak",
+                keep_recommendation="reject",
+                rationale=prefilter[1],
+            )
+
+        obvious = self._obvious_source_quality_verdict(topic, query, url, title, snippet)
+        if obvious is not None:
+            return obvious
+
+        if self.runtime is not None:
+            try:
+                raw = self.runtime.run_text_task(
+                    SOURCE_QUALITY_JUDGE_INSTRUCTIONS,
+                    self._source_quality_payload(
+                        topic=topic,
+                        query=query,
+                        url=url,
+                        title=title,
+                        snippet=snippet,
+                        provider=provider,
+                        understanding=understanding,
+                    ),
+                    temperature=0.0,
+                    max_tokens=500,
+                    timeout_seconds=20.0,
+                )
+                parsed = _parse_source_quality_verdict(raw)
+                if parsed is not None:
+                    return parsed
+            except Exception:
+                pass
+        return self._fallback_source_quality_verdict(topic, query, url, title, snippet)
+
+    @staticmethod
+    def _source_quality_payload(
+        *,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+        provider: str,
+        understanding: BriefingUnderstanding,
+    ) -> dict[str, object]:
+        profile = understanding.domain_profile
+        return {
+            "topic": topic,
+            "query": query,
+            "url": url,
+            "domain": urlparse(url).netloc.lower().removeprefix("www."),
+            "title": title,
+            "snippet": snippet,
+            "provider": provider,
+            "briefing_understanding_summary": {
+                "primary_intent": understanding.primary_intent,
+                "secondary_intents": understanding.secondary_intents,
+                "temporal_focus": understanding.temporal_focus,
+                "domain": profile.domain,
+                "research_focus": understanding.research_focus[:5],
+                "evidence_preferences": understanding.evidence_preferences[:5],
+                "preferred_source_types": profile.preferred_source_types[:5],
+            },
+        }
+
+    @classmethod
+    def _obvious_source_quality_verdict(
+        cls,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+    ) -> SourceQualityVerdict | None:
+        if source_authority_weight(url) < _PRIMARY_SOURCE_WEIGHT:
+            return None
+        if not (
+            cls._relevance_score(topic, title, snippet) > 0
+            or cls._query_relevance_score(query, title, snippet) > 0
+            or cls._has_exact_cjk_topic_phrase(topic, title, snippet)
+            or cls._cjk_topic_match_score(topic, title, snippet) >= 2
+        ):
+            return None
+        return SourceQualityVerdict(
+            technical_value="high",
+            source_type="primary",
+            marketing_level="none",
+            evidence_density="high",
+            authority="primary",
+            keep_recommendation="keep",
+            rationale="authoritative source with visible topic/query relevance",
+        )
+
+    @classmethod
+    def _fallback_source_quality_verdict(
+        cls,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+    ) -> SourceQualityVerdict:
+        # Legacy fallback only: used when no LLM judge is available or parsing
+        # fails. Do not extend the old marketing/technical phrase inventories;
+        # the active boundary judge is the structured SourceQualityVerdict path.
+        if cls._is_marketing_account_content(url, title, snippet):
+            return SourceQualityVerdict(
+                technical_value="low",
+                source_type="marketing",
+                marketing_level="dominant",
+                evidence_density="low",
+                authority="weak",
+                keep_recommendation="reject",
+                rationale="legacy fallback detected dominant marketing funnel content",
+            )
+        topic_score = cls._relevance_score(topic, title, snippet)
+        query_score = cls._query_relevance_score(query, title, snippet)
+        technical_hits = cls._technical_signal_count(title, snippet)
+        relevant = (
+            topic_score >= 2
+            or query_score >= 2
+            or cls._has_exact_cjk_topic_phrase(topic, title, snippet)
+            or cls._cjk_topic_match_score(topic, title, snippet) >= 2
+            or technical_hits > 0
+        )
+        if not relevant:
+            return SourceQualityVerdict(
+                technical_value="low",
+                source_type="unknown",
+                marketing_level="mixed",
+                evidence_density="low",
+                authority="weak",
+                keep_recommendation="reject",
+                rationale="legacy fallback found insufficient topic, query, or technical signal",
+            )
+        authority = "primary" if source_authority_weight(url) >= _PRIMARY_SOURCE_WEIGHT else "secondary"
+        return SourceQualityVerdict(
+            technical_value="high" if technical_hits >= 2 or authority == "primary" else "medium",
+            source_type="primary" if authority == "primary" else "secondary",
+            marketing_level="none",
+            evidence_density="high" if authority == "primary" or technical_hits >= 2 else "medium",
+            authority=authority,
+            keep_recommendation="keep" if technical_hits or authority == "primary" else "borderline",
+            rationale="legacy deterministic fallback retained a relevant source",
+        )
+
     @staticmethod
     def _matches_technical_marker(text: str, marker: str) -> bool:
         if marker.isascii() and re.fullmatch(r"[a-z0-9]+", marker):
@@ -2745,6 +3177,9 @@ class DailyBriefingService:
 
     @classmethod
     def _is_marketing_account_content(cls, url: str, title: str, snippet: str) -> bool:
+        # Legacy fallback only. The active source-quality boundary path uses
+        # SourceQualityVerdict from the hybrid LLM judge and does not expand
+        # this phrase-based marketing classifier.
         text = f"{title} {snippet}".lower()
         compact_text = re.sub(r"\s+", "", text)
         strong_hits = sum(
@@ -2767,6 +3202,9 @@ class DailyBriefingService:
 
     @classmethod
     def _technical_signal_count(cls, title: str, snippet: str) -> int:
+        # Legacy fallback/scoring compatibility only. Do not add domain-specific
+        # markers here to handle source-quality bad cases; use
+        # SourceQualityVerdict instead.
         text = f"{title} {snippet}".lower()
         theme_hits = sum(
             1
@@ -2797,6 +3235,9 @@ class DailyBriefingService:
         title: str,
         snippet: str,
     ) -> bool:
+        # Legacy fallback/API compatibility. The daily collection path now uses
+        # deterministic prefiltering plus SourceQualityVerdict and deterministic
+        # rank/quota decisions.
         if cls._is_generic_reference_domain(url):
             return False
         host = urlparse(url).netloc.lower().removeprefix("www.")
@@ -2827,10 +3268,8 @@ class DailyBriefingService:
         return topic_score >= 2 or query_score >= 2 or cls._technical_signal_count(title, snippet) > 0
 
     @classmethod
-    def _source_rejection_reason(
+    def _deterministic_source_prefilter_rejection(
         cls,
-        topic: str,
-        query: str,
         url: str,
         title: str,
         snippet: str,
@@ -2841,6 +3280,9 @@ class DailyBriefingService:
             return "rejected_empty_content", "title and snippet are both empty"
         if cls._is_search_page_dump(title, snippet):
             return "rejected_search_page_dump", "result looked like a search-result page dump"
+        text = f"{title} {snippet}".lower()
+        if any(marker in text for marker in _PROMPT_INJECTION_MARKERS):
+            return "rejected_low_relevance", "result contained prompt-injection instructions"
         if cls._is_generic_reference_domain(url):
             return "rejected_generic_reference", "generic reference domain is not strong briefing evidence"
         parsed = urlparse(url)
@@ -2850,6 +3292,33 @@ class DailyBriefingService:
             return "rejected_search_page_dump", "Baidu wrapper URL is not an original public source"
         if any(marker in path for marker in _LOGIN_PATH_MARKERS):
             return "rejected_login_page", "login-gated URL path is outside public-source boundary"
+        return None
+
+    @classmethod
+    def _source_rejection_reason(
+        cls,
+        topic: str,
+        query: str,
+        url: str,
+        title: str,
+        snippet: str,
+        verdict: SourceQualityVerdict | None = None,
+    ) -> tuple[str, str] | None:
+        prefilter = cls._deterministic_source_prefilter_rejection(url, title, snippet)
+        if prefilter is not None:
+            return prefilter
+        if verdict is not None:
+            if verdict.keep_recommendation == "reject":
+                return "rejected_low_relevance", f"source quality judge rejected source: {verdict.rationale}"
+            if (
+                verdict.technical_value == "low"
+                and verdict.evidence_density == "low"
+                and verdict.marketing_level == "dominant"
+            ):
+                return "rejected_low_relevance", f"source quality judge found dominant marketing: {verdict.rationale}"
+            return None
+
+        # Legacy fallback branch only for older direct callers/tests.
         text = f"{title} {snippet}".lower()
         if _is_cad_topic(f"{topic} {query}") and any(marker in text for marker in _CAD_MEDICAL_MARKERS):
             return "rejected_cad_medical", "CAD query matched medical CAD acronym content"
@@ -2894,12 +3363,27 @@ class DailyBriefingService:
             created_at=datetime.now(UTC).isoformat(),
         )
 
-    def _importance_score(self, topic: str, query: str, title: str, snippet: str, provider: str) -> float:
+    def _importance_score(
+        self,
+        topic: str,
+        query: str,
+        title: str,
+        snippet: str,
+        provider: str,
+        verdict: SourceQualityVerdict | None = None,
+    ) -> float:
+        provider_bonus = 2.0 if provider.startswith("direct-") else 1.0 if provider.startswith("mcp:") else 0.0
+        if verdict is not None:
+            return (
+                self._relevance_score(topic, title, snippet) * 2
+                + self._query_relevance_score(query, title, snippet) * 2
+                + self._source_quality_score(verdict)
+                + provider_bonus
+            )
         text = f"{title} {snippet}".lower()
         technical_hits = self._technical_signal_count(title, snippet)
         cad_hits = sum(self._matches_technical_marker(text, marker) for marker in _CAD_EVIDENCE_ANCHORS)
         evidence_hits = sum(marker in text for marker in ("paper", "论文", "official", "官方", "release", "发布", "benchmark", "案例", "架构"))
-        provider_bonus = 2.0 if provider.startswith("direct-") else 1.0 if provider.startswith("mcp:") else 0.0
         return (
             self._relevance_score(topic, title, snippet) * 2
             + self._query_relevance_score(query, title, snippet) * 2
@@ -2908,6 +3392,23 @@ class DailyBriefingService:
             + evidence_hits
             + provider_bonus
         )
+
+    @staticmethod
+    def _source_quality_score(verdict: SourceQualityVerdict) -> float:
+        technical = {"high": 8.0, "medium": 4.0, "low": 0.0}[verdict.technical_value]
+        evidence = {"high": 5.0, "medium": 2.0, "low": 0.0}[verdict.evidence_density]
+        authority = {"primary": 6.0, "secondary": 3.0, "weak": 0.0}[verdict.authority]
+        source_type = {
+            "primary": 2.0,
+            "secondary": 1.0,
+            "community": 1.0,
+            "unknown": 0.0,
+            "marketing": -2.0,
+            "aggregator": -3.0,
+        }[verdict.source_type]
+        marketing = {"none": 0.0, "mixed": -2.0, "dominant": -8.0}[verdict.marketing_level]
+        keep = {"keep": 2.0, "borderline": 0.0, "reject": -10.0}[verdict.keep_recommendation]
+        return technical + evidence + authority + source_type + marketing + keep
 
     @staticmethod
     def _evidence_workflow(sources: list[CollectedSource]) -> str:
